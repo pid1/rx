@@ -1955,20 +1955,26 @@ GQRXCONV
 """Managed by rx/setup.sh — switchable, resumable SDR++ profiles.
 
   radio                list profiles; * marks the active one
-  radio NAME           switch SDR++ to NAME. The profile being left is saved
-                       first, so coming back to it resumes where you were.
-  radio resume         re-apply the active profile and start SDR++ (login)
+  radio NAME           switch to NAME, closing whatever runs now. A JS8
+                       profile brings up SDR++ and JS8Call on its dial; any
+                       other brings up SDR++ alone. The profile being left is
+                       saved first, so coming back to it resumes where it was.
+  radio off            save the active profile, close SDR++ and JS8Call
+  radio resume         bring the active profile back up (i3 runs it at login)
   radio save [NAME]    save SDR++'s current tuning as NAME (default: active)
   radio reset NAME     forget your saved state for NAME; back to its default
   radio show NAME      print a profile as JSON
+  radio help           this text
 
-  --no-focus           leave focus where it is (js8ghost / js8call use this)
+  --no-focus           leave focus where it is
 
-A few display settings (SDRPP_GLOBAL) go with every profile rather than
-any one of them. A profile is tuning only, never layout: frequency and VFO position, offset
+Tab completes profile names (/usr/share/bash-completion/completions/radio).
+
+A profile is tuning only, never layout: frequency and VFO position, offset
 mode, demodulator and all of its settings, audio sink and volume, the
-RTL-SDR's settings and, for JS8 profiles, JS8Call's dial. The defaults below
-are starting points; saved state lives in ~/.config/rx/radio/ and wins.
+RTL-SDR's settings and, for JS8 profiles, JS8Call's dial. A few display
+settings (SDRPP_GLOBAL) go with every profile. The defaults below are
+starting points; saved state lives in ~/.config/rx/radio/ and wins.
 
 The dongle is stored by serial number. SDR++ names a dongle with its
 enumeration index ("[serial] name##index"), and the index shifts as dongles
@@ -1977,7 +1983,8 @@ the wrong one under the old label. Resolving the serial to the current name
 on every apply keeps each profile on its own dongle.
 
 SDR++ rewrites its config on exit, so it is closed before any file is
-touched and started again afterwards, already playing (--autostart).
+touched and started again afterwards, already playing (--autostart), with
+workspace 1 on screen -- see start_sdrpp() for why it has to be.
 """
 import argparse
 import configparser
@@ -2000,6 +2007,9 @@ JS8_INI = os.path.join(HOME, ".config", "JS8Call.ini")
 
 SDR_CRIT, SDR_TREE = "(?i)^sdr", "sdr"           # i3 criteria / tree match
 JS8_CRIT, JS8_TREE = "(?i)^js8call$", 'js8call"'
+# By absolute path: /usr/local/bin/js8call is our launcher, which runs radio.
+JS8CALL = "/usr/bin/js8call"
+JS8_NODE = "SDR_to_JS8"
 
 NOOELEC = "57818712"  # NESDR SMArt v5, behind the Ham It Up
 JS8_SINK = "SDR to JS8 (virtual cable)"
@@ -2226,6 +2236,80 @@ def start(argv, pat):
     die("%s did not open a window" % argv[0])
 
 
+def holds_dongle(pid):
+    fds = "/proc/%s/fd" % pid
+    try:
+        return any(os.readlink(os.path.join(fds, f)).startswith("/dev/bus/usb/")
+                   for f in os.listdir(fds))
+    except OSError:
+        return False
+
+
+def focused_workspace():
+    out = subprocess.run(["i3-msg", "-t", "get_workspaces"], capture_output=True,
+                         text=True).stdout
+    try:
+        return next(w["name"] for w in json.loads(out) if w["focused"])
+    except (ValueError, StopIteration):
+        return None
+
+
+def start_sdrpp():
+    # SDR++ blocks inside glfwCreateWindow until its new window is actually
+    # visible. i3 maps it onto workspace 1 (the assign rule), so started while
+    # another workspace is on screen it hangs there for good: a black window,
+    # one core spinning, the dongle never opened. Show workspace 1 first and
+    # go back afterwards. Then check playback really began, and retry once.
+    back = focused_workspace()
+    i3("workspace number 1")
+    try:
+        for attempt in (1, 2):
+            start(["sdrpp", "--autostart"], SDR_TREE)
+            for _ in range(40):
+                pids = subprocess.run(["pgrep", "-x", "sdrpp"], capture_output=True,
+                                      text=True).stdout.split()
+                if pids and holds_dongle(pids[0]):
+                    return
+                time.sleep(0.5)
+            # Its config was written before it started, so nothing is lost.
+            subprocess.run(["pkill", "-KILL", "-x", "sdrpp"])
+            for _ in range(20):
+                if not running("sdrpp"):
+                    break
+                time.sleep(0.25)
+            if attempt == 1:
+                say("SDR++ never opened the dongle; restarting it")
+        die("SDR++ starts but never opens the dongle — check it with 'rtl_test -t'")
+    finally:
+        if back and back != "1":
+            i3('workspace "%s"' % back)
+
+
+def ensure_js8_sink():
+    # Normally made by /etc/pipewire/pipewire.conf.d/50-sdr-js8.conf when
+    # PipeWire starts; a session that predates that file has to be given it.
+    nodes = subprocess.run(["pw-cli", "ls", "Node"], capture_output=True,
+                           text=True).stdout
+    if 'node.name = "%s"' % JS8_NODE in nodes:
+        return
+    if subprocess.run(["pw-cli", "create-node", "adapter",
+                       "{ factory.name=support.null-audio-sink node.name=%s "
+                       "node.description=\"%s\" media.class=Audio/Sink "
+                       "audio.position=[FL FR] object.linger=true }" % (JS8_NODE, JS8_SINK)],
+                      stdout=subprocess.DEVNULL).returncode != 0:
+        die("could not create the %s audio sink" % JS8_NODE)
+
+
+def check_clock():
+    # JS8 slots are 15 s with about 2 s of tolerance. Outside that nothing
+    # decodes and nothing says why, so say it here.
+    out = subprocess.run(["chronyc", "-n", "tracking"], capture_output=True,
+                         text=True).stdout
+    if not re.search(r"^Leap status\s*: Normal", out, re.M):
+        say("clock not synchronised (no GPS fix and no network?) — JS8 will "
+            "not decode until it is. See: chronyc sources", "warning")
+
+
 # ------------------------------------------------------ capture and apply
 
 def capture(p):
@@ -2315,13 +2399,23 @@ def switch(name, focus, resume=False):
         die("no SDR++Brown config at %s — start SDR++ once first" % SDRPP)
     prev = active()
     target = profile(name)
-    sdr_up = running("sdrpp")
+    js8 = target.get("js8call_dial") is not None
+
+    # JS8Call writes its ini only on exit, so close it before capturing the
+    # profile being left -- that is what puts its final dial on disk. Only
+    # re-running the JS8 profile already up leaves it be.
+    if not (js8 and prev == name):
+        close("js8call", JS8_CRIT)
 
     # Save the profile being left. SDR++ writes its files within a second
     # of any change, so they are current even while it runs.
+    sdr_up = running("sdrpp")
     if prev and sdr_up and not resume:
         store(prev, capture(profile(prev)))
         target = profile(name)
+
+    if js8:
+        ensure_js8_sink()  # before SDR++ starts: it binds its sink then
 
     names = dongles()
     changes = plan(target, names)
@@ -2331,17 +2425,18 @@ def switch(name, focus, resume=False):
     for path, doc in changes.items():
         dump(path, doc)
 
-    js8_was_up = False
-    want = target.get("js8call_dial")
-    if want is not None and read_ini().get("Common", "DialFreq", fallback="") != str(want):
-        js8_was_up = close("js8call", JS8_CRIT)
-        write_dial(want)
-
     set_active(name)
     if not running("sdrpp"):
-        start(["sdrpp", "--autostart"], SDR_TREE)
-    if js8_was_up:
-        start(["/usr/bin/js8call"], JS8_TREE)
+        start_sdrpp()
+
+    if js8:
+        want = str(target["js8call_dial"])
+        if read_ini().get("Common", "DialFreq", fallback="") != want:
+            close("js8call", JS8_CRIT)
+            write_dial(want)
+        if not running("js8call"):
+            start([JS8CALL], JS8_TREE)
+        check_clock()
 
     print(summary(name, target))
     # The one setting no file can change.
@@ -2352,23 +2447,36 @@ def switch(name, focus, resume=False):
             say("flip the Ham It Up to %s" % ("UPCONVERT" if now else "BYPASS"),
                 "warning")
     if focus:
-        i3('[class="%s"] focus' % SDR_CRIT)
+        i3('[class="%s"] focus' % (JS8_CRIT if js8 else SDR_CRIT))
 
 
 def main():
     ap = argparse.ArgumentParser(prog="radio", add_help=True)
     ap.add_argument("--no-focus", action="store_true")
+    ap.add_argument("--names", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("cmd", nargs="?")
     ap.add_argument("arg", nargs="?")
     a = ap.parse_args()
     focus = not a.no_focus
 
-    if a.cmd is None:
+    if a.names:  # for tab completion
+        print("\n".join(known()))
+    elif a.cmd is None:
         cur = active()
         for n in known():
             saved = os.path.isfile(os.path.join(STATE, n + ".json"))
             print("%s %s%s" % ("*" if n == cur else " ", summary(n, profile(n)),
                                "  (saved)" if saved else ""))
+        print("\nradio NAME switches · radio off · radio help · Tab completes names")
+    elif a.cmd == "help":
+        print(__doc__.split("\n\n", 1)[1].split("\nA profile is")[0])
+    elif a.cmd == "off":
+        name = active()
+        close("js8call", JS8_CRIT)  # first, so its dial reaches the ini
+        if name and running("sdrpp"):
+            store(name, capture(profile(name)))
+        close("sdrpp", SDR_CRIT)
+        print("SDR++ and JS8Call closed" + ("; 'radio resume' brings back %s" % name if name else ""))
     elif a.cmd == "resume":
         name = active()
         if name:
@@ -2400,7 +2508,24 @@ if __name__ == "__main__":
     main()
 RADIO
     log "installed the radio profile switcher"
-    note "radio: 'radio' lists SDR++ profiles, 'radio NAME' switches (saving the one you leave, so each resumes where it was). Profiles: ghostnet js8 vhf dcara uhf noaa fm-93.3 fm-105.3 am-820. It says when the Ham It Up needs flipping between upconvert (HF, AM) and bypass (VHF/UHF, FM)."
+
+    # bash-completion loads this lazily, the first time 'radio <Tab>' runs.
+    write_file /usr/share/bash-completion/completions/radio 0644 <<'RADIOCOMP'
+# Managed by rx/setup.sh — tab completion for radio.
+_radio() {
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    local names
+    names=$(radio --names 2>/dev/null)
+    case $prev in
+        save|reset|show)
+            COMPREPLY=($(compgen -W "$names" -- "$cur")) ;;
+        radio|--no-focus)
+            COMPREPLY=($(compgen -W "$names off resume save reset show help --no-focus" -- "$cur")) ;;
+    esac
+}
+complete -F _radio radio
+RADIOCOMP
+    note "radio: 'radio' lists profiles, 'radio NAME' (Tab completes) closes whatever runs and brings NAME up; 'radio off' closes everything. Each profile resumes where it was left. Profiles: ghostnet js8 vhf dcara uhf noaa fm-93.3 fm-105.3 am-820. It says when the Ham It Up needs flipping between upconvert (HF, AM) and bypass (VHF/UHF, FM)."
 
     note "SDR needs the antenna on the 'SDR' IPEX pad (the GPS pad is a separate path). The SDR and internal-USB rails come up at boot; GPS and LoRa do not — see the README for turning those on."
     note "SDR++ starts RTL-SDR gain at 0, which looks identical to a dead device: an empty, flat waterfall. Select the source, press play, then raise gain — and test against a strong FM broadcast (88-108 MHz) before anything weak."
@@ -2656,84 +2781,32 @@ PWSINK
       log "removed the old js8 launcher (it shadowed JS8Call's decoder)"
     fi
 
-    # One launcher, two names: js8ghost for GhostNet, js8call for standard
-    # JS8. 'js8call' deliberately shadows /usr/bin/js8call so that starting
-    # JS8Call the usual way -- terminal or dmenu -- also tunes SDR++ to match;
-    # the real binary is always called by absolute path, so it cannot recurse.
+    # Two names for 'radio <JS8 profile>', which closes whatever runs now and
+    # brings up SDR++ tuned and playing plus JS8Call on the matching dial.
+    # 'js8call' deliberately shadows /usr/bin/js8call, so starting JS8Call the
+    # usual way -- terminal or dmenu -- also tunes the SDR; radio runs the
+    # real binary by absolute path, so it cannot recurse.
     write_file /usr/local/bin/js8ghost 0755 <<'JS8'
-#!/bin/bash
-# Managed by rx/setup.sh — receive JS8 through the SDR.
+#!/bin/sh
+# Managed by rx/setup.sh — one-command JS8 receive through the SDR.
 #
-#   js8ghost [ARGS]    GhostNet: SDR++ on the 'ghostnet' radio profile
-#   js8call  [ARGS]    standard JS8: SDR++ on the 'js8' radio profile
-#
-# Either one tunes SDR++ (see: radio), sets JS8Call's dial to match, then
-# starts JS8Call with ARGS, or focuses it if already running. SDR++ plays
-# USB audio into the SDR_to_JS8 sink and JS8Call decodes from its monitor.
-# Each keeps its own workspace from the i3 assign rules -- SDR++ on 1,
-# JS8Call on 2 -- so JS8Call gets the whole panel.
-set -euo pipefail
-
-REAL=/usr/bin/js8call
-SINK=SDR_to_JS8
-JS8_CLASS='(?i)^js8call$'
-
+#   js8ghost           GhostNet:     radio ghostnet
+#   js8call            standard JS8: radio js8
+#   js8call ARGS...    plain JS8Call with ARGS, no retuning
 case $(basename "$0") in
-    js8ghost) PROFILE=ghostnet ;;
-    *)        PROFILE=js8 ;;
+    js8ghost) profile=ghostnet ;;
+    *)        [ $# -gt 0 ] && exec /usr/bin/js8call "$@"
+              profile=js8 ;;
 esac
-
-fail() {
-    # Launched from dmenu there is no terminal to print to, so surface
-    # failures where they can actually be seen.
-    if [ -n "${DISPLAY:-}" ] && command -v i3-nagbar >/dev/null 2>&1; then
-        i3-nagbar -t error -m "$(basename "$0"): $1" >/dev/null 2>&1 &
-    fi
-    echo "$(basename "$0"): $1" >&2
-    exit 1
-}
-
-warn() {
-    if [ -n "${DISPLAY:-}" ] && command -v i3-nagbar >/dev/null 2>&1; then
-        i3-nagbar -t warning -m "$(basename "$0"): $1" >/dev/null 2>&1 &
-    fi
-    echo "$(basename "$0"): $1" >&2
-}
-
-[ -n "${DISPLAY:-}" ] || fail "no X display — run this from the i3 session"
-
-# The sink comes from /etc/pipewire/pipewire.conf.d/50-sdr-js8.conf when
-# PipeWire starts; a session that predates that file has to be given it.
-if ! pw-cli ls Node 2>/dev/null | grep -q "node.name = \"$SINK\""; then
-    pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=$SINK node.description=\"SDR to JS8 (virtual cable)\" media.class=Audio/Sink audio.position=[FL FR] object.linger=true }" >/dev/null \
-        || fail "could not create the $SINK audio sink"
-fi
-
-# JS8 slots are 15 s with about 2 s of tolerance. Outside that nothing
-# decodes and nothing says why, so say it here.
-if ! chronyc -n tracking 2>/dev/null | grep -q '^Leap status *: Normal'; then
-    warn "clock not synchronised (no GPS fix and no network?) — JS8 will not decode until it is. See: chronyc sources"
-fi
-
 # Without radio (the sdr section skipped) this is plain JS8Call.
-if command -v radio >/dev/null 2>&1; then
-    radio --no-focus "$PROFILE" || fail "radio could not switch SDR++ to '$PROFILE'"
-fi
-
-if ! pgrep -x js8call >/dev/null; then
-    setsid -f "$REAL" "$@" >/dev/null 2>&1
-    for _ in $(seq 1 60); do
-        i3-msg -t get_tree | grep -qi '"class":"js8call"' && break
-        sleep 0.5
-    done
-fi
-i3-msg -q "[class=\"$JS8_CLASS\"] focus" || fail "JS8Call did not open a window"
+command -v radio >/dev/null 2>&1 || exec /usr/bin/js8call
+exec radio "$profile"
 JS8
     run ln -sfn js8ghost /usr/local/bin/js8call
     log "installed the js8ghost / js8call launchers"
 
     note "JS8Call: groups @GHOSTNET, @GSTFLASH, @GNUSATX; dial 7.107 MHz (GhostNet)."
-    note "JS8 receive: 'js8ghost' (GhostNet, 7.107) or 'js8call' (standard JS8, 7.078), from a terminal or dmenu. Each tunes SDR++ on workspace 1 and opens JS8Call on 2. JS8Call's audio input defaults to the SDR_to_JS8.monitor loopback; a device picked under Settings -> Audio is kept on re-runs."
+    note "JS8 receive: 'js8ghost' (GhostNet, 7.107) or 'js8call' (standard JS8, 7.078), from a terminal or dmenu — same as 'radio ghostnet' / 'radio js8'. SDR++ tunes on workspace 1 and JS8Call opens on 2. JS8Call's audio input defaults to the SDR_to_JS8.monitor loopback; a device picked under Settings -> Audio is kept on re-runs."
     note "SDR++ for JS8, set once in its GUI (it keeps its own config): RTL-SDR source with the Ham It Up, Offset mode 'Ham-It-Up' (125 MHz), direct sampling off; Radio USB, ~3 kHz bandwidth; Audio sink 'SDR to JS8 (virtual cable)'; tune to the dial JS8Call shows, since with no rig they are not linked."
     note "JS8Call: 7.107 is set as the dial but is not in the preset Frequencies list; add it under Settings -> Frequencies to get it in the dropdown."
     note "JS8Call transmit needs an external rig (CAT + USB audio) — the SDR is receive-only. Set audio out and PTT under Settings -> Audio / Radio."

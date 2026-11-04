@@ -403,20 +403,27 @@ reload.
 
 ## Radio profiles
 
-**`radio`** switches SDR++ between saved setups. Each profile is tuning only —
-frequency, offset mode, demodulator and its settings, audio sink and volume,
-RTL-SDR gain — never window layout.
+**`radio`** is one command per setup. `radio NAME` closes whatever is running
+and brings NAME up ready to listen: a JS8 profile starts SDR++ tuned and
+playing *and* JS8Call on the matching dial; any other profile starts SDR++
+alone and closes JS8Call. Profile names tab-complete.
 
 ```bash
 radio                 # list; * marks the active profile
-radio dcara           # switch
+radio fm-105.3        # switch (Tab completes the name)
+radio off             # close SDR++ and JS8Call
+radio resume          # bring the active profile back (i3 runs this at login)
 radio save            # keep the current tuning in the active profile
 radio save NAME       # ... or as a new profile
 radio reset NAME      # back to the shipped default
+radio help
 ```
 
+Each profile is tuning only — frequency, offset mode, demodulator and its
+settings, audio sink and volume, RTL-SDR gain — never window layout.
 Switching saves the profile you are leaving first, so every profile resumes
-where you left it. Saved state lives in `~/.config/rx/radio/`; the defaults
+where you left it. Re-running the profile already up just brings it to the
+front. Saved state lives in `~/.config/rx/radio/`; the defaults
 live in `radio` itself and are only starting points.
 
 | Profile | Tuning | Ham It Up |
@@ -439,20 +446,25 @@ to SDR++'s current name on every switch, and i3 starts SDR++ at login through
 thing a file cannot change; `radio` says when to flip it.
 
 SDR++ rewrites its config on exit, so `radio` closes it before touching
-anything and restarts it already playing (`--autostart`).
+anything and restarts it already playing (`--autostart`). It shows
+workspace 1 while SDR++ starts: SDR++ blocks in window creation until its
+window is visible, so started onto a workspace that is not on screen it hangs
+for good behind a black window. It then checks SDR++ really opened the dongle,
+and restarts it once if not.
 
 Every switch also sets SDR++'s FFT to its minimum — 1024 points at one frame
 a second. SDR++ computes the FFT even with the FFT and waterfall hidden, and
-then it feeds only the signal meter.
+then it feeds only the signal meter. That cut its memory from 1–2 GB to about
+150 MB; CPU barely moved, since demodulation and the GUI dominate it.
 
 ## JS8 over the SDR
 
 **`js8ghost`** (GhostNet, 7.107 MHz) and **`js8call`** (standard JS8,
-7.078 MHz) each switch SDR++ to the matching profile, set JS8Call's dial to
-agree, and open JS8Call. SDR++ stays on workspace 1 and JS8Call gets
-workspace 2 to itself. `js8call` deliberately shadows `/usr/bin/js8call`, so
-starting JS8Call the usual way tunes the SDR too; it always runs the real
-binary by absolute path. (There is no `js8` command: `/usr/bin/js8` is
+7.078 MHz) are `radio ghostnet` and `radio js8`: whatever is running closes,
+and SDR++ comes up tuned with JS8Call on the matching dial. SDR++ stays on
+workspace 1 and JS8Call gets workspace 2. `js8call` deliberately shadows
+`/usr/bin/js8call`, so starting JS8Call the usual way tunes the SDR too;
+`js8call ARGS...` runs the real binary with those arguments and no retuning. (There is no `js8` command: `/usr/bin/js8` is
 JS8Call's decoder.)
 
 Audio goes SDR++ → the `SDR_to_JS8` PipeWire null sink
@@ -464,7 +476,7 @@ The GhostNet config is receive-only: auto-reply at startup, PSK Reporter and
 APRS spotting are forced off, and the window layout set by hand on this panel
 is reapplied on every run.
 
-The launchers warn if chrony is not synchronised: JS8 slots tolerate about
+JS8 profiles warn if chrony is not synchronised: JS8 slots tolerate about
 2 s of clock error and fail silently beyond it.
 
 ## CHIRP
