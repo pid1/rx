@@ -88,8 +88,8 @@ Every section is skippable with `--skip NAME`, or run alone with `--only NAME`.
 | `rtc` | PCF85063A over i2c, bound once the AIO rails are up (`uconsole-rtc`), `fake-hwclock` as fallback |
 | `gps` | UART + PPS overlays, serial console removed, `gpsd` on `/dev/ttyS0` |
 | `lora` | SPI overlays, `meshtasticd` with the SX1262 config, `meshtastic-ui` dashboard, region |
-| `sdr` | `sdrpp-brown`, `rtl-sdr`, DVB-T driver blacklisted, gqrx bookmarks migrated |
-| `ham` | JS8Call + hamlib, GhostNet configuration, SDR→JS8Call loopback sink, `js8` launcher, CHIRP |
+| `sdr` | `sdrpp-brown`, `rtl-sdr`, DVB-T driver blacklisted, gqrx bookmarks migrated, `radio` profiles |
+| `ham` | JS8Call + hamlib, receive-only GhostNet configuration, SDR→JS8Call loopback sink, `js8ghost`/`js8call` launchers, CHIRP |
 | `tailscale` | Tailscale from its official repo |
 
 ### Flags
@@ -376,7 +376,7 @@ i3 launches three apps and places them:
 
 | Workspace | Application | At boot |
 |---|---|---|
-| 1 | SDR++Brown | launched |
+| 1 | SDR++Brown | launched, via `radio resume` |
 | 2 | JS8Call | placement only |
 | 3 | `meshtastic-ui` | placement only |
 
@@ -401,30 +401,67 @@ These use `exec`, which runs only at i3 startup — `i3-msg restart` will not
 relaunch them, by design, since `exec_always` would spawn duplicates on every
 reload.
 
+## Radio profiles
+
+**`radio`** switches SDR++ between saved setups. Each profile is tuning only —
+frequency, offset mode, demodulator and its settings, audio sink and volume,
+RTL-SDR gain — never window layout.
+
+```bash
+radio                 # list; * marks the active profile
+radio dcara           # switch
+radio save            # keep the current tuning in the active profile
+radio save NAME       # ... or as a new profile
+radio reset NAME      # back to the shipped default
+```
+
+Switching saves the profile you are leaving first, so every profile resumes
+where you left it. Saved state lives in `~/.config/rx/radio/`; the defaults
+live in `radio` itself and are only starting points.
+
+| Profile | Tuning | Ham It Up |
+|---|---|---|
+| `ghostnet` | 7.107 MHz USB → JS8Call | upconvert |
+| `js8` | 7.078 MHz USB → JS8Call | upconvert |
+| `vhf` | 146.520 MHz FM (2 m calling) | bypass |
+| `dcara` | 146.920 MHz FM (DCARA) | bypass |
+| `uhf` | 446.000 MHz FM (70 cm calling) | bypass |
+| `noaa` | 162.550 MHz FM (NOAA weather) | bypass |
+| `fm-93.3`, `fm-105.3` | broadcast WFM, 75 µs de-emphasis | bypass |
+| `am-820` | 820 kHz AM | upconvert |
+
+All of them use the Nooelec behind the Ham It Up, pinned by **serial
+number**. SDR++ names a dongle by enumeration index as well, and the index
+shifts as dongles come and go — an SDR++ started before the Nooelec was
+plugged in opened it under the AIO dongle's label. `radio` resolves the serial
+to SDR++'s current name on every switch, and i3 starts SDR++ at login through
+`radio resume` for the same reason. The Ham It Up's bypass switch is the one
+thing a file cannot change; `radio` says when to flip it.
+
+SDR++ rewrites its config on exit, so `radio` closes it before touching
+anything and restarts it already playing (`--autostart`).
+
 ## JS8 over the SDR
 
-**`js8`** puts SDR++ and JS8Call side by side on workspace 4 (`Alt+4`),
-moving them there if they are already open rather than starting second
-copies. Run it from a terminal or dmenu.
+**`js8ghost`** (GhostNet, 7.107 MHz) and **`js8call`** (standard JS8,
+7.078 MHz) each switch SDR++ to the matching profile, set JS8Call's dial to
+agree, and open JS8Call. SDR++ stays on workspace 1 and JS8Call gets
+workspace 2 to itself. `js8call` deliberately shadows `/usr/bin/js8call`, so
+starting JS8Call the usual way tunes the SDR too; it always runs the real
+binary by absolute path. (There is no `js8` command: `/usr/bin/js8` is
+JS8Call's decoder.)
 
 Audio goes SDR++ → the `SDR_to_JS8` PipeWire null sink
 (`/etc/pipewire/pipewire.conf.d/50-sdr-js8.conf`) → JS8Call, which records
 from `SDR_to_JS8.monitor`. JS8Call's input is set to that only when it has
 none, so a rig's sound card picked later is kept.
 
-SDR++ keeps its own config, so set it once in its GUI:
+The GhostNet config is receive-only: auto-reply at startup, PSK Reporter and
+APRS spotting are forced off, and the window layout set by hand on this panel
+is reapplied on every run.
 
-| Where | Setting |
-|---|---|
-| Source | RTL-SDR, the dongle behind the Ham It Up; direct sampling **off** |
-| Source → Offset mode | `Ham-It-Up` (125 MHz) |
-| Radio | USB, ~3 kHz bandwidth |
-| Sinks → Audio | `SDR to JS8 (virtual cable)` |
-| Frequency | whatever JS8Call's dial says — 7.107 MHz for GhostNet |
-
-With no rig attached nothing links the two dials, so retune both together.
-`js8` warns if chrony is not synchronised: JS8 slots tolerate about 2 s of
-clock error and fail silently beyond it.
+The launchers warn if chrony is not synchronised: JS8 slots tolerate about
+2 s of clock error and fail silently beyond it.
 
 ## CHIRP
 
@@ -500,9 +537,9 @@ Three things the script deliberately leaves to you:
   `meshtastic --set lora.region US`. Transmitting on the wrong region is a
   regulatory problem, not a config annoyance.
 - **JS8Call transmit** is not configured — audio out and PTT depend on the
-  rig attached. Groups, grid, callsign, the 7.107 MHz dial and the SDR
-  receive input *are* set; SDR++'s side is a one-time GUI step (see
-  [JS8 over the SDR](#js8-over-the-sdr)).
+  rig attached. Groups, grid, callsign, the dial and the SDR receive input
+  *are* set, and `radio` tunes SDR++ to match (see
+  [Radio profiles](#radio-profiles)).
 - **`hwclock -r` alone can lie**, reporting plausible time sourced from
   elsewhere. Check `/dev/rtc*` and `dmesg`. No output at all usually means the
   CR1220 is in backwards.
