@@ -441,6 +441,10 @@ thing a file cannot change; `radio` says when to flip it.
 SDR++ rewrites its config on exit, so `radio` closes it before touching
 anything and restarts it already playing (`--autostart`).
 
+Every switch also sets SDR++'s FFT to its minimum — 1024 points at one frame
+a second. SDR++ computes the FFT even with the FFT and waterfall hidden, and
+then it feeds only the signal meter.
+
 ## JS8 over the SDR
 
 **`js8ghost`** (GhostNet, 7.107 MHz) and **`js8call`** (standard JS8,

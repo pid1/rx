@@ -1964,7 +1964,8 @@ GQRXCONV
 
   --no-focus           leave focus where it is (js8ghost / js8call use this)
 
-A profile is tuning only, never layout: frequency and VFO position, offset
+A few display settings (SDRPP_GLOBAL) go with every profile rather than
+any one of them. A profile is tuning only, never layout: frequency and VFO position, offset
 mode, demodulator and all of its settings, audio sink and volume, the
 RTL-SDR's settings and, for JS8 profiles, JS8Call's dial. The defaults below
 are starting points; saved state lives in ~/.config/rx/radio/ and wins.
@@ -2026,6 +2027,11 @@ NFM = {"bandwidth": 12500.0, "squelchEnabled": False}
 WFM = {"bandwidth": 150000.0, "deempMode": "75us", "rds": True,
        "rdsInfo": True, "rdsRegion": "na", "squelchEnabled": False}
 AM = {"bandwidth": 10000.0, "squelchEnabled": False}
+
+# Applied with every profile. SDR++ computes the FFT whether or not the FFT
+# or waterfall is shown, so with both hidden it only feeds the signal meter;
+# the smallest size at one frame a second keeps that alive at almost no CPU.
+SDRPP_GLOBAL = {"fftSize": 1024, "fftRate": 1}
 
 
 def js8(desc, dial):
@@ -2278,6 +2284,7 @@ def plan(p, names):
         c.setdefault("vfoOffsets", {})["Radio"] = float(p["vfo_offset"])
         c["selectedOffset"] = p["offset"]
         c["source"] = "RTL-SDR"
+        c.update(SDRPP_GLOBAL)
         c.setdefault("streams", {}).setdefault("Radio", {}).update(
             sink="Brown Audio", volume=float(p["volume"]), muted=False)
 
