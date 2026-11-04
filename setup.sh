@@ -1281,15 +1281,82 @@ UNIT
   if want rtc; then
     section "Real-time clock"
     apt_install i2c-tools
-    # With a real battery-backed RTC, fake-hwclock's saved timestamp will
-    # fight it on boot. Disabled rather than purged so it is trivial to undo.
-    if systemctl list-unit-files 2>/dev/null | grep -q '^fake-hwclock'; then
-      run systemctl disable --now fake-hwclock || true
-      log "fake-hwclock disabled in favour of the onboard PCF85063A"
+
+    # The kernel probes the PCF85063A early in boot, before aiov2-rails-boot
+    # has brought the AIO rails up, gets no answer ("RTC chip is not present",
+    # -121) and gives up -- so /dev/rtc0 never appears and the clock boots at
+    # whatever date systemd last knew. The chip answers fine once the rails
+    # are on, so bind it then, and load the time from it before chrony starts.
+    #
+    # The same script seeds the chip when the system clock is already
+    # disciplined, which is the state any re-run of this script finds it in.
+    # That replaces a manual 'hwclock -w' that could never work while the
+    # chip was unbound.
+    write_file /usr/local/sbin/uconsole-rtc 0755 <<'RTC'
+#!/bin/sh
+# Managed by rx/setup.sh — bind the AIO v2 RTC once the power rails are up,
+# then either load the system clock from it (boot) or seed it (clock synced).
+set -u
+
+if [ ! -e /dev/rtc0 ]; then
+    for dev in /sys/bus/i2c/devices/*-0051; do
+        [ -e "$dev" ] || continue
+        [ -e "$dev/driver" ] && continue
+        # The rail may still be settling; give the chip a few seconds.
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            echo "${dev##*/}" > /sys/bus/i2c/drivers/rtc-pcf85063/bind 2>/dev/null && break
+            sleep 1
+        done
+    done
+fi
+
+if [ ! -e /dev/rtc0 ]; then
+    echo "uconsole-rtc: no RTC bound — the chip is not answering at 0x51" >&2
+    exit 1
+fi
+
+# At boot this runs before chrony, so 'tracking' fails and the RTC is read.
+# Run later against a disciplined clock, it writes the chip instead -- never
+# the other way round, which would step good time back to the RTC's drift.
+if chronyc -n tracking 2>/dev/null | grep -q '^Leap status *: Normal'; then
+    hwclock --systohc && echo "uconsole-rtc: RTC seeded from the synchronised system clock"
+elif hwclock --hctosys; then
+    echo "uconsole-rtc: system clock set from the RTC"
+else
+    # A chip that lost power (flat or missing CR1220) holds no valid time.
+    # The clock then keeps fake-hwclock's restore until GPS or NTP fixes it.
+    echo "uconsole-rtc: RTC holds no valid time; system clock left alone" >&2
+fi
+exit 0
+RTC
+    write_file /etc/systemd/system/uconsole-rtc.service 0644 <<'UNIT'
+[Unit]
+Description=uConsole AIO v2 RTC (bind after the power rails, then load time)
+After=aiov2-rails-boot.service uconsole-aio-rails.service fake-hwclock.service
+Before=chrony.service time-sync.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/uconsole-rtc
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    run systemctl daemon-reload
+    run systemctl enable uconsole-rtc.service
+    # Not --now: start is a no-op on an already-active oneshot, so call the
+    # script directly; on a synced clock that binds and seeds the chip.
+    run /usr/local/sbin/uconsole-rtc || warn "RTC did not bind — see 'dmesg | grep -i rtc'"
+
+    # fake-hwclock stays on as the fallback for a flat CR1220. It restores
+    # the last-saved time early in boot and only ever moves the clock
+    # forward, and uconsole-rtc runs after it, so a working RTC still wins.
+    if pkg_installed fake-hwclock; then
+      run systemctl enable fake-hwclock
+      log "fake-hwclock enabled as the fallback behind the RTC"
     fi
-    note "RTC, after reboot: confirm the chip is actually bound with 'ls /dev/rtc*' and 'dmesg | grep -i rtc' — 'hwclock -r' alone can report plausible time sourced from elsewhere."
-    note "RTC: once the system clock is NTP-accurate, seed the chip once with: sudo hwclock -w   (it powers up holding garbage otherwise)"
-    note "RTC: no output at all from 'hwclock -r' usually means the CR1220 is missing or in backwards."
+    note "RTC: 'systemctl status uconsole-rtc' says whether the chip bound and which way time went. 'Power loss detected' in dmesg after a full power-off means the CR1220 is flat, missing or in backwards."
   fi
 
   # --------------------------------------------------------------------- gps
@@ -1921,6 +1988,8 @@ frequency. Deliberately NOT carried over, because they would be wrong or
 harmful on the uConsole:
 
   SoundInId/SoundInName/SoundOutId/SoundOutName   macOS Core Audio devices
+                                                  (SoundInName instead defaults
+                                                  to the SDR loopback; below)
   WindowGeometry, Font, RXTextFont, TXTextFont    sized for a Mac, not 1280x480
   Rig, PTTMethod, PTTport, CATSerialPort          depends on the attached radio
   Notifications\\*\\path                            macOS sound file paths
@@ -1973,6 +2042,15 @@ SETTINGS = {
     },
 }
 
+# Written only when the key is absent or empty, so a device picked later in
+# JS8Call's own Settings -> Audio survives re-runs.
+DEFAULTS = {
+    "Configuration": {
+        # Monitor of the PipeWire loopback sink SDR++ plays into.
+        "SoundInName": "SDR_to_JS8.monitor",
+    },
+}
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -2009,6 +2087,13 @@ def main():
             if cp.get(section, key, fallback=None) != val:
                 changed.append("%s/%s" % (section, key))
             cp.set(section, key, val)
+    for section, keys in DEFAULTS.items():
+        if not cp.has_section(section):
+            cp.add_section(section)
+        for key, val in keys.items():
+            if not cp.get(section, key, fallback=""):
+                changed.append("%s/%s" % (section, key))
+                cp.set(section, key, val)
 
     if args.dry_run:
         print("  [dry-run] would write %d key(s) to %s" % (len(changed), ini))
@@ -2035,7 +2120,9 @@ def main():
     print("  callsign %s, grid %s, groups %s"
           % (CALLSIGN, GRID, GROUPS.replace("@@", "@")))
     print("  dial frequency %s MHz" % (int(GHOSTNET_DIAL) / 1e6))
-    print("  NOT set (device-specific, configure in JS8Call): audio in/out devices, PTT method, rig")
+    print("  audio in: %s (unless already set)"
+          % cp.get("Configuration", "SoundInName", fallback=""))
+    print("  NOT set (device-specific, configure in JS8Call): audio out, PTT method, rig")
     return 0
 
 
@@ -2050,10 +2137,110 @@ JS8CONF
         || warn "JS8Call config failed — any existing config was left untouched"
       chown "${DESKTOP_USER}:${USER_GROUP}" "$USER_HOME/.config/JS8Call.ini" 2>/dev/null || true
     fi
+    # Receive path for JS8 without a rig: SDR++ demodulates USB into this
+    # null sink, and JS8Call records from its monitor. A null sink rather
+    # than the speaker's monitor so decoding does not depend on the volume
+    # key, and the speaker stays quiet. System-wide, so it needs no per-user
+    # PipeWire config; PipeWire picks it up at its next start.
+    write_file /etc/pipewire/pipewire.conf.d/50-sdr-js8.conf 0644 <<'PWSINK'
+# Managed by rx/setup.sh — virtual audio cable from SDR++ to JS8Call.
+# SDR++ plays into "SDR_to_JS8"; JS8Call records from SDR_to_JS8.monitor.
+context.objects = [
+  { factory = adapter
+    args = {
+      factory.name     = support.null-audio-sink
+      node.name        = "SDR_to_JS8"
+      node.description = "SDR to JS8 (virtual cable)"
+      media.class      = Audio/Sink
+      audio.position   = [ FL FR ]
+      audio.rate       = 48000
+    }
+  }
+]
+PWSINK
+    log "PipeWire loopback sink SDR_to_JS8 configured"
+
+    write_file /usr/local/bin/js8 0755 <<'JS8'
+#!/bin/bash
+# Managed by rx/setup.sh — SDR++ and JS8Call side by side on workspace 4.
+#
+# SDR++ plays USB audio into the SDR_to_JS8 sink and JS8Call decodes from its
+# monitor. Windows already open are moved rather than relaunched: SDR++ starts
+# at login, and a second instance could not open the RTL-SDR the first holds.
+set -euo pipefail
+
+WS=4
+SINK=SDR_to_JS8
+# Same matches as the i3 assign rules; SDR++Brown has its version in WM_CLASS.
+SDR_CLASS='(?i)^sdr'
+JS8_CLASS='(?i)^js8call$'
+
+fail() {
+    # Launched from dmenu there is no terminal to print to, so surface
+    # failures where they can actually be seen.
+    if [ -n "${DISPLAY:-}" ] && command -v i3-nagbar >/dev/null 2>&1; then
+        i3-nagbar -t error -m "js8: $1" >/dev/null 2>&1 &
+    fi
+    echo "js8: $1" >&2
+    exit 1
+}
+
+warn() {
+    if [ -n "${DISPLAY:-}" ] && command -v i3-nagbar >/dev/null 2>&1; then
+        i3-nagbar -t warning -m "js8: $1" >/dev/null 2>&1 &
+    fi
+    echo "js8: $1" >&2
+}
+
+[ -n "${DISPLAY:-}" ] || fail "no X display — run this from the i3 session"
+
+# The sink comes from /etc/pipewire/pipewire.conf.d/50-sdr-js8.conf when
+# PipeWire starts; a session that predates that file has to be given it.
+if ! pw-cli ls Node 2>/dev/null | grep -q "node.name = \"$SINK\""; then
+    pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=$SINK node.description=\"SDR to JS8 (virtual cable)\" media.class=Audio/Sink audio.position=[FL FR] object.linger=true }" >/dev/null \
+        || fail "could not create the $SINK audio sink"
+fi
+
+# JS8 slots are 15 s with about 2 s of tolerance. Outside that nothing
+# decodes and nothing says why, so say it here.
+if ! chronyc -n tracking 2>/dev/null | grep -q '^Leap status *: Normal'; then
+    warn "clock not synchronised (no GPS fix and no network?) — JS8 will not decode until it is. See: chronyc sources"
+fi
+
+has_window() {
+    i3-msg -t get_tree | grep -qiE "\"class\":\"$1"
+}
+
+# place <i3 class regex> <tree pattern> <command...>
+place() {
+    local crit=$1 pat=$2 _
+    shift 2
+    if ! has_window "$pat"; then
+        setsid -f "$@" >/dev/null 2>&1
+        for _ in $(seq 1 60); do
+            has_window "$pat" && break
+            sleep 0.5
+        done
+        has_window "$pat" || fail "$1 did not open a window"
+    fi
+    # The assign rules put new windows on 1 and 2; this overrides them.
+    i3-msg -q "[class=\"$crit\"] move to workspace number $WS"
+}
+
+place "$SDR_CLASS" 'sdr' sdrpp
+place "$JS8_CLASS" 'js8call"' js8call
+
+i3-msg -q "workspace number $WS"
+i3-msg -q "[class=\"$SDR_CLASS\"] focus, layout splith"
+i3-msg -q "[class=\"$JS8_CLASS\"] focus"
+JS8
+    log "installed the js8 launcher"
+
     note "JS8Call: groups @GHOSTNET, @GSTFLASH, @GNUSATX; dial 7.107 MHz (GhostNet)."
-    note "JS8Call: set audio in/out to your USB sound device under Settings -> Audio, and PTT under Settings -> Radio — neither was migrated, as they depend on the attached rig."
+    note "JS8 receive: run 'js8' (terminal or dmenu) for SDR++ and JS8Call side by side on workspace 4. JS8Call's audio input defaults to the SDR_to_JS8.monitor loopback; a device picked under Settings -> Audio is kept on re-runs."
+    note "SDR++ for JS8, set once in its GUI (it keeps its own config): RTL-SDR source with the Ham It Up, Offset mode 'Ham-It-Up' (125 MHz), direct sampling off; Radio USB, ~3 kHz bandwidth; Audio sink 'SDR to JS8 (virtual cable)'; tune to the dial JS8Call shows, since with no rig they are not linked."
     note "JS8Call: 7.107 is set as the dial but is not in the preset Frequencies list; add it under Settings -> Frequencies to get it in the dropdown."
-    note "JS8Call needs an external rig (CAT + USB audio) or an SDR fed through a loopback sink — the uConsole has no HF radio of its own."
+    note "JS8Call transmit needs an external rig (CAT + USB audio) — the SDR is receive-only. Set audio out and PTT under Settings -> Audio / Radio."
   fi
 
   # ---------------------------------------------------------------- tailscale

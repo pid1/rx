@@ -85,11 +85,11 @@ Every section is skippable with `--skip NAME`, or run alone with `--only NAME`.
 | `desktop` | X11 + i3, autologin on tty1, Alacritty, Atkinson fonts, PipeWire, blanking disabled |
 | `claude` | Claude Code from Anthropic's signed apt repo |
 | `aio` | HackerGadgets AIO v2 metapackage, GPIO power rails, boot overlays |
-| `rtc` | PCF85063A over i2c, `fake-hwclock` disabled |
+| `rtc` | PCF85063A over i2c, bound once the AIO rails are up (`uconsole-rtc`), `fake-hwclock` as fallback |
 | `gps` | UART + PPS overlays, serial console removed, `gpsd` on `/dev/ttyS0` |
 | `lora` | SPI overlays, `meshtasticd` with the SX1262 config, `meshtastic-ui` dashboard, region |
 | `sdr` | `sdrpp-brown`, `rtl-sdr`, DVB-T driver blacklisted, gqrx bookmarks migrated |
-| `ham` | JS8Call + hamlib, GhostNet configuration, CHIRP |
+| `ham` | JS8Call + hamlib, GhostNet configuration, SDR→JS8Call loopback sink, `js8` launcher, CHIRP |
 | `tailscale` | Tailscale from its official repo |
 
 ### Flags
@@ -401,6 +401,31 @@ These use `exec`, which runs only at i3 startup — `i3-msg restart` will not
 relaunch them, by design, since `exec_always` would spawn duplicates on every
 reload.
 
+## JS8 over the SDR
+
+**`js8`** puts SDR++ and JS8Call side by side on workspace 4 (`Alt+4`),
+moving them there if they are already open rather than starting second
+copies. Run it from a terminal or dmenu.
+
+Audio goes SDR++ → the `SDR_to_JS8` PipeWire null sink
+(`/etc/pipewire/pipewire.conf.d/50-sdr-js8.conf`) → JS8Call, which records
+from `SDR_to_JS8.monitor`. JS8Call's input is set to that only when it has
+none, so a rig's sound card picked later is kept.
+
+SDR++ keeps its own config, so set it once in its GUI:
+
+| Where | Setting |
+|---|---|
+| Source | RTL-SDR, the dongle behind the Ham It Up; direct sampling **off** |
+| Source → Offset mode | `Ham-It-Up` (125 MHz) |
+| Radio | USB, ~3 kHz bandwidth |
+| Sinks → Audio | `SDR to JS8 (virtual cable)` |
+| Frequency | whatever JS8Call's dial says — 7.107 MHz for GhostNet |
+
+With no rig attached nothing links the two dials, so retune both together.
+`js8` warns if chrony is not synchronised: JS8 slots tolerate about 2 s of
+clock error and fail silently beyond it.
+
 ## CHIRP
 
 Radio programming, from Debian's package. Run `chirp` (symlinked) or `chirpw`
@@ -460,9 +485,10 @@ nothing until then.
 
 ```bash
 ls /dev/rtc* && dmesg | grep -i rtc   # RTC actually bound
-sudo hwclock -w                       # seed it once, when NTP time is good
+systemctl status uconsole-rtc         # RTC bound and seeded (automatic)
 rtl_test -t                           # SDR enumerated (its rail is on by default)
-sudo aiov2_ctl GPS on && cgps -s      # GPS rail is OFF by default
+cgps -s                               # GPS fix; needs a sky view
+chronyc sources                       # NMEA and PPS reachable, PPS '*' once locked
 claude                                # log in via browser prompt
 ssh jroemer@clockworkpi.local         # from another machine
 sudo tailscale up                     # unless TS_AUTHKEY was passed
@@ -473,8 +499,10 @@ Three things the script deliberately leaves to you:
 - **Meshtastic will not transmit** until a LoRa region is set:
   `meshtastic --set lora.region US`. Transmitting on the wrong region is a
   regulatory problem, not a config annoyance.
-- **JS8Call audio and PTT** are not configured — they depend on the rig
-  attached. Groups, grid, callsign and the 7.107 MHz dial *are* set.
+- **JS8Call transmit** is not configured — audio out and PTT depend on the
+  rig attached. Groups, grid, callsign, the 7.107 MHz dial and the SDR
+  receive input *are* set; SDR++'s side is a one-time GUI step (see
+  [JS8 over the SDR](#js8-over-the-sdr)).
 - **`hwclock -r` alone can lie**, reporting plausible time sourced from
   elsewhere. Check `/dev/rtc*` and `dmesg`. No output at all usually means the
   CR1220 is in backwards.
