@@ -33,10 +33,11 @@ Only SDR++ starts on its own. JS8Call and the dashboard keep their placement
 rules, so they land on 2 and 3 whenever started — `Alt+2` and `Alt+3` reach
 those workspaces at any time, whether or not anything is on them.
 
-`meshtasticd` does not run at boot either. **`mesh`** starts the daemon, waits
-for the radio, and opens the dashboard — run it from dmenu (`Alt+Shift+d`).
-It uses a sudo rule scoped to exactly `systemctl start meshtasticd`, installed
-at `/etc/sudoers.d/50-meshtasticd` and validated with `visudo -c` before being
+No mesh daemon runs at boot either. **`radio mesh`** starts the active one
+and opens its client — the dashboard on workspace 3 for Meshtastic — from a
+terminal or dmenu (`Alt+Shift+d`). It starts the daemon through `rx-mesh`, the
+one command the desktop user may run as root, under a sudo rule at
+`/etc/sudoers.d/50-rx-mesh` that is validated with `visudo -c` before being
 put in place. Failures surface through `i3-nagbar`, since dmenu gives it no
 terminal to print to.
 

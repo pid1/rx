@@ -75,7 +75,7 @@ main() {
   local BEGIN_MARK='# >>> uconsole-setup >>>'
   local END_MARK='# <<< uconsole-setup <<<'
 
-  local ALL_SECTIONS=(base desktop claude aio rtc gps lora sdr ham tailscale)
+  local ALL_SECTIONS=(base firewall desktop claude aio rtc gps lora sdr ham tailscale)
 
   # Hardware groups. The account created by the image's first-boot wizard is
   # not in these, and no AIO peripheral works non-root without them.
@@ -607,6 +607,91 @@ MAINT
     note "Routine upkeep is one command: 'sudo maint' — apt update + full-upgrade + autoremove, then re-applies this script (idempotent, so only drift changes). 'sudo maint --dry-run' previews the config half."
     note "SSH is listening on 22, key-only (password auth disabled), keys synced from github.com/${GH_KEY_USER}.keys every 5 minutes."
     fi
+  fi
+
+  # ---------------------------------------------------------------- firewall
+
+  # Default-deny inbound. Nothing on this device needs to accept unsolicited
+  # traffic except SSH, and some of what it runs would otherwise be wide
+  # open -- meshtasticd serves an unauthenticated API (4403) and web client
+  # (443) on every interface, as packaged.
+  #
+  # Its own table and its own unit rather than /etc/nftables.conf: Debian's
+  # file starts with `flush ruleset`, which would wipe the rules Tailscale
+  # installs through iptables-nft. A separate table's drop still applies to
+  # everything, since a packet must pass every base chain on its hook.
+  if want firewall; then
+    section "Firewall"
+    apt_install nftables
+
+    write_file /etc/rx/firewall.nft 0644 <<'NFT'
+#!/usr/sbin/nft -f
+# Managed by rx/setup.sh — inbound: SSH and replies only. Loaded by
+# rx-firewall.service. Replaces only its own table, never the ruleset.
+
+table inet rx_firewall
+delete table inet rx_firewall
+
+table inet rx_firewall {
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        iif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+
+        # IPv6 does not work without these: neighbour discovery, router
+        # adverts (link-local, hop limit 255) and DHCPv6 replies, which go
+        # to a multicast solicit that conntrack cannot match.
+        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert } accept
+        ip6 saddr fe80::/10 ip6 hoplimit 255 icmpv6 type nd-router-advert accept
+        ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept
+
+        # Key-only (sshd_config.d/10-no-password.conf), on every interface.
+        tcp dport 22 accept
+    }
+
+    # Not a router.
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+}
+NFT
+
+    write_file /etc/systemd/system/rx-firewall.service 0644 <<'FWUNIT'
+[Unit]
+Description=rx inbound firewall (SSH and replies only)
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/sbin/nft -c -f /etc/rx/firewall.nft
+ExecStart=/usr/sbin/nft -f /etc/rx/firewall.nft
+ExecReload=/usr/sbin/nft -f /etc/rx/firewall.nft
+ExecStop=-/usr/sbin/nft delete table inet rx_firewall
+
+[Install]
+WantedBy=sysinit.target
+FWUNIT
+    run systemctl daemon-reload
+    run systemctl enable rx-firewall.service
+
+    # Check before loading: a ruleset that fails to parse loads nothing, but
+    # this says so here rather than leaving the device open without a word.
+    # Loading keeps established connections, an SSH session included.
+    if $DRY_RUN; then
+      log "[dry-run] nft -c -f /etc/rx/firewall.nft, then load it"
+    elif nft -c -f /etc/rx/firewall.nft; then
+      run systemctl restart rx-firewall.service
+      log "firewall loaded: inbound SSH and replies only"
+    else
+      warn "firewall rules failed to parse; NOT loaded — the device is unfiltered"
+    fi
+    note "Firewall: nothing reaches this device unsolicited except SSH on 22. Other machines can no longer resolve clockworkpi.local (mDNS answers are inbound); use its IP or Tailscale name. Rules: /etc/rx/firewall.nft; 'sudo nft list table inet rx_firewall'."
   fi
 
   # ----------------------------------------------------------------- desktop
@@ -1445,7 +1530,7 @@ CHRONYGPS
   # -------------------------------------------------------------------- lora
 
   if want lora; then
-    section "LoRa / Meshtastic"
+    section "LoRa mesh (Meshtastic / MeshCore)"
     require_akrex_repo
 
     apt_install libgpiod-dev libyaml-cpp-dev libbluetooth-dev libusb-1.0-0-dev \
@@ -1478,12 +1563,20 @@ CHRONYGPS
       note "meshtasticd was not installed — the SPI overlays are in place, so the radio is ready once you do."
     fi
 
-    # Current meshtasticd reads drop-ins from config.d. Only patch the
-    # monolithic config.yaml path by hand if that directory is absent —
-    # sed-ing structured YAML in place is a good way to break a config.
-    if [[ -d /etc/meshtasticd/config.d ]] || $DRY_RUN; then
-      write_file /etc/meshtasticd/config.d/uconsole-aio-v2.yaml 0644 <<'MESHYAML'
-# Managed by rx/setup.sh — HackerGadgets AIO v2 (SX1262) on uConsole CM4.
+    # meshtasticd gets a config of its own rather than the packaged
+    # config.yaml, which the AIO metapackage edits to add `GPS: SerialPath:
+    # /dev/ttyS0`. A config.d drop-in cannot remove that key, and gpsd owns
+    # the port to feed chrony; two readers on one UART garble both streams.
+    # Same state directory as before, so the node keeps its identity.
+    if [[ -f /etc/meshtasticd/config.d/uconsole-aio-v2.yaml ]] \
+       && grep -qs 'Managed by rx/setup.sh' /etc/meshtasticd/config.d/uconsole-aio-v2.yaml; then
+      run rm -f /etc/meshtasticd/config.d/uconsole-aio-v2.yaml
+      log "removed the old config.d drop-in (superseded by rx.yaml)"
+    fi
+    write_file /etc/meshtasticd/rx.yaml 0644 <<'MESHYAML'
+# Managed by rx/setup.sh — meshtasticd on the HackerGadgets AIO v2 (SX1262).
+# Started with --config by meshtasticd.service.d/50-rx.conf, in place of the
+# packaged config.yaml.
 Lora:
   Module: sx1262
   DIO2_AS_RF_SWITCH: true
@@ -1493,13 +1586,121 @@ Lora:
   Reset: 25
   spidev: spidev1.0
 
-# No GPS block on purpose. gpsd owns /dev/ttyS0 to feed chrony, and a second
-# reader on that port would fight it for the receiver.
+# No GPS block on purpose: gpsd owns /dev/ttyS0 to feed chrony.
+
+Logging:
+  LogLevel: info
+
+Webserver:
+  Port: 443
+  RootPath: /usr/share/meshtasticd/web
+  SSLKey: /etc/meshtasticd/ssl/private_key.pem
+  SSLCert: /etc/meshtasticd/ssl/certificate.pem
+
+General:
+  MaxNodes: 200
+  MaxMessageQueue: 100
+  ConfigDirectory: /etc/meshtasticd/config.d/
 MESHYAML
-      log "wrote /etc/meshtasticd/config.d/uconsole-aio-v2.yaml"
-    else
-      warn "no /etc/meshtasticd/config.d — leaving config.yaml alone"
-      note "Add the SX1262 block (Module sx1262, IRQ 26, Busy 24, Reset 25, spidev1.0) to /etc/meshtasticd/config.yaml by hand."
+
+    # Both mesh daemons drive the same SX1262, so at most one may run, and
+    # only when asked for. aiov2_ctl starts meshtasticd every time it powers
+    # the LoRa rail -- at boot, and on every run of the aio section -- so
+    # rather than fight it, each unit refuses to start unless rx-mesh has
+    # left a flag in /run, which is empty at every boot.
+    write_file /etc/systemd/system/meshtasticd.service.d/50-rx.conf 0644 <<'MESHUNIT'
+# Managed by rx/setup.sh — start only through rx-mesh, with rx's config.
+[Service]
+ExecCondition=/usr/bin/test -e /run/rx/mesh/meshtastic
+ExecStart=
+ExecStart=/usr/bin/meshtasticd --config=/etc/meshtasticd/rx.yaml
+MESHUNIT
+
+    write_file /usr/local/sbin/rx-mesh 0755 <<'RXMESH'
+#!/bin/sh
+# Managed by rx/setup.sh — the one way to start or stop the mesh daemons that
+# share the AIO's LoRa radio. Run as root (radio calls it through sudo).
+#
+#   rx-mesh start meshtastic|meshcore   stop the other, then start this one
+#   rx-mesh stop                        stop both
+#   rx-mesh status                      the running network, or "off"
+#   rx-mesh release-pins                free the radio's GPIO lines
+#
+# Each unit has ExecCondition=test -e /run/rx/mesh/<network>, so nothing else
+# can start it: not boot, and not aiov2_ctl, which starts meshtasticd whenever
+# it powers the LoRa rail.
+set -eu
+FLAGS=/run/rx/mesh
+
+unit() {
+    case $1 in
+        meshtastic) echo meshtasticd ;;
+        meshcore)   echo raspberrypimc-companion ;;
+        *)          echo "rx-mesh: unknown network '$1'" >&2; exit 2 ;;
+    esac
+}
+
+release_pins() {
+    # MeshCoreRPI drives BUSY, RESET and IRQ through sysfs and leaves them
+    # exported when it stops; meshtasticd then cannot claim them ("cannot
+    # claim pin GPIO26"). sysfs numbers are offset by the lowest chip base,
+    # 512 on current Pi kernels -- the same rule MeshCoreRPI uses.
+    base=""
+    for c in /sys/class/gpio/gpiochip*; do
+        [ -e "$c/base" ] || continue
+        b=$(cat "$c/base")
+        if [ -z "$base" ] || [ "$b" -lt "$base" ]; then base=$b; fi
+    done
+    [ -n "$base" ] || return 0
+    for pin in 24 25 26; do
+        n=$((base + pin))
+        if [ -e "/sys/class/gpio/gpio$n" ]; then echo "$n" > /sys/class/gpio/unexport || true; fi
+    done
+}
+
+stop_all() {
+    rm -f "$FLAGS/meshtastic" "$FLAGS/meshcore"
+    systemctl stop meshtasticd raspberrypimc-companion 2>/dev/null || true
+    release_pins
+}
+
+case ${1:-} in
+    start)
+        net=${2:-}; u=$(unit "$net")
+        if [ -e "$FLAGS/$net" ] && systemctl is-active --quiet "$u"; then exit 0; fi
+        stop_all
+        mkdir -p "$FLAGS"
+        : > "$FLAGS/$net"
+        systemctl reset-failed "$u" 2>/dev/null || true
+        systemctl start "$u"
+        ;;
+    stop)
+        stop_all
+        ;;
+    status)
+        for net in meshtastic meshcore; do
+            if systemctl is-active --quiet "$(unit "$net")"; then echo "$net"; exit 0; fi
+        done
+        echo off
+        ;;
+    release-pins)
+        release_pins
+        ;;
+    *)
+        echo "usage: rx-mesh start meshtastic|meshcore | stop | status | release-pins" >&2
+        exit 2
+        ;;
+esac
+RXMESH
+    run systemctl daemon-reload
+    # Not at boot: the flags above already guarantee that, and disabling
+    # keeps systemctl's own view honest. aiov2_ctl's switch is left off too,
+    # but only written when it is not already -- its "off" path runs
+    # `disable --now`, which would stop a running node on every maint run.
+    run systemctl disable meshtasticd 2>/dev/null || true
+    if command -v aiov2_ctl >/dev/null 2>&1 \
+       && ! aiov2_ctl --mesh-on-boot status 2>/dev/null | grep -q 'mesh_on_boot: off'; then
+      run aiov2_ctl --mesh-on-boot off || warn "could not turn off aiov2_ctl's mesh autostart"
     fi
 
     # meshtastic-mui provides /usr/bin/meshtastic-ui, the dashboard.
@@ -1509,129 +1710,410 @@ MESHYAML
       warn "meshtastic-mui not available in any configured repo"
     fi
 
-    # aiov2_ctl owns whether meshtasticd starts at boot; going through
-    # systemctl as well would give two things an opinion about it.
-    # meshtasticd is started on demand by `mesh`, not at boot.
-    if command -v aiov2_ctl >/dev/null 2>&1; then
-      run aiov2_ctl --mesh-on-boot off || warn "could not stop meshtasticd starting at boot"
-    elif [[ -f /lib/systemd/system/meshtasticd.service ]] || $DRY_RUN; then
-      run systemctl daemon-reload
-      run systemctl enable meshtasticd || warn "could not enable meshtasticd"
-    fi
-
     # The radio needs /dev/spidev1.0 from the spi1-1cs overlay. Say so plainly
     # rather than leaving a daemon that starts and finds nothing.
     if ! $DRY_RUN && [[ ! -e /dev/spidev1.0 ]]; then
       warn "/dev/spidev1.0 does not exist — the LoRa radio cannot be reached until the spi1-1cs overlay is active (reboot)."
-      note "LoRa: /dev/spidev1.0 was missing at setup time. Reboot, then confirm it exists and 'systemctl status meshtasticd' is running."
+      note "LoRa: /dev/spidev1.0 was missing at setup time. Reboot, then check it exists before 'radio meshtastic'."
     fi
 
-    # The region lives in the node's own config, not in a file, so it is set
-    # through the client against a running daemon. The CLI is a Python package
-    # with no Debian equivalent; a venv keeps it off the system interpreter,
-    # which bookworm marks externally-managed.
-    local mtcli=/opt/meshtastic-cli
-    if ! $DRY_RUN; then
-      if [[ ! -x $mtcli/bin/meshtastic ]]; then
-        apt_install_opt python3-venv
-        if python3 -m venv "$mtcli" 2>/dev/null \
-           && "$mtcli/bin/pip" install --quiet --upgrade pip meshtastic 2>/dev/null; then
-          ln -sf "$mtcli/bin/meshtastic" /usr/local/bin/meshtastic
-          log "installed the meshtastic CLI into $mtcli"
-        else
-          warn "could not install the meshtastic CLI; set the region by hand"
-        fi
-      fi
+    # MeshCore on Linux: MeshCoreRPI, a port of the MeshCore firmware to the
+    # Pi, run as a companion (the node a client app talks to). A third-party
+    # fork, so pinned to one release and checked against its digest; bump
+    # both together. Its 1.8 V TCXO default and its handling of the 512 sysfs
+    # GPIO offset were read in its source before choosing it.
+    local MC_VER=0.2.4+de72da2
+    local MC_DEB="raspberrypimc-native-companion_${MC_VER}_arm64.deb"
+    local MC_URL="https://github.com/engperini/MeshCoreRPI/releases/download/v${MC_VER%%+*}/${MC_DEB}"
+    local MC_SHA=3301d139cc206c4bd548c5935cf59afcfc0353cd1d62fed9292e067b72a7a318
 
-      if [[ -x $mtcli/bin/meshtastic ]] && systemctl is-active --quiet meshtasticd; then
-        local cur
-        # `|| cur=""` is load-bearing: under pipefail a grep that matches
-        # nothing makes the assignment itself non-zero, and set -e would end
-        # the run here.
-        cur=$(timeout 30 "$mtcli/bin/meshtastic" --host localhost --get lora.region 2>/dev/null \
-              | grep -oE '[A-Z_]+$' | head -1) || cur=""
-        if [[ $cur == "$LORA_REGION" ]]; then
-          log "LoRa region already $LORA_REGION"
+    # The env file first: the package's postinst copies its example only when
+    # none exists, and restarts the service on upgrade (which the
+    # ExecCondition below then refuses unless MeshCore is the active network).
+    write_file /etc/raspberrypimc/companion.env 0644 <<'MCENV'
+# Managed by rx/setup.sh — MeshCoreRPI companion on the AIO v2's SX1262.
+# Radio: the North Texas MeshCore settings (ntxmesh.com/join): 910.525 MHz,
+# 62.5 kHz, SF 7, CR 5. Applied at every start; the client app cannot
+# change them.
+RPI_FREQ_HZ=910525000
+RPI_BW_HZ=62500
+RPI_SF=7
+RPI_CR=5
+# The firmware reports 20 dBm as its maximum.
+RPI_TX_DBM=20
+RPI_RADIO_DRIVER=sx1262
+RPI_DATA_DIR=/var/lib/raspberrypimc/userdata
+# spidev1.0, with chip select left to the kernel (-1: no manual CS pin).
+RPI_SPI_DEV_PREFIX=/dev/spidev
+RPI_SPI_BUS=1
+RPI_SPI_CS=0
+RPI_CS_PIN=-1
+RPI_SPI_SPEED_HZ=1000000
+RPI_RESET_PIN=25
+RPI_BUSY_PIN=24
+RPI_IRQ_PIN=26
+RPI_TXEN_PIN=-1
+RPI_RXEN_PIN=-1
+# 1.8 V TCXO on DIO3, RF switch on DIO2 -- as in meshtasticd's config.
+RPI_USE_TCXO=1
+RPI_USE_DIO2_RF=1
+# Clients connect over loopback only: the port is unauthenticated.
+RPI_COMPANION_TCP_PORT=5000
+RPI_COMPANION_TCP_HOST=127.0.0.1
+RPI_COMPANION_BLE_ENABLE=0
+# Its web GUI would listen on 0.0.0.0:8080 without a password.
+RPI_COMPANION_WEB_ENABLE=0
+RPI_ADVERT_INTERVAL_MIN=0
+RPI_ADVERT_MODE=flood
+MCENV
+    write_file /etc/systemd/system/raspberrypimc-companion.service.d/50-rx.conf 0644 <<'MCUNIT'
+# Managed by rx/setup.sh — start only through rx-mesh; free the radio's pins
+# on the way out so meshtasticd can claim them.
+[Service]
+ExecCondition=/usr/bin/test -e /run/rx/mesh/meshcore
+ExecStopPost=/usr/local/sbin/rx-mesh release-pins
+MCUNIT
+    run systemctl daemon-reload
+
+    local mc_have=""
+    mc_have=$(dpkg-query -W -f='${Version}' raspberrypimc-native-companion 2>/dev/null) || mc_have=""
+    if [[ $mc_have == "$MC_VER" ]]; then
+      log "MeshCoreRPI companion $MC_VER already installed"
+    elif [[ $(dpkg --print-architecture) != arm64 ]]; then
+      warn "MeshCoreRPI ships arm64 only; skipping MeshCore"
+    elif $DRY_RUN; then
+      log "[dry-run] install MeshCoreRPI companion $MC_VER from $MC_URL"
+    else
+      local mc_tmp; mc_tmp=$(mktemp -d)
+      if curl -fsSL --max-time 120 "$MC_URL" -o "$mc_tmp/$MC_DEB" \
+         && printf '%s  %s\n' "$MC_SHA" "$mc_tmp/$MC_DEB" | sha256sum -c --quiet -; then
+        if apt-get install -y "$mc_tmp/$MC_DEB"; then
+          log "installed MeshCoreRPI companion $MC_VER"
         else
-          if timeout 60 "$mtcli/bin/meshtastic" --host localhost \
-               --set lora.region "$LORA_REGION" >/dev/null 2>&1; then
-            log "LoRa region set to $LORA_REGION"
-          else
-            warn "could not set the LoRa region; run: meshtastic --host localhost --set lora.region $LORA_REGION"
-          fi
-        fi
-        # Node identity. Read back rather than trusting the exit status: the
-        # node applies the change and then drops the connection, so the client
-        # reports a broken pipe even on success.
-        local owner
-        owner=$(timeout 40 "$mtcli/bin/meshtastic" --host localhost --info 2>/dev/null \
-                | grep -m1 "^Owner:") || owner=""
-        if [[ $owner == *"$NODE_NAME ($NODE_SHORT)"* ]]; then
-          log "node identity already $NODE_NAME ($NODE_SHORT)"
-        else
-          timeout 90 "$mtcli/bin/meshtastic" --host localhost \
-            --set-owner "$NODE_NAME" --set-owner-short "$NODE_SHORT" >/dev/null 2>&1 || true
-          sleep 8
-          owner=$(timeout 40 "$mtcli/bin/meshtastic" --host localhost --info 2>/dev/null \
-                  | grep -m1 "^Owner:") || owner=""
-          if [[ $owner == *"$NODE_NAME ($NODE_SHORT)"* ]]; then
-            log "node identity set to $NODE_NAME ($NODE_SHORT)"
-          else
-            warn "could not set the node identity; run: meshtastic --host localhost --set-owner $NODE_NAME --set-owner-short $NODE_SHORT"
-          fi
+          warn "MeshCoreRPI install failed"
         fi
       else
-        note "LoRa region and node identity are not set yet. Once meshtasticd is running: meshtastic --host localhost --set lora.region ${LORA_REGION} --set-owner ${NODE_NAME} --set-owner-short ${NODE_SHORT}  — nothing transmits until the region is set."
+        warn "MeshCoreRPI download failed or did not match its pinned digest; MeshCore not installed"
       fi
+      rm -rf "$mc_tmp"
+    fi
+    # Its postinst enables the service at boot; rx-mesh starts it instead.
+    if [[ -f /lib/systemd/system/raspberrypimc-companion.service ]]; then
+      run systemctl disable raspberrypimc-companion 2>/dev/null || true
     fi
 
-    # Deliberately not set: transmitting on the wrong region is a regulatory
-    # problem, not a config annoyance.
-    # `mesh` brings the whole stack up in one step, and appears in dmenu by
-    # virtue of being on PATH. meshtasticd does not run at boot, so the UI
-    # alone would show a dashboard with nothing behind it.
-    write_file /usr/local/bin/mesh 0755 <<'MESHLAUNCH'
-#!/bin/bash
-# Managed by rx/setup.sh — start meshtasticd, then the dashboard.
-set -euo pipefail
-
-fail() {
-    # Launched from dmenu there is no terminal to print to, so surface
-    # failures where they can actually be seen.
-    if [ -n "${DISPLAY:-}" ] && command -v i3-nagbar >/dev/null 2>&1; then
-        i3-nagbar -t error -m "mesh: $1" >/dev/null 2>&1 &
+    # Python clients, each in a venv: neither has a Debian package, and
+    # bookworm marks the system interpreter externally-managed. radio talks
+    # to the nodes through them.
+    local mtcli=/opt/meshtastic-cli mccli=/opt/meshcore-cli
+    if ! $DRY_RUN; then
+      apt_install_opt python3-venv
+      if [[ ! -x $mtcli/bin/meshtastic ]]; then
+        if python3 -m venv "$mtcli" 2>/dev/null \
+           && "$mtcli/bin/pip" install --quiet --upgrade pip meshtastic 2>/dev/null; then
+          log "installed the meshtastic CLI into $mtcli"
+        else
+          warn "could not install the meshtastic CLI"
+        fi
+      fi
+      [[ -x $mtcli/bin/meshtastic ]] && ln -sf "$mtcli/bin/meshtastic" /usr/local/bin/meshtastic
+      if [[ ! -x $mccli/bin/meshcli ]]; then
+        if python3 -m venv "$mccli" 2>/dev/null \
+           && "$mccli/bin/pip" install --quiet --upgrade pip meshcore-cli 2>/dev/null; then
+          log "installed meshcore-cli into $mccli"
+        else
+          warn "could not install meshcore-cli"
+        fi
+      fi
+      [[ -x $mccli/bin/meshcli ]] && ln -sf "$mccli/bin/meshcli" /usr/local/bin/meshcore-cli
     fi
-    echo "mesh: $1" >&2
-    exit 1
+
+    # The node-side half of `radio meshtastic`: its settings and the mesh
+    # commands, through the meshtastic library in the CLI's venv. Identity
+    # and region come from the config at the top of this script.
+    write_file /usr/local/lib/rx/meshtastic_ops.py 0644 <<'MTOPS'
+"""Managed by rx/setup.sh — Meshtastic operations for radio, run with the
+meshtastic CLI's venv interpreter (/opt/meshtastic-cli/bin/python).
+
+  apply            put the North Texas settings and our identity in effect
+  nodes            heard nodes, most recent first
+  send TEXT        to the primary channel
+  dm NAME TEXT     direct message; NAME is a long or short name, or !id
+  join URL         add the channels in a shared URL, keeping ours
+  info             identity, radio, channels and policy
+
+Settings follow NTX Mesh (ntxmesh.com/join): every metroplex county runs
+LONG_FAST except Wise. Position is never sent.
+"""
+import json
+import logging
+import os
+import sys
+import time
+
+from meshtastic.tcp_interface import TCPInterface
+
+# The library logs tracebacks from its heartbeat thread whenever a connection
+# closes under it, which every short-lived command here does.
+logging.disable(logging.CRITICAL)
+
+
+def mesh_conf():
+    # Written by setup.sh from the config at the top of it.
+    conf = {}
+    with open("/etc/rx/mesh.conf", encoding="utf-8") as fh:
+        for line in fh:
+            key, sep, value = line.strip().partition("=")
+            if sep and not key.startswith("#"):
+                conf[key] = value
+    return conf
+
+
+CONF = mesh_conf()
+OWNER_LONG, OWNER_SHORT, REGION = CONF["NODE_NAME"], CONF["NODE_SHORT"], CONF["LORA_REGION"]
+
+# Slot 20 is LongFast's default, 906.875 MHz in the US. Pinned rather than
+# left at 0, which hashes the primary channel's name: joining a private
+# channel as primary would otherwise move the node off the regional
+# frequency.
+WANT = {
+    "config": {
+        "lora": {"region": REGION, "use_preset": True, "modem_preset": "LONG_FAST",
+                 "channel_num": 20, "hop_limit": 3, "tx_enabled": True,
+                 "ignore_mqtt": True, "config_ok_to_mqtt": False},
+        "device": {"role": "CLIENT", "node_info_broadcast_secs": 10800},
+        # NTX also suggests a 60 s smart minimum interval; the firmware clamps
+        # it to 300, and with no position ever sent it would not matter.
+        "position": {"gps_mode": "NOT_PRESENT", "fixed_position": False,
+                     "position_broadcast_secs": 3600,
+                     "position_broadcast_smart_enabled": True,
+                     "broadcast_smart_minimum_distance": 100},
+    },
+    "module": {
+        "telemetry": {"device_update_interval": 10800, "environment_update_interval": 3600},
+        "mqtt": {"enabled": False},
+    },
 }
 
-if ! systemctl is-active --quiet meshtasticd; then
-    sudo -n systemctl start meshtasticd 2>/dev/null         || fail "could not start meshtasticd (sudo rule missing?)"
-    # The radio needs a moment to initialise before the UI can attach.
-    for _ in $(seq 1 30); do
-        systemctl is-active --quiet meshtasticd && break
-        sleep 1
-    done
-    systemctl is-active --quiet meshtasticd || fail "meshtasticd did not come up"
-fi
+NAMES_CACHE = os.path.expanduser("~/.cache/rx/mesh-names-meshtastic")
 
-exec meshtastic-ui "$@"
-MESHLAUNCH
-    log "installed the 'mesh' launcher"
 
-    # Exactly one command, for one unit, without a password. Validated before
-    # installing: a malformed drop-in makes sudo refuse to run at all.
+def connect():
+    last = None
+    for _ in range(20):
+        try:
+            iface = TCPInterface(hostname="localhost")
+        except Exception as exc:  # the daemon takes a few seconds to listen
+            last = exc
+            time.sleep(1.5)
+            continue
+        # The library's reader thread finishes connecting -- and sends its
+        # first heartbeat -- just after the constructor returns. Closing
+        # before then makes it print a BrokenPipe traceback.
+        time.sleep(0.5)
+        return iface
+    sys.exit("meshtastic: cannot reach meshtasticd on localhost:4403 (%s)" % last)
+
+
+def coerce(msg, key, value):
+    field = msg.DESCRIPTOR.fields_by_name[key]
+    if field.enum_type is not None and isinstance(value, str):
+        return field.enum_type.values_by_name[value].number
+    return value
+
+
+def differences(iface):
+    node = iface.localNode
+    out = []
+    for kind, groups in WANT.items():
+        root = node.localConfig if kind == "config" else node.moduleConfig
+        for group, fields in groups.items():
+            msg = getattr(root, group)
+            for key, value in fields.items():
+                value = coerce(msg, key, value)
+                if getattr(msg, key) != value:
+                    out.append((msg, group, key, value))
+    user = (iface.getMyNodeInfo() or {}).get("user", {})
+    owner_ok = user.get("longName") == OWNER_LONG and user.get("shortName") == OWNER_SHORT
+    return out, owner_ok
+
+
+def apply():
+    # A config write makes the node reboot itself about 7 s later, and writes
+    # that land around that reboot can be lost -- seen with lora and position
+    # together. So write, wait out the reboot, read back, and retry what is
+    # still different.
+    applied = set()
+    for _ in range(3):
+        iface = connect()
+        try:
+            diffs, owner_ok = differences(iface)
+            if not diffs and owner_ok:
+                break
+            if diffs:
+                iface.localNode.beginSettingsTransaction()
+                for msg, group, key, value in diffs:
+                    setattr(msg, key, value)
+                    applied.add("%s.%s" % (group, key))
+                for group in sorted({d[1] for d in diffs}):
+                    iface.localNode.writeConfig(group)
+                iface.localNode.commitSettingsTransaction()
+            if not owner_ok:
+                iface.localNode.setOwner(long_name=OWNER_LONG, short_name=OWNER_SHORT)
+                applied.add("owner")
+            time.sleep(2)
+        finally:
+            iface.close()
+        time.sleep(12)
+    else:
+        iface = connect()
+        try:
+            diffs, owner_ok = differences(iface)
+        finally:
+            iface.close()
+        left = ["%s.%s" % (d[1], d[2]) for d in diffs] + ([] if owner_ok else ["owner"])
+        if left:
+            sys.exit("meshtastic: these would not stick: " + ", ".join(left))
+    print("meshtastic: applied " + ", ".join(sorted(applied)) if applied
+          else "meshtastic: settings already in effect")
+
+
+def heard(iface):
+    me = iface.myInfo.my_node_num
+    rows = []
+    for n in (iface.nodes or {}).values():
+        if n.get("num") == me:
+            continue
+        u = n.get("user", {})
+        rows.append({"id": u.get("id", ""), "long": u.get("longName", "?"),
+                     "short": u.get("shortName", ""), "hw": u.get("hwModel", ""),
+                     "role": u.get("role", "CLIENT"), "snr": n.get("snr"),
+                     "hops": n.get("hopsAway"), "last": n.get("lastHeard") or 0})
+    rows.sort(key=lambda r: r["last"], reverse=True)
+    os.makedirs(os.path.dirname(NAMES_CACHE), exist_ok=True)
+    with open(NAMES_CACHE, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(r["short"] or r["long"] for r in rows if r["short"] or r["long"]) + "\n")
+    return rows
+
+
+def age(epoch):
+    if not epoch:
+        return "-"
+    s = int(time.time() - epoch)
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= n:
+            return "%d%s ago" % (s // n, unit)
+    return "%ds ago" % s
+
+
+def nodes(iface):
+    rows = heard(iface)
+    if not rows:
+        print("no nodes heard yet — node info goes out every few hours, or when a node boots")
+        return
+    print("%-20s %-5s %-10s %-12s %6s %4s  %s" % ("NAME", "SHORT", "ID", "HARDWARE", "SNR", "HOPS", "LAST HEARD"))
+    for r in rows:
+        snr = "" if r["snr"] is None else "%.1f" % r["snr"]
+        hops = "" if r["hops"] is None else str(r["hops"])
+        print("%-20s %-5s %-10s %-12s %6s %4s  %s" % (r["long"][:20], r["short"][:5], r["id"],
+                                                      r["hw"][:12], snr, hops, age(r["last"])))
+
+
+def resolve(iface, name):
+    want = name.lower()
+    for n in (iface.nodes or {}).values():
+        u = n.get("user", {})
+        if want in (u.get("id", "").lower(), u.get("longName", "").lower(), u.get("shortName", "").lower()):
+            return u["id"], u.get("longName", u["id"])
+    sys.exit("meshtastic: no heard node named '%s' (see: radio mesh nodes)" % name)
+
+
+def info(iface):
+    node = iface.localNode
+    lora, dev = node.localConfig.lora, node.localConfig.device
+    enum = lambda msg, key: msg.DESCRIPTOR.fields_by_name[key].enum_type.values_by_number[getattr(msg, key)].name
+    me = (iface.getMyNodeInfo() or {}).get("user", {})
+    print("network   Meshtastic")
+    print("identity  %s (%s) %s" % (me.get("longName"), me.get("shortName"), me.get("id")))
+    print("radio     %s %s, slot %d, hop limit %d, tx %s" % (
+        enum(lora, "region"), enum(lora, "modem_preset"), lora.channel_num, lora.hop_limit,
+        "on" if lora.tx_enabled else "off"))
+    print("role      %s; node info every %dh; position never sent" % (
+        enum(dev, "role"), dev.node_info_broadcast_secs // 3600))
+    print("mqtt      %s" % ("on" if node.moduleConfig.mqtt.enabled else "off"))
+    for ch in node.channels or []:
+        if ch.role == 0:
+            continue
+        role = "primary" if ch.role == 1 else "secondary"
+        print("channel   %d %s %s" % (ch.index, role, ch.settings.name or "(default LongFast)"))
+    print("heard     %d nodes" % len(heard(iface)))
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    cmd, args = sys.argv[1], sys.argv[2:]
+    if cmd == "apply":
+        apply()
+        return
+    iface = connect()
+    try:
+        if cmd == "nodes":
+            nodes(iface)
+        elif cmd == "send" and args:
+            iface.sendText(" ".join(args))
+            time.sleep(2)  # let the queue drain before disconnecting
+            print("sent to the primary channel")
+        elif cmd == "dm" and len(args) >= 2:
+            dest, label = resolve(iface, args[0])
+            iface.sendText(" ".join(args[1:]), destinationId=dest, wantAck=True)
+            time.sleep(2)
+            print("sent to %s" % label)
+        elif cmd == "join" and len(args) == 1:
+            iface.localNode.setURL(args[0], addOnly=True)
+            print("joined; channels now:")
+            info(iface)
+        elif cmd == "info":
+            info(iface)
+        else:
+            sys.exit(__doc__)
+    finally:
+        iface.close()
+
+
+if __name__ == "__main__":
+    main()
+MTOPS
+    # Identity for both networks, read by radio and meshtastic_ops.py.
+    write_file /etc/rx/mesh.conf 0644 <<MESHCONF
+# Managed by rx/setup.sh — mesh identity, from the config at the top of it.
+NODE_NAME=${NODE_NAME}
+NODE_SHORT=${NODE_SHORT}
+LORA_REGION=${LORA_REGION}
+MESHCONF
+
+    # radio starts and stops the daemons through rx-mesh; that one helper is
+    # all the desktop user may run as root. It validates its own arguments.
+    # Validated before installing: a malformed drop-in makes sudo refuse to
+    # run at all.
     if ! $DRY_RUN; then
       local sudo_tmp; sudo_tmp=$(mktemp)
-      printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl start meshtasticd
-'         "$DESKTOP_USER" > "$sudo_tmp"
+      printf '%s ALL=(root) NOPASSWD: /usr/local/sbin/rx-mesh\n' "$DESKTOP_USER" > "$sudo_tmp"
       if visudo -cqf "$sudo_tmp" 2>/dev/null; then
-        install -m 0440 -o root -g root "$sudo_tmp" /etc/sudoers.d/50-meshtasticd
-        log "sudo rule installed: $DESKTOP_USER may start meshtasticd"
+        install -m 0440 -o root -g root "$sudo_tmp" /etc/sudoers.d/50-rx-mesh
+        log "sudo rule installed: $DESKTOP_USER may run rx-mesh"
+        # Superseded: it allowed only `systemctl start meshtasticd`.
+        rm -f /etc/sudoers.d/50-meshtasticd
       else
         warn "sudoers snippet failed validation; not installed"
       fi
       rm -f "$sudo_tmp"
+    fi
+
+    # `radio mesh` replaces the old `mesh` launcher. Remove it, if ours.
+    if grep -qs 'Managed by rx/setup.sh' /usr/local/bin/mesh; then
+      run rm -f /usr/local/bin/mesh
+      log "removed the old mesh launcher (now: radio mesh)"
     fi
 
     # Offline map tiles for meshtastic-ui, in the SD-card layout its bundles
@@ -1661,7 +2143,7 @@ MESHLAUNCH
       run ln -sfn "$mapdir" /maps
     fi
 
-    note "Meshtastic: run 'mesh' (in dmenu, Alt+Shift+d) — it starts meshtasticd and opens the dashboard on workspace 3. Neither runs at boot. Node state: meshtastic --host localhost --info"
+    note "Mesh: 'radio meshtastic' or 'radio meshcore' picks the network (North Texas settings), and 'radio mesh nodes|send|dm|join|info|on|off' works on whichever is active, starting it if needed. Neither runs at boot. 'radio mesh' alone opens the dashboard."
     note "Map tiles cover zoom 1-6 worldwide. For detail around home, fetch a regional bundle from https://download.tiles.coalition.space/ and unzip it into ~/.portduino/default/ keeping the maps/<style>/z/x/y layout."
   fi
 
@@ -1966,6 +2448,21 @@ GQRXCONV
   radio show NAME      print a profile as JSON
   radio help           this text
 
+  radio meshtastic     put the LoRa radio on Meshtastic, North Texas settings
+  radio meshcore       put the LoRa radio on MeshCore, North Texas settings
+  radio mesh           start the active mesh and open its client
+  radio mesh nodes     who has been heard
+  radio mesh send TEXT          to the primary (Meshtastic) or public channel
+  radio mesh dm NAME TEXT       direct message; Tab completes names
+  radio mesh join URL           Meshtastic: add channels from a shared URL
+  radio mesh join NAME [KEY]    MeshCore: add a channel (#name needs no key)
+  radio mesh info      identity, radio settings, channels -- without starting it
+  radio mesh on | off  start / stop the active mesh
+
+  Every mesh command but info starts the mesh if it is not running. The two
+  networks share one radio, so choosing one stops the other. Neither starts at
+  boot.
+
   --no-focus           leave focus where it is
 
 Tab completes profile names (/usr/share/bash-completion/completions/radio).
@@ -1995,6 +2492,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -2450,12 +2948,232 @@ def switch(name, focus, resume=False):
         i3('[class="%s"] focus' % (JS8_CRIT if js8 else SDR_CRIT))
 
 
+# --------------------------------------------------------------------- mesh
+
+# Both networks share the AIO's SX1262, so one runs at a time. rx-mesh (root,
+# through sudo) is the only thing that starts or stops their daemons.
+MESHES = ("meshtastic", "meshcore")
+MESH_FILE = os.path.join(STATE, "mesh")
+MESH_UNITS = {"meshtastic": "meshtasticd", "meshcore": "raspberrypimc-companion"}
+MESH_PORTS = {"meshtastic": 4403, "meshcore": 5000}
+RX_MESH = "/usr/local/sbin/rx-mesh"
+MT_PY = "/opt/meshtastic-cli/bin/python"
+MT_OPS = "/usr/local/lib/rx/meshtastic_ops.py"
+MESHCLI = "/opt/meshcore-cli/bin/meshcli"
+NAMES_CACHE = os.path.join(HOME, ".cache", "rx", "mesh-names-%s")
+MC_TYPES = {1: "companion", 2: "repeater", 3: "room", 4: "sensor"}
+
+
+def mesh_conf():
+    conf = {}
+    try:
+        with open("/etc/rx/mesh.conf", encoding="utf-8") as fh:
+            for line in fh:
+                key, sep, value = line.strip().partition("=")
+                if sep and not key.startswith("#"):
+                    conf[key] = value
+    except OSError:
+        die("no /etc/rx/mesh.conf — run setup.sh --only lora")
+    return conf
+
+
+def mesh_network():
+    try:
+        with open(MESH_FILE, encoding="utf-8") as fh:
+            name = fh.read().strip()
+    except OSError:
+        name = ""
+    return name if name in MESHES else "meshtastic"
+
+
+def mesh_running():
+    for net in MESHES:
+        if subprocess.run(["systemctl", "is-active", "--quiet", MESH_UNITS[net]]).returncode == 0:
+            return net
+    return None
+
+
+def wait_port(port, secs=60):
+    for _ in range(secs * 2):
+        with socket.socket() as sock:
+            sock.settimeout(0.5)
+            if sock.connect_ex(("127.0.0.1", port)) == 0:
+                return True
+        time.sleep(0.5)
+    return False
+
+
+def mesh_up(net, apply=False):
+    """Make net the running mesh, applying its settings when it (re)starts."""
+    started = False
+    if mesh_running() != net:
+        if subprocess.run(["sudo", "-n", RX_MESH, "start", net]).returncode != 0:
+            die("could not start %s (rx-mesh via sudo; re-run setup.sh --only lora)" % net)
+        started = True
+    if not wait_port(MESH_PORTS[net]):
+        die("%s started but is not answering on port %d" % (net, MESH_PORTS[net]))
+    if apply or started:
+        mesh_apply(net, started)
+
+
+def mt_ops(*args, check=True):
+    if not os.path.exists(MT_OPS):
+        die("no %s — run setup.sh --only lora" % MT_OPS)
+    rc = subprocess.run([MT_PY, MT_OPS, *args]).returncode
+    if check and rc != 0:
+        sys.exit(rc)
+    return rc
+
+
+def meshcli(*args, as_json=False):
+    cmd = [MESHCLI, "-q", "-t", "127.0.0.1", "-p", str(MESH_PORTS["meshcore"])]
+    if as_json:
+        cmd.append("-j")
+    out = subprocess.run(cmd + list(args), capture_output=True, text=True, timeout=90)
+    if out.returncode != 0:
+        die("meshcore-cli %s failed: %s" % (args[0], (out.stderr or out.stdout).strip()[-200:]))
+    if not as_json:
+        return out.stdout
+    text = out.stdout.strip()
+    try:
+        return json.loads(text) if text else {}
+    except ValueError:
+        die("meshcore-cli %s returned something unexpected" % args[0])
+
+
+def mesh_apply(net, started):
+    conf = mesh_conf()
+    if net == "meshtastic":
+        mt_ops("apply")  # waits out the node's own reboot
+        wait_port(MESH_PORTS[net])
+        return
+    # MeshCore's radio settings live in companion.env and are applied at
+    # every start; only the identity is set through the client.
+    info = meshcli("infos", as_json=True)
+    if info.get("name") != conf["NODE_NAME"]:
+        meshcli("set", "name", conf["NODE_NAME"])
+        print("meshcore: name set to %s" % conf["NODE_NAME"])
+    # One flood advert per start, so the mesh learns this node exists --
+    # MeshCore nodes only appear in each other's contacts from adverts.
+    if started:
+        meshcli("floodadv")
+        print("meshcore: sent an advert")
+
+
+def age(epoch):
+    if not epoch:
+        return "-"
+    secs = int(time.time() - epoch)
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= n:
+            return "%d%s ago" % (secs // n, unit)
+    return "%ds ago" % secs
+
+
+def mc_nodes():
+    contacts = meshcli("contacts", as_json=True) or {}
+    rows = sorted(contacts.values(), key=lambda c: c.get("last_advert", 0), reverse=True)
+    os.makedirs(os.path.dirname(NAMES_CACHE), exist_ok=True)
+    with open(NAMES_CACHE % "meshcore", "w", encoding="utf-8") as fh:
+        fh.write("".join(c["adv_name"] + "\n" for c in rows if c.get("adv_name") and " " not in c["adv_name"]))
+    if not rows:
+        print("no contacts yet — MeshCore learns nodes from their adverts")
+        return
+    print("%-24s %-10s %-6s %s" % ("NAME", "TYPE", "HOPS", "LAST ADVERT"))
+    for c in rows:
+        hops = c.get("out_path_len", -1)
+        print("%-24s %-10s %-6s %s" % (c.get("adv_name", "?")[:24], MC_TYPES.get(c.get("type"), "?"),
+                                       "flood" if hops < 0 else hops, age(c.get("last_advert"))))
+
+
+def mc_info():
+    me = meshcli("infos", as_json=True)
+    print("network   MeshCore")
+    print("identity  %s %s" % (me.get("name"), me.get("public_key", "")[:16]))
+    print("radio     %.3f MHz, %.1f kHz, SF %s, CR %s, %s dBm" % (
+        me.get("radio_freq", 0), me.get("radio_bw", 0), me.get("radio_sf"), me.get("radio_cr"),
+        me.get("tx_power")))
+    print("position  %s" % ("never sent" if not me.get("adv_lat") and not me.get("adv_lon") else "in adverts"))
+    chans = meshcli("get_channels", as_json=True) or []
+    for ch in chans if isinstance(chans, list) else []:
+        print("channel   %s %s" % (ch.get("channel_idx"), ch.get("channel_name")))
+    contacts = meshcli("contacts", as_json=True) or {}
+    print("heard     %d contacts" % len(contacts))
+
+
+def mesh_main(argv, focus):
+    net = mesh_network()
+    sub, args = (argv[0] if argv else None), argv[1:]
+
+    if sub == "info":
+        if mesh_running() == net:
+            mt_ops("info") if net == "meshtastic" else mc_info()
+        else:
+            print("network   %s (off; 'radio mesh on' starts it)" % ("Meshtastic" if net == "meshtastic" else "MeshCore"))
+        return
+    if sub == "off":
+        subprocess.run(["sudo", "-n", RX_MESH, "stop"], check=False)
+        print("mesh off")
+        return
+    if sub not in (None, "on", "nodes", "send", "dm", "join"):
+        die("unknown mesh command '%s' (see: radio help)" % sub)
+
+    mesh_up(net)
+    if sub == "on":
+        print("%s on" % net)
+    elif sub is None:
+        if net == "meshtastic":
+            # It sets no WM_CLASS, so there is no window to wait for by class;
+            # i3's title rule moves it to workspace 3.
+            if not running("meshtastic-ui"):
+                subprocess.Popen(["meshtastic-ui"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            if focus:
+                i3("workspace number 3")
+        elif sys.stdin.isatty():
+            os.execv(MESHCLI, [MESHCLI, "-t", "127.0.0.1", "-p", str(MESH_PORTS["meshcore"])])
+        else:
+            print("MeshCore is up; for its chat client run: meshcore-cli -t 127.0.0.1")
+    elif net == "meshtastic":
+        mt_ops(sub, *args)
+    elif sub == "nodes":
+        mc_nodes()
+    elif sub == "send" and args:
+        meshcli("public", " ".join(args))
+        print("sent to the public channel")
+    elif sub == "dm" and len(args) >= 2:
+        sys.stdout.write(meshcli("msg", args[0], " ".join(args[1:])))
+    elif sub == "join" and args:
+        meshcli("add_channel", *args[:2])
+        mc_info()
+    else:
+        die("usage: radio mesh %s ... (see: radio help)" % sub)
+
+
+def choose_mesh(net, focus):
+    os.makedirs(STATE, exist_ok=True)
+    with open(MESH_FILE, "w", encoding="utf-8") as fh:
+        fh.write(net + "\n")
+    mesh_up(net, apply=True)
+    mt_ops("info") if net == "meshtastic" else mc_info()
+
+
 def main():
     ap = argparse.ArgumentParser(prog="radio", add_help=True)
     ap.add_argument("--no-focus", action="store_true")
     ap.add_argument("--names", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("cmd", nargs="?")
     ap.add_argument("arg", nargs="?")
+    rest = sys.argv[1:]
+    if rest[:1] == ["--no-focus"]:
+        rest, focus_flag = rest[1:], False
+    else:
+        focus_flag = True
+    if rest[:1] == ["mesh"]:
+        # radio [--no-focus] mesh SUB ARGS...: free text follows, so take the
+        # rest verbatim rather than through argparse.
+        mesh_main(rest[1:], focus_flag)
+        return
     a = ap.parse_args()
     focus = not a.no_focus
 
@@ -2468,6 +3186,7 @@ def main():
             print("%s %s%s" % ("*" if n == cur else " ", summary(n, profile(n)),
                                "  (saved)" if saved else ""))
         print("\nradio NAME switches · radio off · radio help · Tab completes names")
+        print("mesh: radio %s (active) · radio mesh nodes|send|dm|join|info|on|off" % mesh_network())
     elif a.cmd == "help":
         print(__doc__.split("\n\n", 1)[1].split("\nA profile is")[0])
     elif a.cmd == "off":
@@ -2498,6 +3217,8 @@ def main():
             os.remove(path)
         print("reset %s to its default" % a.arg if a.arg in PROFILES
               else "removed %s" % a.arg)
+    elif a.cmd in MESHES:
+        choose_mesh(a.cmd, focus)
     elif a.cmd == "show":
         print(json.dumps(profile(a.arg or active() or "ghostnet"), indent=2))
     else:
@@ -2520,7 +3241,14 @@ _radio() {
         save|reset|show)
             COMPREPLY=($(compgen -W "$names" -- "$cur")) ;;
         radio|--no-focus)
-            COMPREPLY=($(compgen -W "$names off resume save reset show help --no-focus" -- "$cur")) ;;
+            COMPREPLY=($(compgen -W "$names meshtastic meshcore mesh off resume save reset show help --no-focus" -- "$cur")) ;;
+        mesh)
+            COMPREPLY=($(compgen -W "nodes send dm join info on off" -- "$cur")) ;;
+        dm)
+            # Names seen by the last 'radio mesh nodes' on the active network.
+            local net
+            net=$(cat ~/.config/rx/radio/mesh 2>/dev/null || echo meshtastic)
+            COMPREPLY=($(compgen -W "$(cat ~/.cache/rx/mesh-names-"$net" 2>/dev/null)" -- "$cur")) ;;
     esac
 }
 complete -F _radio radio

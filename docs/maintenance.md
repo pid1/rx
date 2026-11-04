@@ -57,13 +57,37 @@ public keys, and only then swaps it in atomically — a GitHub outage can never
 empty the file and lock you out. It also only rewrites when the content
 actually changed, which matters against an SD card.
 
-**Password authentication is still on.** Once you have confirmed key login
-works, turn it off:
+**Keys only.** `/etc/ssh/sshd_config.d/10-no-password.conf` turns off password
+and keyboard-interactive login; `sudo sshd -T | grep -i authentication`
+confirms what sshd actually uses.
+
+## Firewall
+
+Nothing reaches the device unsolicited except **SSH on 22**, from any
+interface. Everything else inbound is dropped, IPv4 and IPv6, and nothing is
+forwarded. Replies to connections the device made itself still arrive, and so
+do the few packets IPv6 needs to work at all (neighbour discovery, router
+adverts, DHCPv6 replies). The `firewall` section installs it.
+
+The rules are one nftables table, `inet rx_firewall`, in
+`/etc/rx/firewall.nft`, loaded by `rx-firewall.service` before the network
+comes up. It is a table of its own rather than `/etc/nftables.conf`, whose
+`flush ruleset` would wipe the rules Tailscale keeps through iptables-nft;
+a drop in any table still applies, since a packet must pass every base chain
+on its hook. Loading checks the file first (`nft -c`) and keeps established
+connections, an SSH session included.
 
 ```bash
-sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
-sudo systemctl restart ssh
+sudo nft list table inet rx_firewall   # what is in force
+systemctl status rx-firewall           # loaded at boot?
 ```
+
+Two consequences. Other machines cannot resolve `clockworkpi.local`, since
+mDNS answers are inbound traffic: reach it by IP or by its Tailscale name.
+And the device does not answer ping.
+
+To open something, add a rule to `/etc/rx/firewall.nft` in `setup.sh`, not on
+the device: a re-run rewrites the file.
 
 ## Troubleshooting
 
@@ -88,6 +112,9 @@ sudo apt --fix-broken install
 whole script. Boot files always have a `.bak-<timestamp>` beside them (taken
 once, on the first run — that copy is the pristine pre-script state).
 
-**LoRa silent** — check `/etc/meshtasticd/config.d/uconsole-aio-v2.yaml` is
-actually being read before debugging the radio. The drop-in only applies if the
-packaged version supports `config.d`.
+**LoRa silent** — `sudo rx-mesh status` says which mesh is running, if any;
+`journalctl -u meshtasticd` or `-u raspberrypimc-companion` says why. "cannot
+claim pin GPIO26" means MeshCore left the radio's lines exported:
+`sudo rx-mesh release-pins`, then `radio mesh on`. A unit "skipped due to
+exec-condition" was started by something other than `rx-mesh`, which is
+working as intended.
