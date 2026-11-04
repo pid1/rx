@@ -756,7 +756,10 @@ for_window [title="^Meshtastic"] move to workspace number 3
 # Only SDR++ starts on its own. JS8Call and the Meshtastic dashboard keep
 # their placement rules above, so they land on 2 and 3 whenever started --
 # from dmenu, or via `mesh`, which also brings meshtasticd up.
-exec --no-startup-id sdrpp
+#
+# Through `radio resume`, not plain sdrpp: it re-pins the active profile's
+# dongle by serial before SDR++ opens one, and starts it already playing.
+exec --no-startup-id radio resume
 
 bar {
         status_command i3status
@@ -1281,15 +1284,82 @@ UNIT
   if want rtc; then
     section "Real-time clock"
     apt_install i2c-tools
-    # With a real battery-backed RTC, fake-hwclock's saved timestamp will
-    # fight it on boot. Disabled rather than purged so it is trivial to undo.
-    if systemctl list-unit-files 2>/dev/null | grep -q '^fake-hwclock'; then
-      run systemctl disable --now fake-hwclock || true
-      log "fake-hwclock disabled in favour of the onboard PCF85063A"
+
+    # The kernel probes the PCF85063A early in boot, before aiov2-rails-boot
+    # has brought the AIO rails up, gets no answer ("RTC chip is not present",
+    # -121) and gives up -- so /dev/rtc0 never appears and the clock boots at
+    # whatever date systemd last knew. The chip answers fine once the rails
+    # are on, so bind it then, and load the time from it before chrony starts.
+    #
+    # The same script seeds the chip when the system clock is already
+    # disciplined, which is the state any re-run of this script finds it in.
+    # That replaces a manual 'hwclock -w' that could never work while the
+    # chip was unbound.
+    write_file /usr/local/sbin/uconsole-rtc 0755 <<'RTC'
+#!/bin/sh
+# Managed by rx/setup.sh — bind the AIO v2 RTC once the power rails are up,
+# then either load the system clock from it (boot) or seed it (clock synced).
+set -u
+
+if [ ! -e /dev/rtc0 ]; then
+    for dev in /sys/bus/i2c/devices/*-0051; do
+        [ -e "$dev" ] || continue
+        [ -e "$dev/driver" ] && continue
+        # The rail may still be settling; give the chip a few seconds.
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            echo "${dev##*/}" > /sys/bus/i2c/drivers/rtc-pcf85063/bind 2>/dev/null && break
+            sleep 1
+        done
+    done
+fi
+
+if [ ! -e /dev/rtc0 ]; then
+    echo "uconsole-rtc: no RTC bound — the chip is not answering at 0x51" >&2
+    exit 1
+fi
+
+# At boot this runs before chrony, so 'tracking' fails and the RTC is read.
+# Run later against a disciplined clock, it writes the chip instead -- never
+# the other way round, which would step good time back to the RTC's drift.
+if chronyc -n tracking 2>/dev/null | grep -q '^Leap status *: Normal'; then
+    hwclock --systohc && echo "uconsole-rtc: RTC seeded from the synchronised system clock"
+elif hwclock --hctosys; then
+    echo "uconsole-rtc: system clock set from the RTC"
+else
+    # A chip that lost power (flat or missing CR1220) holds no valid time.
+    # The clock then keeps fake-hwclock's restore until GPS or NTP fixes it.
+    echo "uconsole-rtc: RTC holds no valid time; system clock left alone" >&2
+fi
+exit 0
+RTC
+    write_file /etc/systemd/system/uconsole-rtc.service 0644 <<'UNIT'
+[Unit]
+Description=uConsole AIO v2 RTC (bind after the power rails, then load time)
+After=aiov2-rails-boot.service uconsole-aio-rails.service fake-hwclock.service
+Before=chrony.service time-sync.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/uconsole-rtc
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    run systemctl daemon-reload
+    run systemctl enable uconsole-rtc.service
+    # Not --now: start is a no-op on an already-active oneshot, so call the
+    # script directly; on a synced clock that binds and seeds the chip.
+    run /usr/local/sbin/uconsole-rtc || warn "RTC did not bind — see 'dmesg | grep -i rtc'"
+
+    # fake-hwclock stays on as the fallback for a flat CR1220. It restores
+    # the last-saved time early in boot and only ever moves the clock
+    # forward, and uconsole-rtc runs after it, so a working RTC still wins.
+    if pkg_installed fake-hwclock; then
+      run systemctl enable fake-hwclock
+      log "fake-hwclock enabled as the fallback behind the RTC"
     fi
-    note "RTC, after reboot: confirm the chip is actually bound with 'ls /dev/rtc*' and 'dmesg | grep -i rtc' — 'hwclock -r' alone can report plausible time sourced from elsewhere."
-    note "RTC: once the system clock is NTP-accurate, seed the chip once with: sudo hwclock -w   (it powers up holding garbage otherwise)"
-    note "RTC: no output at all from 'hwclock -r' usually means the CR1220 is missing or in backwards."
+    note "RTC: 'systemctl status uconsole-rtc' says whether the chip bound and which way time went. 'Power loss detected' in dmesg after a full power-off means the CR1220 is flat, missing or in backwards."
   fi
 
   # --------------------------------------------------------------------- gps
@@ -1878,7 +1948,586 @@ GQRXCONV
       note "gqrx bookmarks imported into SDR++ (Module list -> Frequency Manager). gqrx config untouched; tarball backup in \$HOME."
     fi
 
-    note "SDR needs the antenna on the 'SDR' IPEX pad (the GPS pad is a separate path). The SDR and internal-USB rails come up at boot; GPS and LoRa do not — see the README for turning those on."
+    # Switchable, resumable SDR++ profiles. See the docstring for why the
+    # dongle is pinned by serial rather than by SDR++'s own device name.
+    write_file /usr/local/bin/radio 0755 <<'RADIO'
+#!/usr/bin/env python3
+"""Managed by rx/setup.sh — switchable, resumable SDR++ profiles.
+
+  radio                list profiles; * marks the active one
+  radio NAME           switch to NAME, closing whatever runs now. A JS8
+                       profile brings up SDR++ and JS8Call on its dial; any
+                       other brings up SDR++ alone. The profile being left is
+                       saved first, so coming back to it resumes where it was.
+  radio off            save the active profile, close SDR++ and JS8Call
+  radio resume         bring the active profile back up (i3 runs it at login)
+  radio save [NAME]    save SDR++'s current tuning as NAME (default: active)
+  radio reset NAME     forget your saved state for NAME; back to its default
+  radio show NAME      print a profile as JSON
+  radio help           this text
+
+  --no-focus           leave focus where it is
+
+Tab completes profile names (/usr/share/bash-completion/completions/radio).
+
+A profile is tuning only, never layout: frequency and VFO position, offset
+mode, demodulator and all of its settings, audio sink and volume, the
+RTL-SDR's settings and, for JS8 profiles, JS8Call's dial. A few display
+settings (SDRPP_GLOBAL) go with every profile. The defaults below are
+starting points; saved state lives in ~/.config/rx/radio/ and wins.
+
+The dongle is stored by serial number. SDR++ names a dongle with its
+enumeration index ("[serial] name##index"), and the index shifts as dongles
+come and go: an SDR++ started before a second dongle appeared silently opens
+the wrong one under the old label. Resolving the serial to the current name
+on every apply keeps each profile on its own dongle.
+
+SDR++ rewrites its config on exit, so it is closed before any file is
+touched and started again afterwards, already playing (--autostart), with
+workspace 1 on screen -- see start_sdrpp() for why it has to be.
+"""
+import argparse
+import configparser
+import copy
+import ctypes
+import ctypes.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+SDRPP = os.path.join(HOME, ".config", "sdrpp-brown")
+STATE = os.path.join(HOME, ".config", "rx", "radio")
+ACTIVE = os.path.join(STATE, "active")
+JS8_INI = os.path.join(HOME, ".config", "JS8Call.ini")
+
+SDR_CRIT, SDR_TREE = "(?i)^sdr", "sdr"           # i3 criteria / tree match
+JS8_CRIT, JS8_TREE = "(?i)^js8call$", 'js8call"'
+# By absolute path, so a stray wrapper earlier on PATH cannot recurse.
+JS8CALL = "/usr/bin/js8call"
+JS8_NODE = "SDR_to_JS8"
+
+NOOELEC = "57818712"  # NESDR SMArt v5, behind the Ham It Up
+JS8_SINK = "SDR to JS8 (virtual cable)"
+SPEAKER = "Built-in Audio"
+
+# SDR++'s demodulator IDs, keyed by the names it files their settings under.
+# Narrow FM is "FM", as on its radio buttons.
+DEMODS = {"FM": 0, "WFM": 1, "AM": 2, "DSB": 3, "USB": 4, "CW": 5, "LSB": 6, "RAW": 7}
+
+
+def rtl(gain):
+    # gain is SDR++'s index into the tuner's gain table, not dB. On the
+    # R820T: 4 = 3.7 dB, 10 = 16.6 dB, 20 = 37.2 dB.
+    return {"serial": NOOELEC, "gain": gain, "sampleRate": 2400000.0,
+            "directSampling": 0, "biasT": False, "offsetTuning": False,
+            "ppm": 0, "rtlAgc": False, "tunerAgc": False}
+
+
+# USB as set by hand for JS8 on 2026-11-04.
+USB_JS8 = {"bandwidth": 3000.0, "agcAttack": 47.916229248046875,
+           "agcDecay": 4.896891117095947, "snapInterval": 100.0,
+           "squelchEnabled": False}
+NFM = {"bandwidth": 12500.0, "squelchEnabled": False}
+# 75 us de-emphasis is the US broadcast standard; 50 us is Europe's.
+WFM = {"bandwidth": 150000.0, "deempMode": "75us", "rds": True,
+       "rdsInfo": True, "rdsRegion": "na", "squelchEnabled": False}
+AM = {"bandwidth": 10000.0, "squelchEnabled": False}
+
+# Applied with every profile. SDR++ computes the FFT whether or not the FFT
+# or waterfall is shown, so with both hidden it only feeds the signal meter;
+# the smallest size at one frame a second keeps that alive at almost no CPU.
+SDRPP_GLOBAL = {"fftSize": 1024, "fftRate": 1}
+
+
+def js8(desc, dial):
+    # The VFO sits 100 Hz under the dial, as tuned by hand for GhostNet.
+    return {"description": desc, "frequency": dial - 100.0,
+            "vfo_offset": -168100.0, "offset": "Ham-It-Up", "demod": "USB",
+            "demod_settings": USB_JS8, "sink": JS8_SINK, "volume": 0.2090567648410797,
+            "rtl": rtl(4), "js8call_dial": dial}
+
+
+def vhf(desc, hz, demod="FM", settings=NFM, gain=20, vfo=-250000.0):
+    # Straight into the dongle: the Ham It Up must be on bypass.
+    return {"description": desc, "frequency": hz, "vfo_offset": vfo,
+            "offset": "None", "demod": demod, "demod_settings": settings,
+            "sink": SPEAKER, "volume": 0.5, "rtl": rtl(gain)}
+
+
+PROFILES = {
+    "ghostnet": js8("JS8 GhostNet, 40 m", 7107000),
+    "js8":      js8("JS8, 40 m", 7078000),
+    "vhf":      vhf("2 m calling", 146520000.0),
+    "dcara":    vhf("DCARA", 146920000.0),
+    "uhf":      vhf("70 cm calling", 446000000.0),
+    "noaa":     vhf("NOAA weather", 162400000.0),
+    "fm-93.3":  vhf("93.3 FM", 93300000.0, "WFM", WFM, gain=10, vfo=-400000.0),
+    "fm-105.3": vhf("105.3 FM", 105300000.0, "WFM", WFM, gain=10, vfo=-400000.0),
+    # Below the R820T's range, so through the Ham It Up like HF.
+    "am-820":   dict(vhf("820 AM", 820000.0, "AM", AM, gain=4, vfo=-168100.0),
+                     offset="Ham-It-Up"),
+}
+
+
+def say(msg, kind=None):
+    print("radio: " + msg, file=sys.stderr)
+    # From dmenu or a launcher there is no terminal; surface what matters.
+    if kind and os.environ.get("DISPLAY") and shutil.which("i3-nagbar"):
+        subprocess.Popen(["i3-nagbar", "-t", kind, "-m", "radio: " + msg],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+
+
+def die(msg):
+    say(msg, "error")
+    sys.exit(1)
+
+
+# ------------------------------------------------------------------ files
+
+def load(name, missing=None):
+    path = os.path.join(SDRPP, name)
+    if missing is not None and not os.path.isfile(path):
+        return copy.deepcopy(missing)
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def dump(path, doc):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=4)
+    os.replace(tmp, path)
+
+
+def read_ini():
+    # Same parser settings as js8call-ghostnet-config: QSettings values
+    # carry bare '%', ';' and '#', and keys are case-sensitive.
+    cp = configparser.ConfigParser(interpolation=None, strict=False,
+                                   delimiters=("=",), comment_prefixes=())
+    cp.optionxform = str
+    if os.path.isfile(JS8_INI):
+        with open(JS8_INI, encoding="utf-8") as fh:
+            cp.read_file(fh)
+    return cp
+
+
+def write_dial(hz):
+    cp = read_ini()
+    if not cp.has_section("Common"):
+        cp.add_section("Common")
+    cp.set("Common", "DialFreq", str(hz))
+    tmp = JS8_INI + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        cp.write(fh, space_around_delimiters=False)
+    os.replace(tmp, JS8_INI)
+
+
+# --------------------------------------------------------------- profiles
+
+def known():
+    saved = []
+    if os.path.isdir(STATE):
+        saved = sorted(f[:-5] for f in os.listdir(STATE) if f.endswith(".json"))
+    return list(PROFILES) + [n for n in saved if n not in PROFILES]
+
+
+def profile(name):
+    p = copy.deepcopy(PROFILES.get(name, {}))
+    path = os.path.join(STATE, name + ".json")
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as fh:
+            p.update(json.load(fh))
+    if not p:
+        die("no profile '%s' (have: %s)" % (name, ", ".join(known())))
+    return p
+
+
+def store(name, p):
+    os.makedirs(STATE, exist_ok=True)
+    dump(os.path.join(STATE, name + ".json"), p)
+
+
+def active():
+    try:
+        with open(ACTIVE, encoding="utf-8") as fh:
+            name = fh.read().strip()
+    except OSError:
+        return None
+    return name if name in known() else None
+
+
+def set_active(name):
+    os.makedirs(STATE, exist_ok=True)
+    with open(ACTIVE, "w", encoding="utf-8") as fh:
+        fh.write(name + "\n")
+
+
+def summary(name, p):
+    path = "Ham It Up upconvert" if p["offset"] != "None" else "Ham It Up bypass"
+    return "%-9s %11.4f MHz %-4s %-19s %s" % (
+        name, p["frequency"] / 1e6, p["demod"], path, p.get("description", ""))
+
+
+# ---------------------------------------------------------------- hardware
+
+def dongles():
+    lib = ctypes.util.find_library("rtlsdr")
+    if not lib:
+        die("librtlsdr not found")
+    lib = ctypes.CDLL(lib)
+    lib.rtlsdr_get_device_name.restype = ctypes.c_char_p
+    lib.rtlsdr_get_device_name.argtypes = [ctypes.c_uint32]
+    found = {}
+    for i in range(lib.rtlsdr_get_device_count()):
+        vendor, product, serial = (ctypes.create_string_buffer(256) for _ in range(3))
+        if lib.rtlsdr_get_device_usb_strings(i, vendor, product, serial) != 0:
+            continue
+        sn = serial.value.decode(errors="replace")
+        dev = (lib.rtlsdr_get_device_name(i) or b"").decode(errors="replace")
+        # The exact format SDR++Brown's RTL-SDR source names devices with.
+        found[sn] = "[%.64s] %.64s##%d" % (sn, dev, i)
+    return found
+
+
+def running(proc):
+    return subprocess.run(["pgrep", "-x", proc],
+                          stdout=subprocess.DEVNULL).returncode == 0
+
+
+def has_window(pat):
+    tree = subprocess.run(["i3-msg", "-t", "get_tree"],
+                          capture_output=True, text=True).stdout
+    return re.search(r'"class":"' + pat, tree, re.I) is not None
+
+
+def i3(cmd):
+    subprocess.run(["i3-msg", "-q", cmd],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def close(proc, crit):
+    """Close politely, so the app saves its own config; True if it was up."""
+    if not running(proc):
+        return False
+    i3('[class="%s"] kill' % crit)
+    for sig in (None, "-TERM", "-KILL"):
+        if sig:
+            subprocess.run(["pkill", sig, "-x", proc])
+        for _ in range(30):
+            if not running(proc):
+                return True
+            time.sleep(0.5)
+    die("%s would not exit" % proc)
+
+
+def start(argv, pat):
+    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(60):
+        if has_window(pat):
+            return
+        time.sleep(0.5)
+    die("%s did not open a window" % argv[0])
+
+
+def holds_dongle(pid):
+    fds = "/proc/%s/fd" % pid
+    try:
+        return any(os.readlink(os.path.join(fds, f)).startswith("/dev/bus/usb/")
+                   for f in os.listdir(fds))
+    except OSError:
+        return False
+
+
+def focused_workspace():
+    out = subprocess.run(["i3-msg", "-t", "get_workspaces"], capture_output=True,
+                         text=True).stdout
+    try:
+        return next(w["name"] for w in json.loads(out) if w["focused"])
+    except (ValueError, StopIteration):
+        return None
+
+
+def start_sdrpp():
+    # SDR++ blocks inside glfwCreateWindow until its new window is actually
+    # visible. i3 maps it onto workspace 1 (the assign rule), so started while
+    # another workspace is on screen it hangs there for good: a black window,
+    # one core spinning, the dongle never opened. Show workspace 1 first and
+    # go back afterwards. Then check playback really began, and retry once.
+    back = focused_workspace()
+    i3("workspace number 1")
+    try:
+        for attempt in (1, 2):
+            start(["sdrpp", "--autostart"], SDR_TREE)
+            for _ in range(40):
+                pids = subprocess.run(["pgrep", "-x", "sdrpp"], capture_output=True,
+                                      text=True).stdout.split()
+                if pids and holds_dongle(pids[0]):
+                    return
+                time.sleep(0.5)
+            # Its config was written before it started, so nothing is lost.
+            subprocess.run(["pkill", "-KILL", "-x", "sdrpp"])
+            for _ in range(20):
+                if not running("sdrpp"):
+                    break
+                time.sleep(0.25)
+            if attempt == 1:
+                say("SDR++ never opened the dongle; restarting it")
+        die("SDR++ starts but never opens the dongle — check it with 'rtl_test -t'")
+    finally:
+        if back and back != "1":
+            i3('workspace "%s"' % back)
+
+
+def ensure_js8_sink():
+    # Normally made by /etc/pipewire/pipewire.conf.d/50-sdr-js8.conf when
+    # PipeWire starts; a session that predates that file has to be given it.
+    nodes = subprocess.run(["pw-cli", "ls", "Node"], capture_output=True,
+                           text=True).stdout
+    if 'node.name = "%s"' % JS8_NODE in nodes:
+        return
+    if subprocess.run(["pw-cli", "create-node", "adapter",
+                       "{ factory.name=support.null-audio-sink node.name=%s "
+                       "node.description=\"%s\" media.class=Audio/Sink "
+                       "audio.position=[FL FR] object.linger=true }" % (JS8_NODE, JS8_SINK)],
+                      stdout=subprocess.DEVNULL).returncode != 0:
+        die("could not create the %s audio sink" % JS8_NODE)
+
+
+def check_clock():
+    # JS8 slots are 15 s with about 2 s of tolerance. Outside that nothing
+    # decodes and nothing says why, so say it here.
+    out = subprocess.run(["chronyc", "-n", "tracking"], capture_output=True,
+                         text=True).stdout
+    if not re.search(r"^Leap status\s*: Normal", out, re.M):
+        say("clock not synchronised (no GPS fix and no network?) — JS8 will "
+            "not decode until it is. See: chronyc sources", "warning")
+
+
+# ------------------------------------------------------ capture and apply
+
+def capture(p):
+    """The profile p, updated with SDR++'s current tuning."""
+    p = copy.deepcopy(p)
+    cfg = load("config.json")
+    radio = load("radio_config.json").get("Radio", {})
+    sink = load("brown_audio_sink_config.json", {}).get("Radio", {})
+    rtlc = load("rtl_sdr_config.json")
+
+    vfo = float(cfg.get("vfoOffsets", {}).get("Radio", 0.0))
+    p["frequency"] = float(cfg["frequency"]) + vfo
+    p["vfo_offset"] = vfo
+    p["offset"] = cfg.get("selectedOffset") or "None"
+    ids = {v: k for k, v in DEMODS.items()}
+    p["demod"] = ids.get(radio.get("selectedDemodId"), p["demod"])
+    p["demod_settings"] = radio.get(p["demod"], p.get("demod_settings", {}))
+    p["sink"] = sink.get("device") or p["sink"]
+    p["volume"] = cfg.get("streams", {}).get("Radio", {}).get("volume", p["volume"])
+
+    # An empty device means SDR++ fell back to whichever dongle enumerated
+    # first; which one that was is unknowable here, so keep the profile's.
+    m = re.match(r"\[(.*?)\] ", rtlc.get("device", ""))
+    if m:
+        dev = rtlc.get("devices", {}).get(rtlc["device"], {})
+        p["rtl"] = dict(p.get("rtl", {}), **dev, serial=m.group(1))
+
+    # JS8Call writes its ini on exit, so this is the dial as of its last
+    # close -- which is when a JS8 profile is switched away from anyway.
+    if p.get("js8call_dial") is not None:
+        dial = read_ini().get("Common", "DialFreq", fallback="")
+        if dial.isdigit():
+            p["js8call_dial"] = int(dial)
+    return p
+
+
+def plan(p, names):
+    """SDR++ files that must change to put p in effect: {path: document}."""
+    name = names.get(p["rtl"]["serial"])
+    if not name:
+        die("dongle SN %s is not plugged in (found: %s)"
+            % (p["rtl"]["serial"], ", ".join(names) or "none"))
+    out = {}
+
+    def edit(fname, fn, missing=None):
+        cur = load(fname, missing)
+        new = copy.deepcopy(cur)
+        fn(new)
+        if new != cur:
+            out[os.path.join(SDRPP, fname)] = new
+
+    def cfg(c):
+        if p["offset"] not in ("None", "Manual") and p["offset"] not in c.get("offsets", {}):
+            die("SDR++ has no offset mode named '%s'" % p["offset"])
+        c["frequency"] = float(p["frequency"] - p["vfo_offset"])
+        c.setdefault("vfoOffsets", {})["Radio"] = float(p["vfo_offset"])
+        c["selectedOffset"] = p["offset"]
+        c["source"] = "RTL-SDR"
+        c.update(SDRPP_GLOBAL)
+        c.setdefault("streams", {}).setdefault("Radio", {}).update(
+            sink="Brown Audio", volume=float(p["volume"]), muted=False)
+
+    def radio(c):
+        r = c.setdefault("Radio", {})
+        r["selectedDemodId"] = DEMODS[p["demod"]]
+        r.setdefault(p["demod"], {}).update(p["demod_settings"])
+
+    def sink(c):
+        r = c.setdefault("Radio", {})
+        r["device"] = p["sink"]
+        r.setdefault("devices", {}).setdefault(p["sink"], 48000)
+
+    def dongle(c):
+        c["device"] = name
+        c.setdefault("devices", {}).setdefault(name, {}).update(
+            {k: v for k, v in p["rtl"].items() if k != "serial"})
+
+    edit("config.json", cfg)
+    edit("radio_config.json", radio)
+    edit("brown_audio_sink_config.json", sink, {})
+    edit("rtl_sdr_config.json", dongle)
+    return out
+
+
+def switch(name, focus, resume=False):
+    if not os.path.isdir(SDRPP):
+        die("no SDR++Brown config at %s — start SDR++ once first" % SDRPP)
+    prev = active()
+    target = profile(name)
+    js8 = target.get("js8call_dial") is not None
+
+    # JS8Call writes its ini only on exit, so close it before capturing the
+    # profile being left -- that is what puts its final dial on disk. Only
+    # re-running the JS8 profile already up leaves it be.
+    if not (js8 and prev == name):
+        close("js8call", JS8_CRIT)
+
+    # Save the profile being left. SDR++ writes its files within a second
+    # of any change, so they are current even while it runs.
+    sdr_up = running("sdrpp")
+    if prev and sdr_up and not resume:
+        store(prev, capture(profile(prev)))
+        target = profile(name)
+
+    if js8:
+        ensure_js8_sink()  # before SDR++ starts: it binds its sink then
+
+    names = dongles()
+    changes = plan(target, names)
+    if changes and sdr_up:
+        close("sdrpp", SDR_CRIT)
+        changes = plan(target, names)  # it rewrote them on the way out
+    for path, doc in changes.items():
+        dump(path, doc)
+
+    set_active(name)
+    if not running("sdrpp"):
+        start_sdrpp()
+
+    if js8:
+        want = str(target["js8call_dial"])
+        if read_ini().get("Common", "DialFreq", fallback="") != want:
+            close("js8call", JS8_CRIT)
+            write_dial(want)
+        if not running("js8call"):
+            start([JS8CALL], JS8_TREE)
+        check_clock()
+
+    print(summary(name, target))
+    # The one setting no file can change.
+    if prev and prev != name:
+        was = profile(prev)["offset"] != "None"
+        now = target["offset"] != "None"
+        if was != now:
+            say("flip the Ham It Up to %s" % ("UPCONVERT" if now else "BYPASS"),
+                "warning")
+    if focus:
+        i3('[class="%s"] focus' % (JS8_CRIT if js8 else SDR_CRIT))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="radio", add_help=True)
+    ap.add_argument("--no-focus", action="store_true")
+    ap.add_argument("--names", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("cmd", nargs="?")
+    ap.add_argument("arg", nargs="?")
+    a = ap.parse_args()
+    focus = not a.no_focus
+
+    if a.names:  # for tab completion
+        print("\n".join(known()))
+    elif a.cmd is None:
+        cur = active()
+        for n in known():
+            saved = os.path.isfile(os.path.join(STATE, n + ".json"))
+            print("%s %s%s" % ("*" if n == cur else " ", summary(n, profile(n)),
+                               "  (saved)" if saved else ""))
+        print("\nradio NAME switches · radio off · radio help · Tab completes names")
+    elif a.cmd == "help":
+        print(__doc__.split("\n\n", 1)[1].split("\nA profile is")[0])
+    elif a.cmd == "off":
+        name = active()
+        close("js8call", JS8_CRIT)  # first, so its dial reaches the ini
+        if name and running("sdrpp"):
+            store(name, capture(profile(name)))
+        close("sdrpp", SDR_CRIT)
+        print("SDR++ and JS8Call closed" + ("; 'radio resume' brings back %s" % name if name else ""))
+    elif a.cmd == "resume":
+        name = active()
+        if name:
+            switch(name, focus, resume=True)
+        elif not running("sdrpp"):
+            start(["sdrpp", "--autostart"], SDR_TREE)
+    elif a.cmd == "save":
+        name = a.arg or active() or die("nothing active; name the profile: radio save NAME")
+        base = profile(name) if name in known() else dict(profile(active() or "ghostnet"),
+                                                          description=name)
+        store(name, capture(base))
+        set_active(name)
+        print("saved " + summary(name, profile(name)))
+    elif a.cmd == "reset":
+        if not a.arg:
+            die("usage: radio reset NAME")
+        path = os.path.join(STATE, a.arg + ".json")
+        if os.path.isfile(path):
+            os.remove(path)
+        print("reset %s to its default" % a.arg if a.arg in PROFILES
+              else "removed %s" % a.arg)
+    elif a.cmd == "show":
+        print(json.dumps(profile(a.arg or active() or "ghostnet"), indent=2))
+    else:
+        switch(a.cmd, focus)
+
+
+if __name__ == "__main__":
+    main()
+RADIO
+    log "installed the radio profile switcher"
+
+    # bash-completion loads this lazily, the first time 'radio <Tab>' runs.
+    write_file /usr/share/bash-completion/completions/radio 0644 <<'RADIOCOMP'
+# Managed by rx/setup.sh — tab completion for radio.
+_radio() {
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    local names
+    names=$(radio --names 2>/dev/null)
+    case $prev in
+        save|reset|show)
+            COMPREPLY=($(compgen -W "$names" -- "$cur")) ;;
+        radio|--no-focus)
+            COMPREPLY=($(compgen -W "$names off resume save reset show help --no-focus" -- "$cur")) ;;
+    esac
+}
+complete -F _radio radio
+RADIOCOMP
+    note "radio: 'radio' lists profiles, 'radio NAME' (Tab completes) closes whatever runs and brings NAME up; 'radio off' closes everything. Each profile resumes where it was left. Profiles: ghostnet js8 vhf dcara uhf noaa fm-93.3 fm-105.3 am-820. It says when the Ham It Up needs flipping between upconvert (HF, AM) and bypass (VHF/UHF, FM)."
+
+    note "SDR needs the antenna on the 'SDR' IPEX pad (the GPS pad is a separate path). All four AIO rails (SDR, USB, GPS, LoRa) come up at boot — see docs/hardware.md for switching them."
     note "SDR++ starts RTL-SDR gain at 0, which looks identical to a dead device: an empty, flat waterfall. Select the source, press play, then raise gain — and test against a strong FM broadcast (88-108 MHz) before anything weak."
     note "If the waterfall stays empty, prove the hardware first with 'rtl_test -t' and 'timeout 10 rtl_test -s 2400000'. The dongle is behind the AIO's internal USB hub, so 'lost at least N bytes' there means drop the sample rate rather than chase SDR++ settings."
   fi
@@ -1921,6 +2570,8 @@ frequency. Deliberately NOT carried over, because they would be wrong or
 harmful on the uConsole:
 
   SoundInId/SoundInName/SoundOutId/SoundOutName   macOS Core Audio devices
+                                                  (SoundInName instead defaults
+                                                  to the SDR loopback; below)
   WindowGeometry, Font, RXTextFont, TXTextFont    sized for a Mac, not 1280x480
   Rig, PTTMethod, PTTport, CATSerialPort          depends on the attached radio
   Notifications\\*\\path                            macOS sound file paths
@@ -1934,6 +2585,7 @@ import argparse
 import configparser
 import os
 import shutil
+import subprocess
 import sys
 import time
 
@@ -1944,7 +2596,6 @@ GHOSTNET_DIAL = "7107000"  # GhostNet calling frequency, 7.107 MHz
 
 SETTINGS = {
     "Common": {
-        "DialFreq": GHOSTNET_DIAL,
         "Freq": "1000",          # audio offset within the passband
         "SubMode": "0",          # normal speed
         "SubModeHB": "false",
@@ -1970,6 +2621,40 @@ SETTINGS = {
         "AutoGrid": "false",
         "AvoidAllcall": "false",
         "TxIdleWatchdog": "60",
+        # Receive-only on the SDR: nothing transmits or uploads on its own.
+        "AutoreplyOnAtStartup": "false",
+        "PSKReporter": "false",
+        "SpotToAPRS": "false",
+    },
+    # Layout set by hand on the uConsole's 1280x720 panel. The ByteArrays are QSettings' own encoding, copied
+    # verbatim; they are opaque and only JS8Call can regenerate them.
+    "MainWindow": {
+        "BandHBActivityVisible": "false",
+        "ShowTooltips": "false",
+        "MainSplitter": r"@ByteArray(\0\0\0\xff\0\0\0\x1\0\0\0\x4\0\0\0}\0\0\x1\xb3\0\0\0\x1e\0\0\0\0\x1\0\0\0\x6\x1\0\0\0\x2\x1)",
+        "TextHorizontalSplitter": r"@ByteArray(\0\0\0\xff\0\0\0\x1\0\0\0\x3\0\0\x1\x1\0\0\0\xb1\0\0\0\xb2\x1\0\0\0\x6\x1\0\0\0\x1\0)",
+        "geometry": r"@ByteArray(\x1\xd9\xd0\xcb\0\x3\0\0\0\0\x2\x80\0\0\0\x1c\0\0\x4\xff\0\0\x2\xcf\0\0\x2\x82\0\0\0\x36\0\0\x4\xfd\0\0\x2\xcd\0\0\0\0\0\0\0\0\x5\0\0\0\x2\x82\0\0\0\x36\0\0\x4\xfd\0\0\x2\xcd)",
+        "state": r"@ByteArray(\0\0\0\xff\0\0\0\0\xfd\0\0\0\0\0\0\x2|\0\0\x2l\0\0\0\x4\0\0\0\x4\0\0\0\b\0\0\0\b\xfc\0\0\0\0)",
+    },
+    "WideGraph": {
+        "HideControls": "true",
+        "PlotWidth": "479",
+        "geometry": r"@ByteArray(\x1\xd9\xd0\xcb\0\x3\0\0\0\0\0\0\0\0\0\0\0\0\x1\xde\0\0\0\t\0\0\0\0\0\0\0\x14\0\0\x1\xf9\0\0\x1\xb7\0\0\0\0\x2\0\0\0\x5\0\0\0\0\0\0\0\0\0\0\0\x1\xde\0\0\0\t)",
+    },
+}
+
+# Written only when the key is absent or empty, so a later choice survives
+# re-runs.
+DEFAULTS = {
+    "Common": {
+        # 'radio' sets the dial when switching JS8 profiles; forcing it here
+        # would pull JS8Call back to GhostNet on every maint run while SDR++
+        # stayed on the other frequency.
+        "DialFreq": GHOSTNET_DIAL,
+    },
+    "Configuration": {
+        # Monitor of the PipeWire loopback sink SDR++ plays into.
+        "SoundInName": "SDR_to_JS8.monitor",
     },
 }
 
@@ -1981,6 +2666,13 @@ def main():
     args = ap.parse_args()
 
     ini = os.path.join(args.home, ".config", "JS8Call.ini")
+
+    # JS8Call writes its whole ini back on exit, so anything written while it
+    # runs is silently undone the next time it closes.
+    if not args.dry_run and subprocess.run(
+            ["pgrep", "-x", "js8call"], stdout=subprocess.DEVNULL).returncode == 0:
+        print("  JS8Call is running and would overwrite %s on exit — close it and re-run" % ini)
+        return 2
 
     cp = configparser.ConfigParser(
         interpolation=None,   # values contain bare '%' and '$'
@@ -2009,6 +2701,13 @@ def main():
             if cp.get(section, key, fallback=None) != val:
                 changed.append("%s/%s" % (section, key))
             cp.set(section, key, val)
+    for section, keys in DEFAULTS.items():
+        if not cp.has_section(section):
+            cp.add_section(section)
+        for key, val in keys.items():
+            if not cp.get(section, key, fallback=""):
+                changed.append("%s/%s" % (section, key))
+                cp.set(section, key, val)
 
     if args.dry_run:
         print("  [dry-run] would write %d key(s) to %s" % (len(changed), ini))
@@ -2035,7 +2734,9 @@ def main():
     print("  callsign %s, grid %s, groups %s"
           % (CALLSIGN, GRID, GROUPS.replace("@@", "@")))
     print("  dial frequency %s MHz" % (int(GHOSTNET_DIAL) / 1e6))
-    print("  NOT set (device-specific, configure in JS8Call): audio in/out devices, PTT method, rig")
+    print("  audio in: %s (unless already set)"
+          % cp.get("Configuration", "SoundInName", fallback=""))
+    print("  NOT set (device-specific, configure in JS8Call): audio out, PTT method, rig")
     return 0
 
 
@@ -2046,14 +2747,58 @@ JS8CONF
     if $DRY_RUN; then
       log "[dry-run] would write the GhostNet JS8Call config for $DESKTOP_USER"
     else
-      /usr/local/sbin/js8call-ghostnet-config --home "$USER_HOME" \
-        || warn "JS8Call config failed — any existing config was left untouched"
+      local js8rc=0
+      /usr/local/sbin/js8call-ghostnet-config --home "$USER_HOME" || js8rc=$?
+      case $js8rc in
+        0) ;;
+        2) note "JS8Call config skipped because JS8Call was open (it rewrites its ini on exit). Close it and re-run: sudo maint, or --only ham." ;;
+        *) warn "JS8Call config failed — any existing config was left untouched" ;;
+      esac
       chown "${DESKTOP_USER}:${USER_GROUP}" "$USER_HOME/.config/JS8Call.ini" 2>/dev/null || true
     fi
+    # Receive path for JS8 without a rig: SDR++ demodulates USB into this
+    # null sink, and JS8Call records from its monitor. A null sink rather
+    # than the speaker's monitor so decoding does not depend on the volume
+    # key, and the speaker stays quiet. System-wide, so it needs no per-user
+    # PipeWire config; PipeWire picks it up at its next start.
+    write_file /etc/pipewire/pipewire.conf.d/50-sdr-js8.conf 0644 <<'PWSINK'
+# Managed by rx/setup.sh — virtual audio cable from SDR++ to JS8Call.
+# SDR++ plays into "SDR_to_JS8"; JS8Call records from SDR_to_JS8.monitor.
+context.objects = [
+  { factory = adapter
+    args = {
+      factory.name     = support.null-audio-sink
+      node.name        = "SDR_to_JS8"
+      node.description = "SDR to JS8 (virtual cable)"
+      media.class      = Audio/Sink
+      audio.position   = [ FL FR ]
+      audio.rate       = 48000
+    }
+  }
+]
+PWSINK
+    log "PipeWire loopback sink SDR_to_JS8 configured"
+
+    # JS8 receive is 'radio ghostnet' / 'radio js8' (the sdr section).
+    # Earlier revisions installed launchers for it -- js8, then js8ghost with
+    # js8call as a symlink -- and js8 and js8call shadowed JS8Call's own
+    # binaries. Remove them, but only ours.
+    local old
+    for old in /usr/local/bin/js8 /usr/local/bin/js8ghost; do
+      if grep -qs 'Managed by rx/setup.sh' "$old"; then
+        run rm -f "$old"
+        log "removed the old launcher $old"
+      fi
+    done
+    if [[ -L /usr/local/bin/js8call && $(readlink /usr/local/bin/js8call) == js8ghost ]]; then
+      run rm -f /usr/local/bin/js8call
+      log "removed the old js8call launcher symlink"
+    fi
+
     note "JS8Call: groups @GHOSTNET, @GSTFLASH, @GNUSATX; dial 7.107 MHz (GhostNet)."
-    note "JS8Call: set audio in/out to your USB sound device under Settings -> Audio, and PTT under Settings -> Radio — neither was migrated, as they depend on the attached rig."
+    note "JS8 receive: 'radio ghostnet' (7.107) or 'radio js8' (7.078) brings up SDR++ tuned on workspace 1 and JS8Call on the matching dial on 2. JS8Call's audio input defaults to the SDR_to_JS8.monitor loopback; a device picked under Settings -> Audio is kept on re-runs."
     note "JS8Call: 7.107 is set as the dial but is not in the preset Frequencies list; add it under Settings -> Frequencies to get it in the dropdown."
-    note "JS8Call needs an external rig (CAT + USB audio) or an SDR fed through a loopback sink — the uConsole has no HF radio of its own."
+    note "JS8Call transmit needs an external rig (CAT + USB audio) — the SDR is receive-only. Set audio out and PTT under Settings -> Audio / Radio."
   fi
 
   # ---------------------------------------------------------------- tailscale
