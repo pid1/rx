@@ -1,611 +1,224 @@
-# rx
+<!-- Hidden until a hero image exists. Add it, restore this line, then delete this note.
+<p align="center"><img src="docs/screenshots/uconsole.jpg" alt="The uConsole running SDR++ and JS8Call" width="880"></p>
 
-**Receive-only comms and situational awareness, in a case.**
+Asset to create: docs/screenshots/uconsole.jpg. A photo of the uConsole (or a
+1280x720 screenshot) with JS8Call decoding on workspace 2. Crop out the status
+bar's Wi-Fi name.
+-->
 
-Provisioning for the ClockworkPi uConsole at the heart of it — a **CM4 Lite**
-running **Rex's Debian Bookworm image** with the **HackerGadgets AIO v2**
-board: SDR, LoRa mesh, GPS-disciplined time, and an i3 desktop sized for the
-5" panel.
+<p align="center">
+  <a href="LICENSE"><img alt="license: BSD 3-Clause" src="https://img.shields.io/badge/license-BSD%203--Clause-15191f"></a>
+  <a href="https://github.com/pid1/rx/actions/workflows/semgrep.yml"><img alt="semgrep" src="https://img.shields.io/github/actions/workflow/status/pid1/rx/semgrep.yml?label=semgrep&color=15191f"></a>
+  <a href="docs/install.md#what-it-assumes"><img alt="hardware: uConsole CM4 + AIO v2" src="https://img.shields.io/badge/hardware-uConsole%20CM4%20%2B%20AIO%20v2-15191f"></a>
+</p>
+
+<p align="center">
+  <a href="docs/install.md">Install</a> •
+  <a href="docs/radio.md">Radio</a> •
+  <a href="docs/hardware.md">Hardware</a> •
+  <a href="docs/desktop.md">Desktop</a> •
+  <a href="docs/maintenance.md">Maintenance</a>
+</p>
+
+<p align="center"><em>Receive-only comms and situational awareness, in a case.</em></p>
+
+## What is rx?
+
+rx is one script that turns a ClockworkPi uConsole into a field receiver. It
+targets a **CM4 Lite** running **Rex's Debian Bookworm image** with the
+**HackerGadgets AIO v2** board, and sets up the SDR, LoRa mesh, GPS-disciplined
+time and an i3 desktop sized for the 5" panel.
+
+It is also how the device is maintained. Every step is idempotent, so the same
+script that provisions a blank card re-applies the configuration on every
+`sudo maint`, and a run that changes nothing writes nothing.
+
+## From SD card to listening
+
+1. **Flash** Rex's image to a microSD card and finish its first-boot wizard.
+2. **Run** `curl -fsSL pid1.space/rx | sudo bash`, then reboot.
+3. **Listen.** `radio ghostnet` brings up SDR++ tuned to 7.107 MHz and JS8Call
+   decoding GhostNet from it. `radio noaa` swaps to weather radio.
+4. **Go off-grid.** The clock keeps JS8-grade time from GPS and the RTC with no
+   network, and the mesh map works from offline tiles.
+5. **Keep it current** with `sudo maint`: package upgrades, then this script
+   again, so only drift changes.
+
+## What it does
+
+- **Switches the SDR between setups in one command.** `radio NAME` closes what
+  is running and brings NAME up tuned, playing, and resuming where you left it.
+- **Receives JS8** through the SDR: SDR++ feeds JS8Call over a virtual audio
+  cable, with GhostNet's groups set and every transmit and upload path off.
+- **Keeps time without a network**, from GPS PPS, the AIO's RTC and chrony.
+- **Runs a Meshtastic node** on the AIO's SX1262, with a dashboard and offline
+  map tiles.
+- **Powers the AIO's subsystems** on GPIO-switched rails, at boot and on demand.
+- **Sets up the desktop**: i3 with Alt as the modifier, autologin, Atkinson
+  Hyperlegible fonts, and screen blanking off at every layer.
+- **Keeps itself current** with one `maint` command, holding the kernel so an
+  unattended upgrade can't take the display away.
+- **Lets you in** over SSH with keys synced from GitHub, and optionally Tailscale.
+
+## Quick start
+
+On a fresh card, after Rex's first-boot wizard has created your account
+([docs/install.md](docs/install.md) has the image links and flashing steps):
 
 ```bash
-curl -fsSL pid1.space/rx | sudo bash
+curl -fsSL pid1.space/rx | sudo bash      # provision; prints next steps at the end
+sudo reboot                               # RTC, GPS and LoRa are boot overlays
 ```
 
-<details>
-<summary>If the short URL is down</summary>
-
-`pid1.space/rx` redirects to `rx.pid1.space`, a Cloudflare Worker that
-Cloudflare builds and deploys straight from this repository on every push to
-`main`. There is no mirror to fall out of date: if Cloudflare misses a push,
-[`cf-fallback.yml`](.github/workflows/cf-fallback.yml) notices that the live
-`/.build-id` is not the current commit and deploys it. The raw URL remains the
-fallback for when Cloudflare itself is unreachable:
+Then:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pid1/rx/main/setup.sh | sudo bash
+radio                       # list the SDR profiles
+radio ghostnet              # JS8 GhostNet: SDR++ on 7.107 MHz + JS8Call
+chronyc sources             # time: PPS marked '*' once the GPS has a fix
+mesh                        # Meshtastic: start the node, open the dashboard
 ```
 
-Both take the same flags. Substitute either URL wherever this README says
-`pid1.space/rx`.
-</details>
+The account is assumed to be `jroemer`; pass another with
+`curl -fsSL pid1.space/rx | sudo bash -s -- --user NAME`.
 
-Re-running is safe and is the intended way to use this — every step is
-idempotent, and a run that changes nothing writes nothing.
+## Command reference
 
----
+### `radio`: the SDR
 
-## Getting the OS on first
-
-**1. Download Rex's image**, `ClockworkPi-Bookworm-6.12.y.img.xz`.
-
-Rex (`ak-rex`) publishes **no images on GitHub** — his GitHub holds only source
-(pi-gen, the kernel tree, the apt repo). The images live on:
-
-- <https://mega.nz/folder/LSInGD6J#0YezWX8xC4PkbyForgl1Hw>
-- <https://drive.google.com/drive/folders/1tw2uPVPsFDhQ5Onx4mlllYexUDmDp0eK>
-- <https://app.drime.cloud/drive/s/O3faUnk9ihg2vlrgek0LiaHRiU3fGb>
-
-all linked from the [forum thread](https://forum.clockworkpi.com/t/bookworm-6-12-y-for-the-uconsole-and-devterm/15847),
-which is also where the current release and any per-version caveats are posted.
-
-**2. Write it with Raspberry Pi Imager** — *Choose OS → Use custom* → pick the
-`.xz` directly, it decompresses on the fly. Balena Etcher works too. Use
-Imager's advanced options to preset the Wi-Fi SSID/password; the uConsole
-keyboard is a slow way to type a passphrase.
-
-**3. Target is a microSD card.** A CM4 *with* eMMC has no SD lines wired up and
-must be flashed over USB with `rpiboot`/`usbboot`. CM4 Lite uses SD.
-
-**4. First boot** expands the filesystem and reboots itself, then runs a wizard
-that creates your user account. The script does not create users — it expects
-that account to exist, and takes `--user NAME` if it isn't `jroemer`.
-
----
-
-## What it assumes
-
-This targets Rex's image specifically:
-
-- **His apt repo is already configured** (it appears as `ClockworkPi-apt`).
-  That's where `sdrpp-brown`, `hackergadgets-uconsole-aio-board`, `pinctrl` and
-  the rtlsdrblog `rtl-sdr` build come from rather than Debian. The script
-  verifies it rather than adding a copy.
-- **No games and no desktop.** True of both the Lite (stage2) and full (stage4)
-  builds, so there is nothing to strip out.
-
----
-
-## Sections
-
-Every section is skippable with `--skip NAME`, or run alone with `--only NAME`.
-
-| Section | What it does |
+| Command | What it does |
 |---|---|
-| `base` | Timezone (America/Chicago), hushlogin, sshd enabled, GitHub-backed `authorized_keys` sync, the `maint` maintenance command, hardware group membership |
-| `desktop` | X11 + i3, autologin on tty1, Alacritty, Atkinson fonts, PipeWire, blanking disabled |
-| `claude` | Claude Code from Anthropic's signed apt repo |
-| `aio` | HackerGadgets AIO v2 metapackage, GPIO power rails, boot overlays |
-| `rtc` | PCF85063A over i2c, bound once the AIO rails are up (`uconsole-rtc`), `fake-hwclock` as fallback |
-| `gps` | UART + PPS overlays, serial console removed, `gpsd` on `/dev/ttyS0` |
-| `lora` | SPI overlays, `meshtasticd` with the SX1262 config, `meshtastic-ui` dashboard, region |
-| `sdr` | `sdrpp-brown`, `rtl-sdr`, DVB-T driver blacklisted, gqrx bookmarks migrated, `radio` profiles |
-| `ham` | JS8Call + hamlib, receive-only GhostNet configuration, SDR→JS8Call loopback sink, CHIRP |
-| `tailscale` | Tailscale from its official repo |
-
-### Flags
-
-```
---dry-run           print every change without making one
---user NAME         target account (default: jroemer)
---only SECTION      run only these (repeatable)
---skip SECTION      skip these (repeatable)
-```
-
-Flags must go through `bash -s --`, since `| sudo bash --dry-run` hands the flag
-to bash rather than to the script:
-
-```bash
-curl -fsSL pid1.space/rx | sudo bash -s -- --dry-run
-curl -fsSL pid1.space/rx | sudo bash -s -- --only sdr --skip lora
-```
-
-`sudo` scrubs the environment, so `TS_AUTHKEY` must be set **after** `sudo`:
-
-```bash
-curl -fsSL pid1.space/rx | sudo TS_AUTHKEY=tskey-auth-... bash -s -- --only tailscale
-```
-
----
-
-## Routine maintenance
-
-```bash
-sudo maint
-```
-
-One command, installed by the `base` section:
-
-1. `apt update`, `apt full-upgrade`, `apt autoremove --purge`
-2. re-fetches and re-applies `setup.sh` — idempotent, so only drift and newly
-   added configuration change
-3. reports whether a reboot is pending, and which packages want one
-
-Arguments pass through, so `sudo maint --dry-run` previews the configuration
-half without touching anything, and `sudo maint --only sdr` narrows it.
-
-**Kernel and boot firmware are held**, so `maint` will not replace them. The
-display, panel rotation and the AIO overlays depend on kernel patches matched
-to this image, and the apt suite the image ships carries newer kernels than the
-build — an unattended run could otherwise leave a portable device with no
-display, away from a desk.
-
-`maint` reports when a held package has an update waiting. Take those
-deliberately:
-
-```bash
-sudo apt-mark unhold clockworkpi-kernel
-sudo apt install clockworkpi-kernel
-sudo reboot                      # confirm the display comes up
-sudo apt-mark hold clockworkpi-kernel
-```
-
-Held by default: `akrex-kernel`, `clockworkpi-kernel`,
-`clockworkpi-cm-firmware`, `raspberrypi-kernel`, `raspberrypi-bootloader`
-(whichever are installed) — `HOLD_PACKAGES` in `setup.sh`.
-
-It fetches from `pid1.space/rx`, falling back to the raw URL, and downloads to
-a file rather than piping — a truncated transfer is then caught by the same
-checks [`build.sh`](build.sh) runs before publishing (`bash -n`, shebang, and
-the trailing `main "$@"` without which the script would parse cleanly and do
-nothing).
-
----
-
-## SSH
-
-Enabled and listening on 22 by the `base` section. pi-gen's stage2 contains
-both `systemctl enable ssh` and `systemctl disable ssh` behind a build-time
-condition, so the image's state is not assumable either way.
-
-`authorized_keys` is refreshed from `github.com/pid1.keys` every 5 minutes for
-both `root` and the desktop user, via `/usr/local/sbin/sync-github-keys`. It
-fetches to a temp file, requires the result to be non-empty and to parse as SSH
-public keys, and only then swaps it in atomically — a GitHub outage can never
-empty the file and lock you out. It also only rewrites when the content
-actually changed, which matters against an SD card.
-
-**Password authentication is still on.** Once you have confirmed key login
-works, turn it off:
-
-```bash
-sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
-sudo systemctl restart ssh
-```
-
----
-
-## Key bindings
-
-**`$mod` is Alt.** The uConsole's CMD key is only reachable as `Fn`+`CMD` — a
-two-key chord for every window operation — so Alt wins on ergonomics.
-
-| | |
-|---|---|
-| `Alt + Return` | terminal (Alacritty) |
-| `Alt + Shift + d` | dmenu |
-| `Alt + Shift + q` | close window |
-| `Alt + h/j/k/l` or arrows | focus |
-| `Alt + Shift + h/j/k/l` or arrows | move window |
-| `Alt + 1..9` | switch workspace |
-| `Alt + Shift + 1..9` | move window to workspace |
-| `Alt + Shift + b` / `v` | split horizontal / vertical |
-| `Alt + Shift + f` | fullscreen |
-| `Alt + Shift + w` / `s` / `e` | tabbed / stacking / toggle split |
-| `Alt + r` | resize mode (`Escape` exits) |
-| `Alt + Shift + c` / `r` | reload / restart i3 |
-| `Alt + Shift + x` | exit i3 |
-| `Alt + Shift + o` / `p` | backlight off / restore |
-
-### Why window management sits on `Alt+Shift`
-
-i3 grabs `$mod` combinations globally, so every plain `Alt`+letter binding is
-taken away from the shell, where readline uses Meta for word motion. i3 claims
-only `Alt+h/j/k/l`, `Alt+1..9`, `Alt+r` and `Alt+Return` — costing readline
-`M-l`, `M-r` and `M-<digit>`, all rare.
-
-**Still yours in the terminal:** `Alt+b`, `Alt+f`, `Alt+d`, `Alt+t`, `Alt+u`,
-`Alt+p`, `Alt+y`, `Alt+.`, `Alt+Backspace`.
-
----
-
-## Power rails
-
-AIO v2 gates each subsystem behind a GPIO-switched rail — nothing on the board
-responds until its rail is driven high. This is the main difference from V1,
-which had no such gating.
-
-| Rail | GPIO | At boot |
-|---|---|---|
-| `SDR` | 7 | **on** |
-| `USB` (internal hub) | 23 | **on** |
-| `GPS` | 27 | **on** |
-| `LORA` | 16 | **on** |
-
-**SDR and USB come up together on purpose.** The RTL-SDR is an internal USB
-device behind the AIO's hub, so powering the SDR rail alone will not make it
-enumerate — `rtl_test` would report no supported devices found.
-
-All four are up: GPS because chrony disciplines the clock from it, LoRa
-because `meshtasticd` runs at boot.
-
-`aiov2_ctl` tracks the current state and the boot state separately —
-`aiov2_ctl SDR on` powers a rail now, while `aiov2-rails-boot.service` replays
-only what `--boot-rail` recorded. The setup sets both.
-
-### Turning one on for this session
-
-```bash
-sudo aiov2_ctl GPS on          # or LORA, SDR, USB
-sudo aiov2_ctl GPS off
-```
-
-Without the vendor tool, the fallback installed here does the same:
-
-```bash
-sudo uconsole-aio-rails GPS on
-sudo uconsole-aio-rails            # just the boot set (SDR + USB)
-```
-
-### Making it persistent
-
-Edit `BOOT_RAILS` near the top of `setup.sh` and re-run `--only aio`:
-
-```bash
-local BOOT_RAILS=(SDR USB GPS)
-```
-
-A re-run never forces GPS or LoRa *off*, so a rail you switched on by hand
-survives until you reboot.
-
-### Empty waterfall in SDR++
-
-A working device and a dead one look the same in SDR++, so check in this order:
-
-1. **Gain starts at 0.** This is the usual cause. Raise the gain slider.
-2. **Press play.** A stopped SDR++ shows an empty waterfall, not an error.
-3. **Source → RTL-SDR → Refresh**, then select the device. It will not
-   auto-select one that appeared after launch.
-4. **Test on a strong FM broadcast** (88–108 MHz) before anything weak.
-5. Check the waterfall **min/max dB** sliders have not collapsed together.
-
-**`usb_claim_interface error -6`** means the dongle enumerated but something
-already holds it — `LIBUSB_ERROR_BUSY`, not a broken device. Either SDR
-software is still running, or the kernel bound it as a TV tuner:
-
-```bash
-sudo fuser -v /dev/bus/usb/*/*        # definitive: names the holding process
-systemctl is-active readsb            # ADS-B decoder — the usual culprit
-pgrep -a sdrpp                        # SDR++ still running?
-lsmod | grep -E 'rtl28|dvb'           # DVB-T driver bound?
-```
-
-Only one process can claim the dongle. If the holder is a *service* — an ADS-B
-decoder such as `readsb` or `dump1090` is the usual one — killing the process is
-not enough, since it restarts and reclaims the device:
-
-```bash
-sudo systemctl disable --now readsb
-sudo systemctl mask readsb            # cannot be silently re-enabled
-```
-
-Some decoders are built from source into `/usr/bin` by a package postinst
-rather than installed as packages themselves, so `apt purge` will not remove
-them. Masking the unit is what reliably keeps them off the dongle.
-
-For the kernel driver, `sudo modprobe -r dvb_usb_rtl28xxu`.
-
-The blacklist in `/etc/modprobe.d/blacklist-dvb-rtl.conf` stops it loading at
-boot, but a module already loaded stays loaded until unloaded or rebooted.
-
-Prove the hardware independently of SDR++ first:
-
-```bash
-rtl_test -t                     # tuner type, and that the device opens
-timeout 10 rtl_test -s 2400000  # sample rate; watch for "lost at least N bytes"
-```
-
-Sample loss points at USB rather than software — the dongle sits behind the
-AIO's internal hub, so lower the sample rate rather than chasing SDR++
-settings. The antenna belongs on the pad marked **SDR**; the GPS pad is a
-separate path and will not feed the dongle.
-
-### Checking
-
-```bash
-rtl_test -t                   # SDR enumerated
-pinctrl get 7                 # rail state directly
-cgps -s                       # GPS, once its rail is on
-```
-
-## Meshtastic
-
-`meshtasticd` drives the SX1262 over `/dev/spidev1.0`, created by the
-`spi1-1cs` overlay. `meshtastic-ui` is the dashboard, on workspace 3.
-
-Setting identity or config drops the client connection once the node applies
-it, so the CLI reports `BrokenPipeError` even on success. Read the value back
-rather than trusting the exit status.
-
-```bash
-meshtastic --host localhost --info      # node, region, modem preset
-meshtastic --host localhost --nodes     # what the mesh can see
-systemctl status meshtasticd
-```
-
-The node presents as **KA1PID (PID1)** on the mesh — `NODE_NAME` and
-`NODE_SHORT` in `setup.sh`; the short name is capped at 4 characters.
-
-Region is set to `US` (`LORA_REGION` in `setup.sh`). **Nothing transmits until
-a region is set**, and the wrong one is a regulatory problem rather than a
-config annoyance.
-
-The Meshtastic config deliberately has **no `GPS:` block**: `gpsd` owns
-`/dev/ttyS0` to feed chrony, and a second reader would fight it for the
-receiver.
-
-The CLI lives in a venv at `/opt/meshtastic-cli`, symlinked to
-`/usr/local/bin/meshtastic` — there is no Debian package, and bookworm marks
-the system interpreter externally-managed.
-
-### Map tiles
-
-`meshtastic-ui` ships with no tiles. The `osm` bundle from
-`meshtastic/device-ui` is installed to `~/.portduino/default/maps/` — the
-portduino emulated filesystem root — in the SD-card layout it expects,
-`maps/<style>/z/x/y.png`, with `/maps` symlinked to the same tree. `MAP_STYLE`
-selects `positron`, `atlas` or `dark-matter-brown` instead.
-
-That covers **zoom 1–6 worldwide**, which is country-level rather than
-streets. For detail around home, take a regional bundle from
-<https://download.tiles.coalition.space/> and unzip it into
-`~/.portduino/default/` keeping the same layout.
-
-## Applications at login
-
-i3 launches three apps and places them:
-
-| Workspace | Application | At boot |
-|---|---|---|
-| 1 | SDR++Brown | launched, via `radio resume` |
-| 2 | JS8Call | placement only |
-| 3 | `meshtastic-ui` | placement only |
-
-Only SDR++ starts on its own. JS8Call and the dashboard keep their placement
-rules, so they land on 2 and 3 whenever started — `Alt+2` and `Alt+3` reach
-those workspaces at any time, whether or not anything is on them.
-
-`meshtasticd` does not run at boot either. **`mesh`** starts the daemon, waits
-for the radio, and opens the dashboard — run it from dmenu (`Alt+Shift+d`).
-It uses a sudo rule scoped to exactly `systemctl start meshtasticd`, installed
-at `/etc/sudoers.d/50-meshtasticd` and validated with `visudo -c` before being
-put in place. Failures surface through `i3-nagbar`, since dmenu gives it no
-terminal to print to.
-
-Two quirks the rules work around. SDR++Brown puts its version and build date
-*inside* `WM_CLASS`, so the rule matches a `^sdr` prefix rather than the whole
-string, which would break on every upgrade. `meshtastic-ui` sets **no
-`WM_CLASS` at all**, so `assign` has nothing to match and a
-`for_window [title="^Meshtastic"]` rule moves it instead.
-
-These use `exec`, which runs only at i3 startup — `i3-msg restart` will not
-relaunch them, by design, since `exec_always` would spawn duplicates on every
-reload.
-
-## Radio profiles
-
-**`radio`** is one command per setup. `radio NAME` closes whatever is running
-and brings NAME up ready to listen: a JS8 profile starts SDR++ tuned and
-playing *and* JS8Call on the matching dial; any other profile starts SDR++
-alone and closes JS8Call. Profile names tab-complete.
-
-```bash
-radio                 # list; * marks the active profile
-radio fm-105.3        # switch (Tab completes the name)
-radio off             # close SDR++ and JS8Call
-radio resume          # bring the active profile back (i3 runs this at login)
-radio save            # keep the current tuning in the active profile
-radio save NAME       # ... or as a new profile
-radio reset NAME      # back to the shipped default
-radio help
-```
-
-Each profile is tuning only — frequency, offset mode, demodulator and its
-settings, audio sink and volume, RTL-SDR gain — never window layout.
-Switching saves the profile you are leaving first, so every profile resumes
-where you left it. Re-running the profile already up just brings it to the
-front. Saved state lives in `~/.config/rx/radio/`; the defaults
-live in `radio` itself and are only starting points.
+| `radio` | List profiles; `*` marks the active one |
+| `radio NAME` | Close what's running, bring NAME up. JS8 profiles also start JS8Call on the matching dial |
+| `radio off` | Save the active profile, close SDR++ and JS8Call |
+| `radio resume` | Bring the active profile back (i3 runs this at login) |
+| `radio save [NAME]` | Keep SDR++'s current tuning in the active profile, or as a new one |
+| `radio reset NAME` | Back to the shipped default |
+| `radio show NAME` | Print a profile |
+| `radio help` | All of the above |
+
+`Tab` completes profile names and subcommands.
 
 | Profile | Tuning | Ham It Up |
 |---|---|---|
-| `ghostnet` | 7.107 MHz USB → JS8Call | upconvert |
-| `js8` | 7.078 MHz USB → JS8Call | upconvert |
-| `vhf` | 146.520 MHz FM (2 m calling) | bypass |
-| `dcara` | 146.920 MHz FM (DCARA) | bypass |
-| `uhf` | 446.000 MHz FM (70 cm calling) | bypass |
-| `noaa` | 162.550 MHz FM (NOAA weather) | bypass |
-| `fm-93.3`, `fm-105.3` | broadcast WFM, 75 µs de-emphasis | bypass |
+| `ghostnet` | JS8 GhostNet, 7.107 MHz USB → JS8Call | upconvert |
+| `js8` | JS8, 7.078 MHz USB → JS8Call | upconvert |
+| `vhf` | 2 m calling, 146.520 MHz FM | bypass |
+| `dcara` | DCARA, 146.920 MHz FM | bypass |
+| `uhf` | 70 cm calling, 446.000 MHz FM | bypass |
+| `noaa` | NOAA weather, 162.400 MHz FM | bypass |
+| `fm-93.3`, `fm-105.3` | broadcast FM | bypass |
 | `am-820` | 820 kHz AM | upconvert |
 
-All of them use the Nooelec behind the Ham It Up, pinned by **serial
-number**. SDR++ names a dongle by enumeration index as well, and the index
-shifts as dongles come and go — an SDR++ started before the Nooelec was
-plugged in opened it under the AIO dongle's label. `radio` resolves the serial
-to SDR++'s current name on every switch, and i3 starts SDR++ at login through
-`radio resume` for the same reason. The Ham It Up's bypass switch is the one
-thing a file cannot change; `radio` says when to flip it.
+`radio` says when the Ham It Up's switch needs flipping. How profiles work, and
+the SDR++ quirks they work around: [docs/radio.md](docs/radio.md).
 
-SDR++ rewrites its config on exit, so `radio` closes it before touching
-anything and restarts it already playing (`--autostart`). It shows
-workspace 1 while SDR++ starts: SDR++ blocks in window creation until its
-window is visible, so started onto a workspace that is not on screen it hangs
-for good behind a black window. It then checks SDR++ really opened the dongle,
-and restarts it once if not.
+### Everything else
 
-Every switch also sets SDR++'s FFT to its minimum — 1024 points at one frame
-a second. SDR++ computes the FFT even with the FFT and waterfall hidden, and
-then it feeds only the signal meter. That cut its memory from 1–2 GB to about
-150 MB; CPU barely moved, since demodulation and the GUI dominate it.
+| Command | What it does |
+|---|---|
+| `sudo maint` | Upgrade packages, re-apply `setup.sh`, report a pending reboot. `--dry-run` and `--only NAME` pass through |
+| `curl -fsSL pid1.space/rx \| sudo bash -s -- FLAGS` | Run the script directly: `--dry-run`, `--only NAME`, `--skip NAME`, `--user NAME` |
+| `mesh` | Start `meshtasticd`, wait for the radio, open the dashboard |
+| `meshtastic --host localhost --info` | Node, region and modem preset (`--nodes` for the mesh) |
+| `aiov2_ctl --status` | AIO power rails and battery |
+| `sudo aiov2_ctl GPS on` | Power a rail now: `GPS`, `LORA`, `SDR` or `USB` |
+| `chronyc sources` | Time sources; PPS `*` means GPS-locked |
+| `cgps -s` | GPS fix and satellites |
+| `rtl_test -t` | Prove the RTL-SDR opens, independent of SDR++ |
+| `chirp` | CHIRP, for programming handhelds |
+| `js8call` | Plain JS8Call, without retuning the SDR |
+| `claude` | Claude Code |
+| `sudo tailscale up` | Join the tailnet |
 
-## JS8 over the SDR
+Sections, flags and what each one installs: [docs/install.md](docs/install.md#sections).
 
-**`radio ghostnet`** (7.107 MHz) and **`radio js8`** (7.078 MHz) are the
-JS8 profiles: whatever is running closes, and SDR++ comes up tuned on
-workspace 1 with JS8Call on the matching dial on workspace 2. Plain
-`js8call` is still just JS8Call, with no retuning.
+## Key map
 
-Audio goes SDR++ → the `SDR_to_JS8` PipeWire null sink
-(`/etc/pipewire/pipewire.conf.d/50-sdr-js8.conf`) → JS8Call, which records
-from `SDR_to_JS8.monitor`. JS8Call's input is set to that only when it has
-none, so a rig's sound card picked later is kept.
+**The modifier is Alt.** The uConsole's CMD key is only reachable as `Fn`+`CMD`,
+a two-key chord for every window operation. Window management sits on
+`Alt+Shift` so the shell keeps most of readline's `Alt` bindings; why, and
+which ones survive: [docs/desktop.md](docs/desktop.md#why-window-management-sits-on-altshift).
 
-The GhostNet config is receive-only: auto-reply at startup, PSK Reporter and
-APRS spotting are forced off, and the window layout set by hand on this panel
-is reapplied on every run.
+### Workspaces
 
-JS8 profiles warn if chrony is not synchronised: JS8 slots tolerate about
-2 s of clock error and fail silently beyond it.
+| Keys | Action |
+|---|---|
+| `Alt+1` … `Alt+9` | Go to workspace 1–9 |
+| `Alt+Shift+1` … `Alt+Shift+9` | Move the window to workspace 1–9 |
 
-## CHIRP
+| Workspace | What lands there |
+|---|---|
+| `1` | SDR++, started at login by `radio resume` |
+| `2` | JS8Call |
+| `3` | Meshtastic dashboard (`mesh`) |
 
-Radio programming, from Debian's package. Run `chirp` (symlinked) or `chirpw`
-(the actual binary name) — both appear in dmenu.
+### Launch and close
 
-Serial cables need the `dialout` group, which the `base` section grants; it
-applies after a full re-login.
+| Keys | Action |
+|---|---|
+| `Alt+Return` | Terminal (Alacritty); `Alt+Shift+Return` too |
+| `Alt+Shift+d` | dmenu, to launch anything by name |
+| `Alt+Shift+q` | Close the window |
 
-Debian's build lags upstream and CHIRP gains radio support continuously, so a
-recently released model may not be listed. `chirpmyradio.com` returns 403 to
-scripted requests, so a current build cannot be fetched unattended — download
-the wheel in a browser, then:
+### Focus and move
 
-```bash
-sudo apt remove chirp
-pipx install --system-site-packages ./chirp-*.whl
-```
+| Keys | Action |
+|---|---|
+| `Alt+h` `j` `k` `l`, or `Alt+arrows` | Focus left, down, up, right |
+| `Alt+Shift+h` `j` `k` `l`, or `Alt+Shift+arrows` | Move the window |
+| `Alt+Shift+a` | Focus the parent container |
 
-The `chirp` package on PyPI is an unrelated bioacoustics library, not this.
+### Layout
 
-## Display and power
+| Keys | Action |
+|---|---|
+| `Alt+Shift+b` / `Alt+Shift+v` | Next window splits horizontally / vertically |
+| `Alt+Shift+w` | Tabbed |
+| `Alt+Shift+s` | Stacking |
+| `Alt+Shift+e` | Toggle split direction |
+| `Alt+Shift+f` | Fullscreen |
+| `Alt+Shift+space` | Toggle floating |
+| `Alt+r` | Resize mode: `h` `j` `k` `l` resize, `Escape` leaves |
 
-**Screen blanking, DPMS and idle actions are disabled at every layer** — Xorg
-(`/etc/X11/xorg.conf.d/10-no-blanking.conf`), logind (`IdleAction=ignore`), the
-kernel console (`consoleblank=0`) and `xset` in `.xinitrc`. Nothing locks or
-blanks the screen.
+### Session and hardware
 
-This is not only a battery preference: the DSI panel **wakes from DPMS to a
-solid grey screen** and needs a VT switch to repaint, so blanking is actively
-harmful here. Use `Alt+Shift+o` to kill the backlight deliberately — that drives
-`brightnessctl` and never touches DPMS.
+| Keys | Action |
+|---|---|
+| `Alt+Shift+c` | Reload the i3 config |
+| `Alt+Shift+r` | Restart i3 in place |
+| `Alt+Shift+x` | Exit i3 (asks first) |
+| `Alt+Shift+o` / `Alt+Shift+p` | Backlight off / restore |
+| Brightness keys | Backlight ±10% |
+| Volume keys | Volume ±5%, mute |
+| `Ctrl+Alt+F2`, then `Ctrl+Alt+F1` | Repaint the panel if it comes back grey |
 
-**Rotation** is detected at X startup rather than hardcoded. The panel is
-mounted rotated and presents portrait; some images already apply the transform
-at the DRM level, and rotating twice leaves the display sideways. If it comes up
-sideways, edit `~/.xinitrc`.
+## Design principles
 
-## Fonts
+- **Idempotent, so it is the maintenance tool too.** Re-running is the intended
+  use; a run that changes nothing writes nothing, and `maint` is just that run.
+- **Receive-only by default.** Nothing transmits or uploads on its own: JS8
+  auto-reply and spotting are off, and the mesh waits for a region.
+- **Works off-grid.** Time from GPS and the RTC, map tiles on the card, and no
+  step that needs the network after provisioning.
+- **Never brick a portable device.** Kernels are held, boot files are backed up,
+  and a truncated download dies instead of running half a script.
+- **Check the hardware, don't assume it.** Fonts are verified with `fc-match`, the
+  SDR with `rtl_test`, the RTC with `dmesg`, and SDR++ by whether it actually
+  opened the dongle.
+- **One command per job.** `radio`, `mesh` and `maint`, each runnable from dmenu,
+  with failures shown on screen when there is no terminal.
 
-`monospace` → **Atkinson Hyperlegible Mono**, `serif` and `sans-serif` →
-**Atkinson Hyperlegible Next**, via `/etc/fonts/local.conf`.
+## Documentation
 
-Neither is packaged in Debian (`fonts-atkinson-hyperlegible` is the *original*
-family only), so both come from the upstream Google Fonts repos. The install
-verifies with `fc-match` rather than assuming — a silent miss would just fall
-back to DejaVu and look fine.
+| Guide | What's in it |
+|---|---|
+| [Install](docs/install.md) | Rex's image, flashing, running the script, sections and flags, after the first run |
+| [Radio](docs/radio.md) | `radio` profiles, JS8 over the SDR, an empty SDR++ waterfall, CHIRP |
+| [Hardware](docs/hardware.md) | AIO v2 power rails, time (GPS, RTC, chrony), Meshtastic and map tiles, Bluetooth |
+| [Desktop](docs/desktop.md) | Why `Alt+Shift`, what starts on which workspace, display and power, fonts |
+| [Maintenance](docs/maintenance.md) | `maint` and held kernels, SSH, troubleshooting |
 
-i3 uses Mono at 12pt. The panel is ~290 DPI, so raise it in
-`~/.config/i3/config` if it reads small.
+## License
 
----
-
-## After the first run
-
-A reboot is **required** — RTC, GPS and LoRa are all boot overlays and do
-nothing until then.
-
-```bash
-ls /dev/rtc* && dmesg | grep -i rtc   # RTC actually bound
-systemctl status uconsole-rtc         # RTC bound and seeded (automatic)
-rtl_test -t                           # SDR enumerated (its rail is on by default)
-cgps -s                               # GPS fix; needs a sky view
-chronyc sources                       # NMEA and PPS reachable, PPS '*' once locked
-claude                                # log in via browser prompt
-ssh jroemer@clockworkpi.local         # from another machine
-sudo tailscale up                     # unless TS_AUTHKEY was passed
-```
-
-Three things the script deliberately leaves to you:
-
-- **Meshtastic will not transmit** until a LoRa region is set:
-  `meshtastic --set lora.region US`. Transmitting on the wrong region is a
-  regulatory problem, not a config annoyance.
-- **JS8Call transmit** is not configured — audio out and PTT depend on the
-  rig attached. Groups, grid, callsign, the dial and the SDR receive input
-  *are* set, and `radio` tunes SDR++ to match (see
-  [Radio profiles](#radio-profiles)).
-- **`hwclock -r` alone can lie**, reporting plausible time sourced from
-  elsewhere. Check `/dev/rtc*` and `dmesg`. No output at all usually means the
-  CR1220 is in backwards.
-
-## Bluetooth
-
-`bluez` ships with the image; there's no GUI manager under i3.
-
-```bash
-sudo systemctl enable --now bluetooth
-bluetoothctl
-```
-
-```
-power on
-agent on
-default-agent
-scan on                      # note the MAC
-pair    AA:BB:CC:DD:EE:FF
-trust   AA:BB:CC:DD:EE:FF    # without this it will not reconnect after reboot
-connect AA:BB:CC:DD:EE:FF
-scan off
-```
-
-`trust` is the one that matters — without it the device pairs but won't
-reconnect, which reads like flaky Bluetooth. Bluetooth and Wi-Fi share one
-antenna on the CM4, so expect input lag on 2.4 GHz when Wi-Fi is busy.
-
----
-
-## Troubleshooting
-
-**Grey screen after the panel powers off** — shouldn't happen now that blanking
-is disabled everywhere. If it does: `Ctrl+Alt+F2` then `Ctrl+Alt+F1` forces a
-repaint.
-
-**i3 wedged, or you want the GUI off** — `Ctrl+Alt+F2` for another tty, then:
-
-```bash
-sudo rm /etc/systemd/system/getty@tty1.service.d/autologin.conf
-```
-
-**dpkg half-configured** — usually a postinst that needed hardware present:
-
-```bash
-sudo dpkg --configure -a
-sudo apt --fix-broken install
-```
-
-**A section failed** — re-run just that one with `--only NAME` rather than the
-whole script. Boot files always have a `.bak-<timestamp>` beside them (taken
-once, on the first run — that copy is the pristine pre-script state).
-
-**LoRa silent** — check `/etc/meshtasticd/config.d/uconsole-aio-v2.yaml` is
-actually being read before debugging the radio. The drop-in only applies if the
-packaged version supports `config.d`.
+BSD 3-Clause. Made by Jonathan Roemer. See [LICENSE](LICENSE).

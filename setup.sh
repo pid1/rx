@@ -2065,7 +2065,7 @@ PROFILES = {
     "vhf":      vhf("2 m calling", 146520000.0),
     "dcara":    vhf("DCARA", 146920000.0),
     "uhf":      vhf("70 cm calling", 446000000.0),
-    "noaa":     vhf("NOAA weather", 162550000.0),
+    "noaa":     vhf("NOAA weather", 162400000.0),
     "fm-93.3":  vhf("93.3 FM", 93300000.0, "WFM", WFM, gain=10, vfo=-400000.0),
     "fm-105.3": vhf("105.3 FM", 105300000.0, "WFM", WFM, gain=10, vfo=-400000.0),
     # Below the R820T's range, so through the Ham It Up like HF.
@@ -2527,7 +2527,7 @@ complete -F _radio radio
 RADIOCOMP
     note "radio: 'radio' lists profiles, 'radio NAME' (Tab completes) closes whatever runs and brings NAME up; 'radio off' closes everything. Each profile resumes where it was left. Profiles: ghostnet js8 vhf dcara uhf noaa fm-93.3 fm-105.3 am-820. It says when the Ham It Up needs flipping between upconvert (HF, AM) and bypass (VHF/UHF, FM)."
 
-    note "SDR needs the antenna on the 'SDR' IPEX pad (the GPS pad is a separate path). The SDR and internal-USB rails come up at boot; GPS and LoRa do not — see the README for turning those on."
+    note "SDR needs the antenna on the 'SDR' IPEX pad (the GPS pad is a separate path). All four AIO rails (SDR, USB, GPS, LoRa) come up at boot — see docs/hardware.md for switching them."
     note "SDR++ starts RTL-SDR gain at 0, which looks identical to a dead device: an empty, flat waterfall. Select the source, press play, then raise gain — and test against a strong FM broadcast (88-108 MHz) before anything weak."
     note "If the waterfall stays empty, prove the hardware first with 'rtl_test -t' and 'timeout 10 rtl_test -s 2400000'. The dongle is behind the AIO's internal USB hub, so 'lost at least N bytes' there means drop the sample rate rather than chase SDR++ settings."
   fi
