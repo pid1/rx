@@ -51,14 +51,16 @@ script that provisions a blank card re-applies the configuration on every
 - **Receives JS8** through the SDR: SDR++ feeds JS8Call over a virtual audio
   cable, with GhostNet's groups set and every transmit and upload path off.
 - **Keeps time without a network**, from GPS PPS, the AIO's RTC and chrony.
-- **Runs a Meshtastic node** on the AIO's SX1262, with a dashboard and offline
-  map tiles.
+- **Runs a LoRa mesh node** on the AIO's SX1262, Meshtastic or MeshCore, on
+  the North Texas community's settings, with node lists, messaging, a
+  dashboard and offline map tiles.
 - **Powers the AIO's subsystems** on GPIO-switched rails, at boot and on demand.
 - **Sets up the desktop**: i3 with Alt as the modifier, autologin, Atkinson
   Hyperlegible fonts, and screen blanking off at every layer.
 - **Keeps itself current** with one `maint` command, holding the kernel so an
   unattended upgrade can't take the display away.
-- **Lets you in** over SSH with keys synced from GitHub, and optionally Tailscale.
+- **Closes the network** except for SSH: inbound is default-deny, and SSH is
+  key-only with keys synced from GitHub, plus optional Tailscale.
 
 ## Quick start
 
@@ -76,7 +78,8 @@ Then:
 radio                       # list the SDR profiles
 radio ghostnet              # JS8 GhostNet: SDR++ on 7.107 MHz + JS8Call
 chronyc sources             # time: PPS marked '*' once the GPS has a fix
-mesh                        # Meshtastic: start the node, open the dashboard
+radio meshtastic            # mesh node on North Texas settings (or: radio meshcore)
+radio mesh nodes            # who the mesh has heard
 ```
 
 The account is assumed to be `jroemer`; pass another with
@@ -113,14 +116,43 @@ The account is assumed to be `jroemer`; pass another with
 `radio` says when the Ham It Up's switch needs flipping. How profiles work, and
 the SDR++ quirks they work around: [docs/radio.md](docs/radio.md).
 
+### `radio mesh`: the LoRa mesh
+
+| Command | What it does |
+|---|---|
+| `radio meshtastic` | Put the LoRa radio on Meshtastic, with North Texas settings |
+| `radio meshcore` | Put it on MeshCore, with North Texas settings |
+| `radio mesh` | Open the client: the Meshtastic dashboard, or MeshCore's chat |
+| `radio mesh nodes` | Who has been heard, with SNR and hops |
+| `radio mesh send TEXT` | To the primary (Meshtastic) or public (MeshCore) channel |
+| `radio mesh dm NAME TEXT` | Direct message; `Tab` completes heard names |
+| `radio mesh join URL` | Meshtastic: add the channels in a shared URL |
+| `radio mesh join NAME [KEY]` | MeshCore: add a channel (`#name` needs no key) |
+| `radio mesh info` | Identity, radio settings and channels, without starting anything |
+| `radio mesh on` / `off` | Start or stop the active mesh |
+
+The two networks share one radio, so choosing one stops the other. Neither
+starts at boot; every `radio mesh` command but `info` starts the active one.
+
+| | Meshtastic | MeshCore |
+|---|---|---|
+| Radio | LongFast, slot 20 (906.875 MHz) | 910.525 MHz, 62.5 kHz, SF 7, CR 5 |
+| Role | `CLIENT`, 3 hops | companion |
+| Announces | node info every 3 h | one advert per start |
+| Position | never sent | never sent |
+| MQTT | off | — |
+
+Defaults from [NTX Mesh](https://ntxmesh.com/join/); details in
+[docs/hardware.md](docs/hardware.md#lora-mesh).
+
 ### Everything else
 
 | Command | What it does |
 |---|---|
 | `sudo maint` | Upgrade packages, re-apply `setup.sh`, report a pending reboot. `--dry-run` and `--only NAME` pass through |
 | `curl -fsSL pid1.space/rx \| sudo bash -s -- FLAGS` | Run the script directly: `--dry-run`, `--only NAME`, `--skip NAME`, `--user NAME` |
-| `mesh` | Start `meshtasticd`, wait for the radio, open the dashboard |
-| `meshtastic --host localhost --info` | Node, region and modem preset (`--nodes` for the mesh) |
+| `meshtastic --host localhost --info` | Everything the Meshtastic node knows, raw |
+| `meshcore-cli -t 127.0.0.1` | MeshCore's own client, interactive |
 | `aiov2_ctl --status` | AIO power rails and battery |
 | `sudo aiov2_ctl GPS on` | Power a rail now: `GPS`, `LORA`, `SDR` or `USB` |
 | `chronyc sources` | Time sources; PPS `*` means GPS-locked |
@@ -151,7 +183,7 @@ which ones survive: [docs/desktop.md](docs/desktop.md#why-window-management-sits
 |---|---|
 | `1` | SDR++, started at login by `radio resume` |
 | `2` | JS8Call |
-| `3` | Meshtastic dashboard (`mesh`) |
+| `3` | Meshtastic dashboard (`radio mesh`) |
 
 ### Launch and close
 
@@ -197,8 +229,11 @@ which ones survive: [docs/desktop.md](docs/desktop.md#why-window-management-sits
 
 - **Idempotent, so it is the maintenance tool too.** Re-running is the intended
   use; a run that changes nothing writes nothing, and `maint` is just that run.
-- **Receive-only by default.** Nothing transmits or uploads on its own: JS8
-  auto-reply and spotting are off, and the mesh waits for a region.
+- **Closed by default.** Nothing reaches the device unsolicited but SSH, keys
+  only. Services that listen widely, like `meshtasticd`, stay local.
+- **Quiet until asked.** Nothing transmits or uploads on its own: JS8
+  auto-reply and spotting are off, no mesh runs at boot, and neither mesh
+  ever sends a position.
 - **Works off-grid.** Time from GPS and the RTC, map tiles on the card, and no
   step that needs the network after provisioning.
 - **Never brick a portable device.** Kernels are held, boot files are backed up,
@@ -206,7 +241,7 @@ which ones survive: [docs/desktop.md](docs/desktop.md#why-window-management-sits
 - **Check the hardware, don't assume it.** Fonts are verified with `fc-match`, the
   SDR with `rtl_test`, the RTC with `dmesg`, and SDR++ by whether it actually
   opened the dongle.
-- **One command per job.** `radio`, `mesh` and `maint`, each runnable from dmenu,
+- **One command per job.** `radio` and `maint`, each runnable from dmenu,
   with failures shown on screen when there is no terminal.
 
 ## Documentation
@@ -215,9 +250,9 @@ which ones survive: [docs/desktop.md](docs/desktop.md#why-window-management-sits
 |---|---|
 | [Install](docs/install.md) | Rex's image, flashing, running the script, sections and flags, after the first run |
 | [Radio](docs/radio.md) | `radio` profiles, JS8 over the SDR, an empty SDR++ waterfall, CHIRP |
-| [Hardware](docs/hardware.md) | AIO v2 power rails, time (GPS, RTC, chrony), Meshtastic and map tiles, Bluetooth |
+| [Hardware](docs/hardware.md) | AIO v2 power rails, time (GPS, RTC, chrony), the LoRa mesh (Meshtastic, MeshCore) and map tiles, Bluetooth |
 | [Desktop](docs/desktop.md) | Why `Alt+Shift`, what starts on which workspace, display and power, fonts |
-| [Maintenance](docs/maintenance.md) | `maint` and held kernels, SSH, troubleshooting |
+| [Maintenance](docs/maintenance.md) | `maint` and held kernels, SSH, the firewall, troubleshooting |
 
 ## License
 

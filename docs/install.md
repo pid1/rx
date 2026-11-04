@@ -73,12 +73,13 @@ Every section is skippable with `--skip NAME`, or run alone with `--only NAME`.
 | Section | What it does |
 |---|---|
 | `base` | Timezone (America/Chicago), hushlogin, sshd enabled, GitHub-backed `authorized_keys` sync, the `maint` maintenance command, hardware group membership |
+| `firewall` | Default-deny inbound: SSH and replies only, IPv4 and IPv6 (nftables) |
 | `desktop` | X11 + i3, autologin on tty1, Alacritty, Atkinson fonts, PipeWire, blanking disabled |
 | `claude` | Claude Code from Anthropic's signed apt repo |
 | `aio` | HackerGadgets AIO v2 metapackage, GPIO power rails, boot overlays |
 | `rtc` | PCF85063A over i2c, bound once the AIO rails are up (`uconsole-rtc`), `fake-hwclock` as fallback |
 | `gps` | UART + PPS overlays, serial console removed, `gpsd` on `/dev/ttyS0` |
-| `lora` | SPI overlays, `meshtasticd` with the SX1262 config, `meshtastic-ui` dashboard, region |
+| `lora` | `meshtasticd` with its own config, the dashboard and map tiles; MeshCore (MeshCoreRPI, pinned); both clients; `rx-mesh`, so neither starts at boot |
 | `sdr` | `sdrpp-brown`, `rtl-sdr`, DVB-T driver blacklisted, gqrx bookmarks migrated, `radio` profiles |
 | `ham` | JS8Call + hamlib, receive-only GhostNet configuration, SDR→JS8Call loopback sink, CHIRP |
 | `tailscale` | Tailscale from its official repo |
@@ -118,15 +119,16 @@ rtl_test -t                           # SDR enumerated (its rail is on by defaul
 cgps -s                               # GPS fix; needs a sky view
 chronyc sources                       # NMEA and PPS reachable, PPS '*' once locked
 claude                                # log in via browser prompt
-ssh jroemer@clockworkpi.local         # from another machine
+ssh jroemer@<its IP or tailnet name>  # from another machine (mDNS is firewalled)
 sudo tailscale up                     # unless TS_AUTHKEY was passed
 ```
 
 Three things the script deliberately leaves to you:
 
-- **Meshtastic will not transmit** until a LoRa region is set:
-  `meshtastic --set lora.region US`. Transmitting on the wrong region is a
-  regulatory problem, not a config annoyance.
+- **No mesh runs** until `radio meshtastic` or `radio meshcore`. Starting one
+  applies `LORA_REGION` (`US`) and the North Texas settings; outside the US,
+  change `LORA_REGION` in `setup.sh` first — the wrong region is a regulatory
+  problem, not a config annoyance.
 - **JS8Call transmit** is not configured — audio out and PTT depend on the
   rig attached. Groups, grid, callsign, the dial and the SDR receive input
   *are* set, and `radio` tunes SDR++ to match (see
