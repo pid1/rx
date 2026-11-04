@@ -89,7 +89,7 @@ Every section is skippable with `--skip NAME`, or run alone with `--only NAME`.
 | `gps` | UART + PPS overlays, serial console removed, `gpsd` on `/dev/ttyS0` |
 | `lora` | SPI overlays, `meshtasticd` with the SX1262 config, `meshtastic-ui` dashboard, region |
 | `sdr` | `sdrpp-brown`, `rtl-sdr`, DVB-T driver blacklisted, gqrx bookmarks migrated, `radio` profiles |
-| `ham` | JS8Call + hamlib, receive-only GhostNet configuration, SDR→JS8Call loopback sink, `js8ghost`/`js8call` launchers, CHIRP |
+| `ham` | JS8Call + hamlib, receive-only GhostNet configuration, SDR→JS8Call loopback sink, CHIRP |
 | `tailscale` | Tailscale from its official repo |
 
 ### Flags
@@ -459,13 +459,10 @@ then it feeds only the signal meter. That cut its memory from 1–2 GB to about
 
 ## JS8 over the SDR
 
-**`js8ghost`** (GhostNet, 7.107 MHz) and **`js8call`** (standard JS8,
-7.078 MHz) are `radio ghostnet` and `radio js8`: whatever is running closes,
-and SDR++ comes up tuned with JS8Call on the matching dial. SDR++ stays on
-workspace 1 and JS8Call gets workspace 2. `js8call` deliberately shadows
-`/usr/bin/js8call`, so starting JS8Call the usual way tunes the SDR too;
-`js8call ARGS...` runs the real binary with those arguments and no retuning. (There is no `js8` command: `/usr/bin/js8` is
-JS8Call's decoder.)
+**`radio ghostnet`** (7.107 MHz) and **`radio js8`** (7.078 MHz) are the
+JS8 profiles: whatever is running closes, and SDR++ comes up tuned on
+workspace 1 with JS8Call on the matching dial on workspace 2. Plain
+`js8call` is still just JS8Call, with no retuning.
 
 Audio goes SDR++ → the `SDR_to_JS8` PipeWire null sink
 (`/etc/pipewire/pipewire.conf.d/50-sdr-js8.conf`) → JS8Call, which records

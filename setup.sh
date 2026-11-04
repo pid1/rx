@@ -2007,7 +2007,7 @@ JS8_INI = os.path.join(HOME, ".config", "JS8Call.ini")
 
 SDR_CRIT, SDR_TREE = "(?i)^sdr", "sdr"           # i3 criteria / tree match
 JS8_CRIT, JS8_TREE = "(?i)^js8call$", 'js8call"'
-# By absolute path: /usr/local/bin/js8call is our launcher, which runs radio.
+# By absolute path, so a stray wrapper earlier on PATH cannot recurse.
 JS8CALL = "/usr/bin/js8call"
 JS8_NODE = "SDR_to_JS8"
 
@@ -2672,7 +2672,7 @@ def main():
     if not args.dry_run and subprocess.run(
             ["pgrep", "-x", "js8call"], stdout=subprocess.DEVNULL).returncode == 0:
         print("  JS8Call is running and would overwrite %s on exit — close it and re-run" % ini)
-        return 1
+        return 2
 
     cp = configparser.ConfigParser(
         interpolation=None,   # values contain bare '%' and '$'
@@ -2747,8 +2747,13 @@ JS8CONF
     if $DRY_RUN; then
       log "[dry-run] would write the GhostNet JS8Call config for $DESKTOP_USER"
     else
-      /usr/local/sbin/js8call-ghostnet-config --home "$USER_HOME" \
-        || warn "JS8Call config failed — any existing config was left untouched"
+      local js8rc=0
+      /usr/local/sbin/js8call-ghostnet-config --home "$USER_HOME" || js8rc=$?
+      case $js8rc in
+        0) ;;
+        2) note "JS8Call config skipped because JS8Call was open (it rewrites its ini on exit). Close it and re-run: sudo maint, or --only ham." ;;
+        *) warn "JS8Call config failed — any existing config was left untouched" ;;
+      esac
       chown "${DESKTOP_USER}:${USER_GROUP}" "$USER_HOME/.config/JS8Call.ini" 2>/dev/null || true
     fi
     # Receive path for JS8 without a rig: SDR++ demodulates USB into this
@@ -2774,40 +2779,24 @@ context.objects = [
 PWSINK
     log "PipeWire loopback sink SDR_to_JS8 configured"
 
-    # Earlier revisions installed /usr/local/bin/js8, which shadowed JS8Call's
-    # own decoder binary, /usr/bin/js8. Remove that copy, but only if ours.
-    if grep -qs 'Managed by rx/setup.sh' /usr/local/bin/js8; then
-      run rm -f /usr/local/bin/js8
-      log "removed the old js8 launcher (it shadowed JS8Call's decoder)"
+    # JS8 receive is 'radio ghostnet' / 'radio js8' (the sdr section).
+    # Earlier revisions installed launchers for it -- js8, then js8ghost with
+    # js8call as a symlink -- and js8 and js8call shadowed JS8Call's own
+    # binaries. Remove them, but only ours.
+    local old
+    for old in /usr/local/bin/js8 /usr/local/bin/js8ghost; do
+      if grep -qs 'Managed by rx/setup.sh' "$old"; then
+        run rm -f "$old"
+        log "removed the old launcher $old"
+      fi
+    done
+    if [[ -L /usr/local/bin/js8call && $(readlink /usr/local/bin/js8call) == js8ghost ]]; then
+      run rm -f /usr/local/bin/js8call
+      log "removed the old js8call launcher symlink"
     fi
 
-    # Two names for 'radio <JS8 profile>', which closes whatever runs now and
-    # brings up SDR++ tuned and playing plus JS8Call on the matching dial.
-    # 'js8call' deliberately shadows /usr/bin/js8call, so starting JS8Call the
-    # usual way -- terminal or dmenu -- also tunes the SDR; radio runs the
-    # real binary by absolute path, so it cannot recurse.
-    write_file /usr/local/bin/js8ghost 0755 <<'JS8'
-#!/bin/sh
-# Managed by rx/setup.sh — one-command JS8 receive through the SDR.
-#
-#   js8ghost           GhostNet:     radio ghostnet
-#   js8call            standard JS8: radio js8
-#   js8call ARGS...    plain JS8Call with ARGS, no retuning
-case $(basename "$0") in
-    js8ghost) profile=ghostnet ;;
-    *)        [ $# -gt 0 ] && exec /usr/bin/js8call "$@"
-              profile=js8 ;;
-esac
-# Without radio (the sdr section skipped) this is plain JS8Call.
-command -v radio >/dev/null 2>&1 || exec /usr/bin/js8call
-exec radio "$profile"
-JS8
-    run ln -sfn js8ghost /usr/local/bin/js8call
-    log "installed the js8ghost / js8call launchers"
-
     note "JS8Call: groups @GHOSTNET, @GSTFLASH, @GNUSATX; dial 7.107 MHz (GhostNet)."
-    note "JS8 receive: 'js8ghost' (GhostNet, 7.107) or 'js8call' (standard JS8, 7.078), from a terminal or dmenu — same as 'radio ghostnet' / 'radio js8'. SDR++ tunes on workspace 1 and JS8Call opens on 2. JS8Call's audio input defaults to the SDR_to_JS8.monitor loopback; a device picked under Settings -> Audio is kept on re-runs."
-    note "SDR++ for JS8, set once in its GUI (it keeps its own config): RTL-SDR source with the Ham It Up, Offset mode 'Ham-It-Up' (125 MHz), direct sampling off; Radio USB, ~3 kHz bandwidth; Audio sink 'SDR to JS8 (virtual cable)'; tune to the dial JS8Call shows, since with no rig they are not linked."
+    note "JS8 receive: 'radio ghostnet' (7.107) or 'radio js8' (7.078) brings up SDR++ tuned on workspace 1 and JS8Call on the matching dial on 2. JS8Call's audio input defaults to the SDR_to_JS8.monitor loopback; a device picked under Settings -> Audio is kept on re-runs."
     note "JS8Call: 7.107 is set as the dial but is not in the preset Frequencies list; add it under Settings -> Frequencies to get it in the dropdown."
     note "JS8Call transmit needs an external rig (CAT + USB audio) — the SDR is receive-only. Set audio out and PTT under Settings -> Audio / Radio."
   fi
