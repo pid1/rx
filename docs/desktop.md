@@ -21,17 +21,18 @@ only `Alt+h/j/k/l`, `Alt+1..9`, `Alt+r` and `Alt+Return` — costing readline
 
 ## Applications at login
 
-i3 launches three apps and places them:
+i3 runs `radio resume` at login, which starts the active profile's receiver,
+rxd, as a headless systemd user unit (`rxd@NAME`) with no window. Two apps
+have placement rules:
 
 | Workspace | Application | At boot |
 |---|---|---|
-| 1 | SDR++Brown | launched, via `radio resume` |
-| 2 | JS8Call | placement only |
+| 2 | JS8Call | started by `radio resume` for a JS8 profile |
 | 3 | `meshtastic-ui` | placement only |
 
-Only SDR++ starts on its own. JS8Call and the dashboard keep their placement
-rules, so they land on 2 and 3 whenever started — `Alt+2` and `Alt+3` reach
-those workspaces at any time, whether or not anything is on them.
+JS8Call and the dashboard land on 2 and 3 whenever started — `Alt+2` and
+`Alt+3` reach those workspaces at any time, whether or not anything is on
+them.
 
 No mesh daemon runs at boot either. **`radio mesh`** starts the active one
 and opens its client — the dashboard on workspace 3 for Meshtastic — from a
@@ -41,14 +42,12 @@ one command the desktop user may run as root, under a sudo rule at
 put in place. Failures surface through `i3-nagbar`, since dmenu gives it no
 terminal to print to.
 
-Two quirks the rules work around. SDR++Brown puts its version and build date
-*inside* `WM_CLASS`, so the rule matches a `^sdr` prefix rather than the whole
-string, which would break on every upgrade. `meshtastic-ui` sets **no
-`WM_CLASS` at all**, so `assign` has nothing to match and a
-`for_window [title="^Meshtastic"]` rule moves it instead.
+One quirk the rules work around: `meshtastic-ui` sets **no `WM_CLASS` at
+all**, so `assign` has nothing to match and a `for_window [title="^Meshtastic"]`
+rule moves it instead.
 
-These use `exec`, which runs only at i3 startup — `i3-msg restart` will not
-relaunch them, by design, since `exec_always` would spawn duplicates on every
+`radio resume` runs from `exec`, which runs only at i3 startup —
+`i3-msg restart` will not rerun it, by design, since `exec_always` would spawn duplicates on every
 reload.
 
 ## Display and power
