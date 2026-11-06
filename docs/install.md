@@ -33,7 +33,7 @@ that account to exist, and takes `--user NAME` if it isn't `jroemer`.
 This targets Rex's image specifically:
 
 - **His apt repo is already configured** (it appears as `ClockworkPi-apt`).
-  That's where `sdrpp-brown`, `hackergadgets-uconsole-aio-board`, `pinctrl` and
+  That's where `hackergadgets-uconsole-aio-board`, `pinctrl` and
   the rtlsdrblog `rtl-sdr` build come from rather than Debian. The script
   verifies it rather than adding a copy.
 - **No games and no desktop.** True of both the Lite (stage2) and full (stage4)
@@ -80,7 +80,7 @@ Every section is skippable with `--skip NAME`, or run alone with `--only NAME`.
 | `rtc` | PCF85063A over i2c, bound once the AIO rails are up (`uconsole-rtc`), `fake-hwclock` as fallback |
 | `gps` | UART + PPS overlays, serial console removed, `gpsd` on `/dev/ttyS0` |
 | `lora` | `meshtasticd` with its own config, the dashboard and map tiles; MeshCore (MeshCoreRPI, pinned); both clients; `rx-mesh`, so neither starts at boot |
-| `sdr` | `sdrpp-brown`, `rtl-sdr`, DVB-T driver blacklisted, gqrx bookmarks migrated, `radio` profiles |
+| `sdr` | `rtl-sdr`, DVB-T driver blacklisted, rxd and its `rxd@` user unit, `radio` profiles; purges `sdrpp-brown`/`sdrpp` |
 | `ham` | JS8Call + hamlib, receive-only GhostNet configuration, SDR→JS8Call loopback sink, CHIRP |
 | `tailscale` | Tailscale from its official repo |
 
@@ -123,7 +123,7 @@ ssh jroemer@<its IP or tailnet name>  # from another machine (mDNS is firewalled
 sudo tailscale up                     # unless TS_AUTHKEY was passed
 ```
 
-Three things the script deliberately leaves to you:
+Four things the script deliberately leaves to you:
 
 - **No mesh runs** until `radio meshtastic` or `radio meshcore`. Starting one
   applies `LORA_REGION` (`US`) and the North Texas settings; outside the US,
@@ -131,8 +131,11 @@ Three things the script deliberately leaves to you:
   problem, not a config annoyance.
 - **JS8Call transmit** is not configured — audio out and PTT depend on the
   rig attached. Groups, grid, callsign, the dial and the SDR receive input
-  *are* set, and `radio` tunes SDR++ to match (see
+  *are* set, and `radio` tunes rxd to match (see
   [Radio profiles](radio.md#radio-profiles)).
 - **`hwclock -r` alone can lie**, reporting plausible time sourced from
   elsewhere. Check `/dev/rtc*` and `dmesg`. No output at all usually means the
   CR1220 is in backwards.
+- **Old SDR++ settings.** The `sdr` section purges the `sdrpp-brown` and
+  `sdrpp` packages but leaves `~/.config/sdrpp*`; delete it when you no
+  longer want it.
