@@ -2430,20 +2430,21 @@ GQRXCONV
       note "gqrx bookmarks imported into SDR++ (Module list -> Frequency Manager). gqrx config untouched; tarball backup in \$HOME."
     fi
 
-    # Switchable, resumable SDR++ profiles. See the docstring for why the
-    # dongle is pinned by serial rather than by SDR++'s own device name.
+    # Switchable, resumable receiver profiles, played by rxd through its
+    # systemd user unit. See the docstring for how a profile is kept.
     write_file /usr/local/bin/radio 0755 <<'RADIO'
 #!/usr/bin/env python3
-"""Managed by rx/setup.sh — switchable, resumable SDR++ profiles.
+"""Managed by rx/setup.sh — switchable, resumable receiver profiles.
 
   radio                list profiles; * marks the active one
-  radio NAME           switch to NAME, closing whatever runs now. A JS8
-                       profile brings up SDR++ and JS8Call on its dial; any
-                       other brings up SDR++ alone. The profile being left is
-                       saved first, so coming back to it resumes where it was.
-  radio off            save the active profile, close SDR++ and JS8Call
+  radio NAME           switch to NAME. rxd, the receiver, restarts on NAME; a
+                       JS8 profile also brings up JS8Call on its dial. The
+                       profile being left is saved first, so coming back to
+                       it resumes where it was. NAME when it is already up
+                       changes nothing.
+  radio off            save the active profile, stop rxd, close JS8Call
   radio resume         bring the active profile back up (i3 runs it at login)
-  radio save [NAME]    save SDR++'s current tuning as NAME (default: active)
+  radio save [NAME]    save rxd's current tuning as NAME (default: active)
   radio reset NAME     forget your saved state for NAME; back to its default
   radio show NAME      print a profile as JSON
   radio help           this text
@@ -2463,31 +2464,24 @@ GQRXCONV
   networks share one radio, so choosing one stops the other. Neither starts at
   boot.
 
-  --no-focus           leave focus where it is
+  --no-focus           leave focus where it is (JS8Call)
 
 Tab completes profile names (/usr/share/bash-completion/completions/radio).
 
-A profile is tuning only, never layout: frequency and VFO position, offset
-mode, demodulator and all of its settings, audio sink and volume, the
-RTL-SDR's settings and, for JS8 profiles, JS8Call's dial. A few display
-settings (SDRPP_GLOBAL) go with every profile. The defaults below are
-starting points; saved state lives in ~/.config/rx/radio/ and wins.
+A profile is tuning only: frequency, offset mode, demodulator and its
+settings, audio sink and volume, the RTL-SDR's settings and, for JS8
+profiles, JS8Call's dial. The defaults below are starting points; saved
+state lives in ~/.config/rx/radio/ and wins.
 
-The dongle is stored by serial number. SDR++ names a dongle with its
-enumeration index ("[serial] name##index"), and the index shifts as dongles
-come and go: an SDR++ started before a second dongle appeared silently opens
-the wrong one under the old label. Resolving the serial to the current name
-on every apply keeps each profile on its own dongle.
-
-SDR++ rewrites its config on exit, so it is closed before any file is
-touched and started again afterwards, already playing (--autostart), with
-workspace 1 on screen -- see start_sdrpp() for why it has to be.
+rxd (systemd user unit rxd@NAME) reads only ~/.config/rx/radio/NAME.json, so
+the merged profile is written there before it starts. Its HTTP status on
+127.0.0.1:8073 is where the tuning is saved from. One rxd runs at a time: it
+holds the dongle. Edit NAME.json while it plays and
+'systemctl --user kill -s HUP rxd@NAME' makes it re-read the file.
 """
 import argparse
 import configparser
 import copy
-import ctypes
-import ctypes.util
 import json
 import os
 import re
@@ -2496,64 +2490,53 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.request
 
 HOME = os.path.expanduser("~")
-SDRPP = os.path.join(HOME, ".config", "sdrpp-brown")
 STATE = os.path.join(HOME, ".config", "rx", "radio")
 ACTIVE = os.path.join(STATE, "active")
 JS8_INI = os.path.join(HOME, ".config", "JS8Call.ini")
 
-SDR_CRIT, SDR_TREE = "(?i)^sdr", "sdr"           # i3 criteria / tree match
-JS8_CRIT, JS8_TREE = "(?i)^js8call$", 'js8call"'
+JS8_CRIT, JS8_TREE = "(?i)^js8call$", 'js8call"'  # i3 criteria / tree match
 # By absolute path, so a stray wrapper earlier on PATH cannot recurse.
 JS8CALL = "/usr/bin/js8call"
 JS8_NODE = "SDR_to_JS8"
+
+# rxd's HTTP control port; module-level so the tests can point it elsewhere.
+RXD_URL = "http://127.0.0.1:8073"
+RXD_START_SECS = 15
 
 NOOELEC = "57818712"  # NESDR SMArt v5, behind the Ham It Up
 JS8_SINK = "SDR to JS8 (virtual cable)"
 SPEAKER = "Built-in Audio"
 
-# SDR++'s demodulator IDs, keyed by the names it files their settings under.
-# Narrow FM is "FM", as on its radio buttons.
-DEMODS = {"FM": 0, "WFM": 1, "AM": 2, "DSB": 3, "USB": 4, "CW": 5, "LSB": 6, "RAW": 7}
-
 
 def rtl(gain):
-    # gain is SDR++'s index into the tuner's gain table, not dB. On the
-    # R820T: 4 = 3.7 dB, 10 = 16.6 dB, 20 = 37.2 dB.
-    return {"serial": NOOELEC, "gain": gain, "sampleRate": 2400000.0,
-            "directSampling": 0, "biasT": False, "offsetTuning": False,
-            "ppm": 0, "rtlAgc": False, "tunerAgc": False}
+    # gain is an index into the tuner's gain table, not dB. On the R820T:
+    # 4 = 3.7 dB, 10 = 16.6 dB, 20 = 37.2 dB. A saved gain_db wins over it.
+    return {"serial": NOOELEC, "gain": gain, "biasT": False, "ppm": 0}
 
 
 # USB as set by hand for JS8 on 2026-11-04.
 USB_JS8 = {"bandwidth": 3000.0, "agcAttack": 47.916229248046875,
-           "agcDecay": 4.896891117095947, "snapInterval": 100.0,
-           "squelchEnabled": False}
-NFM = {"bandwidth": 12500.0, "squelchEnabled": False}
-# 75 us de-emphasis is the US broadcast standard; 50 us is Europe's.
-WFM = {"bandwidth": 150000.0, "deempMode": "75us", "rds": True,
-       "rdsInfo": True, "rdsRegion": "na", "squelchEnabled": False}
-AM = {"bandwidth": 10000.0, "squelchEnabled": False}
-
-# Applied with every profile. SDR++ computes the FFT whether or not the FFT
-# or waterfall is shown, so with both hidden it only feeds the signal meter;
-# the smallest size at one frame a second keeps that alive at almost no CPU.
-SDRPP_GLOBAL = {"fftSize": 1024, "fftRate": 1}
+           "agcDecay": 4.896891117095947}
+NFM = {"bandwidth": 12500.0}
+WFM = {"bandwidth": 150000.0}
+AM = {"bandwidth": 10000.0}
 
 
 def js8(desc, dial):
-    # The VFO sits 100 Hz under the dial, as tuned by hand for GhostNet.
+    # The VFO sits 100 Hz under the dial, as tuned by hand for GhostNet; rxd
+    # keeps that difference as a calibration.
     return {"description": desc, "frequency": dial - 100.0,
-            "vfo_offset": -168100.0, "offset": "Ham-It-Up", "demod": "USB",
+            "offset": "auto", "demod": "USB",
             "demod_settings": USB_JS8, "sink": JS8_SINK, "volume": 0.2090567648410797,
             "rtl": rtl(4), "js8call_dial": dial}
 
 
-def vhf(desc, hz, demod="FM", settings=NFM, gain=20, vfo=-250000.0):
-    # Straight into the dongle: the Ham It Up must be on bypass.
-    return {"description": desc, "frequency": hz, "vfo_offset": vfo,
-            "offset": "None", "demod": demod, "demod_settings": settings,
+def vhf(desc, hz, demod="FM", settings=NFM, gain=20):
+    return {"description": desc, "frequency": hz,
+            "offset": "auto", "demod": demod, "demod_settings": settings,
             "sink": SPEAKER, "volume": 0.5, "rtl": rtl(gain)}
 
 
@@ -2564,11 +2547,11 @@ PROFILES = {
     "dcara":    vhf("DCARA", 146920000.0),
     "uhf":      vhf("70 cm calling", 446000000.0),
     "noaa":     vhf("NOAA weather", 162400000.0),
-    "fm-93.3":  vhf("93.3 FM", 93300000.0, "WFM", WFM, gain=10, vfo=-400000.0),
-    "fm-105.3": vhf("105.3 FM", 105300000.0, "WFM", WFM, gain=10, vfo=-400000.0),
-    # Below the R820T's range, so through the Ham It Up like HF.
-    "am-820":   dict(vhf("820 AM", 820000.0, "AM", AM, gain=4, vfo=-168100.0),
-                     offset="Ham-It-Up"),
+    "fm-93.3":  vhf("93.3 FM", 93300000.0, "WFM", WFM, gain=10),
+    "fm-105.3": vhf("105.3 FM", 105300000.0, "WFM", WFM, gain=10),
+    # Below the R820T's range, so through the Ham It Up like HF: "auto"
+    # upconverts anything under 30 MHz.
+    "am-820":   vhf("820 AM", 820000.0, "AM", AM, gain=4),
 }
 
 
@@ -2587,14 +2570,6 @@ def die(msg):
 
 
 # ------------------------------------------------------------------ files
-
-def load(name, missing=None):
-    path = os.path.join(SDRPP, name)
-    if missing is not None and not os.path.isfile(path):
-        return copy.deepcopy(missing)
-    with open(path, encoding="utf-8") as fh:
-        return json.load(fh)
-
 
 def dump(path, doc):
     tmp = path + ".tmp"
@@ -2651,6 +2626,19 @@ def store(name, p):
     dump(os.path.join(STATE, name + ".json"), p)
 
 
+def ensure_stored(name, p):
+    # rxd knows nothing of PROFILES: it reads only NAME.json, so a default
+    # that was never saved has to be written out before rxd can play it.
+    path = os.path.join(STATE, name + ".json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            if json.load(fh) == p:
+                return
+    except (OSError, ValueError):
+        pass
+    store(name, p)
+
+
 def active():
     try:
         with open(ACTIVE, encoding="utf-8") as fh:
@@ -2666,32 +2654,32 @@ def set_active(name):
         fh.write(name + "\n")
 
 
+def upconverting(p):
+    """Whether rxd puts p through the Ham It Up's 125 MHz upconversion."""
+    # "auto" (the default) follows the frequency, as rxd does: the R820T
+    # cannot tune below about 24 MHz, so HF and AM broadcast go through the
+    # upconverter. "Ham-It-Up" and "None" pin it on or off.
+    mode = p.get("offset", "auto")
+    if mode == "auto":
+        return float(p["frequency"]) < float(p.get("upconvert_below_hz", 30e6))
+    return mode != "None"
+
+
 def summary(name, p):
-    path = "Ham It Up upconvert" if p["offset"] != "None" else "Ham It Up bypass"
+    path = "Ham It Up upconvert" if upconverting(p) else "Ham It Up bypass"
     return "%-9s %11.4f MHz %-4s %-19s %s" % (
         name, p["frequency"] / 1e6, p["demod"], path, p.get("description", ""))
 
 
-# ---------------------------------------------------------------- hardware
+def unit_name(name):
+    # The unit passes %i to rxd verbatim, so keep to characters that need no
+    # systemd escaping; anything else would reach rxd mangled.
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        die("profile name '%s': use letters, digits, '.', '-' or '_'" % name)
+    return "rxd@%s.service" % name
 
-def dongles():
-    lib = ctypes.util.find_library("rtlsdr")
-    if not lib:
-        die("librtlsdr not found")
-    lib = ctypes.CDLL(lib)
-    lib.rtlsdr_get_device_name.restype = ctypes.c_char_p
-    lib.rtlsdr_get_device_name.argtypes = [ctypes.c_uint32]
-    found = {}
-    for i in range(lib.rtlsdr_get_device_count()):
-        vendor, product, serial = (ctypes.create_string_buffer(256) for _ in range(3))
-        if lib.rtlsdr_get_device_usb_strings(i, vendor, product, serial) != 0:
-            continue
-        sn = serial.value.decode(errors="replace")
-        dev = (lib.rtlsdr_get_device_name(i) or b"").decode(errors="replace")
-        # The exact format SDR++Brown's RTL-SDR source names devices with.
-        found[sn] = "[%.64s] %.64s##%d" % (sn, dev, i)
-    return found
 
+# ------------------------------------------------------------------ apps
 
 def running(proc):
     return subprocess.run(["pgrep", "-x", proc],
@@ -2734,55 +2722,6 @@ def start(argv, pat):
     die("%s did not open a window" % argv[0])
 
 
-def holds_dongle(pid):
-    fds = "/proc/%s/fd" % pid
-    try:
-        return any(os.readlink(os.path.join(fds, f)).startswith("/dev/bus/usb/")
-                   for f in os.listdir(fds))
-    except OSError:
-        return False
-
-
-def focused_workspace():
-    out = subprocess.run(["i3-msg", "-t", "get_workspaces"], capture_output=True,
-                         text=True).stdout
-    try:
-        return next(w["name"] for w in json.loads(out) if w["focused"])
-    except (ValueError, StopIteration):
-        return None
-
-
-def start_sdrpp():
-    # SDR++ blocks inside glfwCreateWindow until its new window is actually
-    # visible. i3 maps it onto workspace 1 (the assign rule), so started while
-    # another workspace is on screen it hangs there for good: a black window,
-    # one core spinning, the dongle never opened. Show workspace 1 first and
-    # go back afterwards. Then check playback really began, and retry once.
-    back = focused_workspace()
-    i3("workspace number 1")
-    try:
-        for attempt in (1, 2):
-            start(["sdrpp", "--autostart"], SDR_TREE)
-            for _ in range(40):
-                pids = subprocess.run(["pgrep", "-x", "sdrpp"], capture_output=True,
-                                      text=True).stdout.split()
-                if pids and holds_dongle(pids[0]):
-                    return
-                time.sleep(0.5)
-            # Its config was written before it started, so nothing is lost.
-            subprocess.run(["pkill", "-KILL", "-x", "sdrpp"])
-            for _ in range(20):
-                if not running("sdrpp"):
-                    break
-                time.sleep(0.25)
-            if attempt == 1:
-                say("SDR++ never opened the dongle; restarting it")
-        die("SDR++ starts but never opens the dongle — check it with 'rtl_test -t'")
-    finally:
-        if back and back != "1":
-            i3('workspace "%s"' % back)
-
-
 def ensure_js8_sink():
     # Normally made by /etc/pipewire/pipewire.conf.d/50-sdr-js8.conf when
     # PipeWire starts; a session that predates that file has to be given it.
@@ -2808,127 +2747,131 @@ def check_clock():
             "not decode until it is. See: chronyc sources", "warning")
 
 
+# ------------------------------------------------------------------- rxd
+
+def systemctl(*args, **kw):
+    return subprocess.run(["systemctl", "--user", *args], **kw)
+
+
+def rxd_status():
+    """rxd's /api/status as a dict, or None when nothing answers."""
+    try:
+        with urllib.request.urlopen(RXD_URL + "/api/status", timeout=1) as r:
+            return json.load(r)
+    except (OSError, ValueError):  # refused, timed out, HTTP error, not JSON
+        return None
+
+
+def rxd_stop():
+    # Every instance, not just the active profile's: whichever one runs holds
+    # the dongle. systemctl matches the pattern against loaded units.
+    systemctl("stop", "rxd@*.service", stderr=subprocess.DEVNULL)
+
+
+def rxd_fail(name, why):
+    unit = unit_name(name)
+    log = subprocess.run(["journalctl", "--user", "-u", unit, "-n", "15", "--no-pager"],
+                         capture_output=True, text=True).stdout.rstrip()
+    # Stopped so Restart=on-failure does not keep hammering a missing dongle.
+    systemctl("stop", unit, stderr=subprocess.DEVNULL)
+    if log:
+        print(log, file=sys.stderr)
+    # rxd says plainly when the dongle is missing or busy; put its own last
+    # word in the message, which is all a nagbar shows.
+    lines = [ln for ln in log.splitlines() if "rxd: " in ln] or log.splitlines() or [""]
+    last = lines[-1].split("rxd: ", 1)[-1].strip()
+    die("%s %s%s" % (unit, why, ": " + last if last else ""))
+
+
+def rxd_start(name):
+    unit = unit_name(name)
+    # After a run of failures systemd refuses to start the unit again until
+    # its counter is cleared; an explicit 'radio NAME' is a fresh attempt.
+    systemctl("reset-failed", unit, stderr=subprocess.DEVNULL)
+    if systemctl("start", unit).returncode != 0:
+        rxd_fail(name, "did not start")
+    deadline = time.monotonic() + RXD_START_SECS
+    while time.monotonic() < deadline:
+        if rxd_status() is not None:
+            return
+        state = systemctl("is-active", unit, capture_output=True, text=True).stdout.strip()
+        if state in ("failed", "inactive"):
+            rxd_fail(name, "exited")
+        time.sleep(0.25)
+    rxd_fail(name, "is not answering on %s" % RXD_URL)
+
+
 # ------------------------------------------------------ capture and apply
 
-def capture(p):
-    """The profile p, updated with SDR++'s current tuning."""
+def capture(p, st):
+    """The profile p, updated with rxd's current tuning from status st."""
     p = copy.deepcopy(p)
-    cfg = load("config.json")
-    radio = load("radio_config.json").get("Radio", {})
-    sink = load("brown_audio_sink_config.json", {}).get("Radio", {})
-    rtlc = load("rtl_sdr_config.json")
-
-    vfo = float(cfg.get("vfoOffsets", {}).get("Radio", 0.0))
-    p["frequency"] = float(cfg["frequency"]) + vfo
-    p["vfo_offset"] = vfo
-    p["offset"] = cfg.get("selectedOffset") or "None"
-    ids = {v: k for k, v in DEMODS.items()}
-    p["demod"] = ids.get(radio.get("selectedDemodId"), p["demod"])
-    p["demod_settings"] = radio.get(p["demod"], p.get("demod_settings", {}))
-    p["sink"] = sink.get("device") or p["sink"]
-    p["volume"] = cfg.get("streams", {}).get("Radio", {}).get("volume", p["volume"])
-
-    # An empty device means SDR++ fell back to whichever dongle enumerated
-    # first; which one that was is unknowable here, so keep the profile's.
-    m = re.match(r"\[(.*?)\] ", rtlc.get("device", ""))
-    if m:
-        dev = rtlc.get("devices", {}).get(rtlc["device"], {})
-        p["rtl"] = dict(p.get("rtl", {}), **dev, serial=m.group(1))
-
-    # JS8Call writes its ini on exit, so this is the dial as of its last
-    # close -- which is when a JS8 profile is switched away from anyway.
-    if p.get("js8call_dial") is not None:
-        dial = read_ini().get("Common", "DialFreq", fallback="")
-        if dial.isdigit():
-            p["js8call_dial"] = int(dial)
+    p.pop("vfo_offset", None)  # SDR++'s; rxd ignores it
+    # offset is left as it was: status reports the upconverter now in
+    # effect, and saving that would pin an "auto" profile to one side.
+    if st.get("vfo_hz") is not None:
+        p["frequency"] = float(st["vfo_hz"])  # the carrier, as rxd reads it
+    if st.get("mode"):
+        p["demod"] = st["mode"]
+    if st.get("bandwidth") is not None:
+        p["demod_settings"] = dict(p.get("demod_settings") or {},
+                                   bandwidth=float(st["bandwidth"]))
+    if st.get("volume") is not None:
+        p["volume"] = float(st["volume"])
+    if st.get("gain_db") is not None:
+        p["rtl"] = dict(p.get("rtl") or {}, gain_db=float(st["gain_db"]))
+    # rxd is the source of truth for the dial too: JS8Call tunes it over
+    # rigctl. Saving both dial and carrier keeps the calibration between them.
+    if p.get("js8call_dial") is not None and st.get("freq") is not None:
+        p["js8call_dial"] = int(round(float(st["freq"])))
     return p
 
 
-def plan(p, names):
-    """SDR++ files that must change to put p in effect: {path: document}."""
-    name = names.get(p["rtl"]["serial"])
-    if not name:
-        die("dongle SN %s is not plugged in (found: %s)"
-            % (p["rtl"]["serial"], ", ".join(names) or "none"))
-    out = {}
-
-    def edit(fname, fn, missing=None):
-        cur = load(fname, missing)
-        new = copy.deepcopy(cur)
-        fn(new)
-        if new != cur:
-            out[os.path.join(SDRPP, fname)] = new
-
-    def cfg(c):
-        if p["offset"] not in ("None", "Manual") and p["offset"] not in c.get("offsets", {}):
-            die("SDR++ has no offset mode named '%s'" % p["offset"])
-        c["frequency"] = float(p["frequency"] - p["vfo_offset"])
-        c.setdefault("vfoOffsets", {})["Radio"] = float(p["vfo_offset"])
-        c["selectedOffset"] = p["offset"]
-        c["source"] = "RTL-SDR"
-        c.update(SDRPP_GLOBAL)
-        c.setdefault("streams", {}).setdefault("Radio", {}).update(
-            sink="Brown Audio", volume=float(p["volume"]), muted=False)
-
-    def radio(c):
-        r = c.setdefault("Radio", {})
-        r["selectedDemodId"] = DEMODS[p["demod"]]
-        r.setdefault(p["demod"], {}).update(p["demod_settings"])
-
-    def sink(c):
-        r = c.setdefault("Radio", {})
-        r["device"] = p["sink"]
-        r.setdefault("devices", {}).setdefault(p["sink"], 48000)
-
-    def dongle(c):
-        c["device"] = name
-        c.setdefault("devices", {}).setdefault(name, {}).update(
-            {k: v for k, v in p["rtl"].items() if k != "serial"})
-
-    edit("config.json", cfg)
-    edit("radio_config.json", radio)
-    edit("brown_audio_sink_config.json", sink, {})
-    edit("rtl_sdr_config.json", dongle)
-    return out
+def save_running(name):
+    """Save rxd's tuning into name; False if no rxd answers to save from."""
+    st = rxd_status()
+    if st is None:
+        return False
+    store(name, capture(profile(name), st))
+    return True
 
 
 def switch(name, focus, resume=False):
-    if not os.path.isdir(SDRPP):
-        die("no SDR++Brown config at %s — start SDR++ once first" % SDRPP)
     prev = active()
     target = profile(name)
+    unit_name(name)  # a name rxd cannot be started on fails before anything closes
     js8 = target.get("js8call_dial") is not None
 
-    # JS8Call writes its ini only on exit, so close it before capturing the
-    # profile being left -- that is what puts its final dial on disk. Only
-    # re-running the JS8 profile already up leaves it be.
+    # Re-running the profile already playing changes nothing: a restart would
+    # throw away tuning done live through rigctl or HTTP. rxd's own idea of
+    # its profile guards against an instance started for some other name.
+    st = rxd_status()
+    same = prev == name and st is not None and st.get("profile", name) == name
+
+    # Only re-running the JS8 profile already up leaves JS8Call be.
     if not (js8 and prev == name):
         close("js8call", JS8_CRIT)
 
-    # Save the profile being left. SDR++ writes its files within a second
-    # of any change, so they are current even while it runs.
-    sdr_up = running("sdrpp")
-    if prev and sdr_up and not resume:
-        store(prev, capture(profile(prev)))
+    # Save the profile being left, so coming back resumes it. Resuming at
+    # login has nothing current to save.
+    if prev and st is not None and not resume and not same:
+        store(prev, capture(profile(prev), st))
         target = profile(name)
 
-    if js8:
-        ensure_js8_sink()  # before SDR++ starts: it binds its sink then
-
-    names = dongles()
-    changes = plan(target, names)
-    if changes and sdr_up:
-        close("sdrpp", SDR_CRIT)
-        changes = plan(target, names)  # it rewrote them on the way out
-    for path, doc in changes.items():
-        dump(path, doc)
-
     set_active(name)
-    if not running("sdrpp"):
-        start_sdrpp()
+    if not same:
+        if js8:
+            ensure_js8_sink()  # before rxd starts: it opens its sink then
+        ensure_stored(name, target)
+        rxd_stop()
+        rxd_start(name)
 
     if js8:
         want = str(target["js8call_dial"])
+        if same and st.get("freq") is not None:
+            # JS8Call may have moved rxd since the profile was saved; the
+            # running dial is the current one.
+            want = str(int(round(float(st["freq"]))))
         if read_ini().get("Common", "DialFreq", fallback="") != want:
             close("js8call", JS8_CRIT)
             write_dial(want)
@@ -2939,13 +2882,13 @@ def switch(name, focus, resume=False):
     print(summary(name, target))
     # The one setting no file can change.
     if prev and prev != name:
-        was = profile(prev)["offset"] != "None"
-        now = target["offset"] != "None"
+        was = upconverting(profile(prev))
+        now = upconverting(target)
         if was != now:
             say("flip the Ham It Up to %s" % ("UPCONVERT" if now else "BYPASS"),
                 "warning")
-    if focus:
-        i3('[class="%s"] focus' % (JS8_CRIT if js8 else SDR_CRIT))
+    if focus and js8:
+        i3('[class="%s"] focus' % JS8_CRIT)
 
 
 # --------------------------------------------------------------------- mesh
@@ -3191,22 +3134,26 @@ def main():
         print(__doc__.split("\n\n", 1)[1].split("\nA profile is")[0])
     elif a.cmd == "off":
         name = active()
-        close("js8call", JS8_CRIT)  # first, so its dial reaches the ini
-        if name and running("sdrpp"):
-            store(name, capture(profile(name)))
-        close("sdrpp", SDR_CRIT)
-        print("SDR++ and JS8Call closed" + ("; 'radio resume' brings back %s" % name if name else ""))
+        close("js8call", JS8_CRIT)
+        if name:
+            save_running(name)
+        rxd_stop()
+        print("rxd stopped, JS8Call closed" + ("; 'radio resume' brings back %s" % name if name else ""))
     elif a.cmd == "resume":
         name = active()
         if name:
             switch(name, focus, resume=True)
-        elif not running("sdrpp"):
-            start(["sdrpp", "--autostart"], SDR_TREE)
+        else:
+            print("no active profile; 'radio NAME' picks one")
     elif a.cmd == "save":
         name = a.arg or active() or die("nothing active; name the profile: radio save NAME")
+        unit_name(name)  # a profile rxd could not be started on is no use
+        st = rxd_status()
+        if st is None:
+            die("rxd is not running; nothing to save")
         base = profile(name) if name in known() else dict(profile(active() or "ghostnet"),
                                                           description=name)
-        store(name, capture(base))
+        store(name, capture(base, st))
         set_active(name)
         print("saved " + summary(name, profile(name)))
     elif a.cmd == "reset":
