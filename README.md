@@ -59,8 +59,9 @@ script that provisions a blank card re-applies the configuration on every
   Hyperlegible fonts, and screen blanking off at every layer.
 - **Keeps itself current** with one `maint` command, holding the kernel so an
   unattended upgrade can't take the display away.
-- **Closes the network** except for SSH: inbound is default-deny, and SSH is
-  key-only with keys synced from GitHub, plus optional Tailscale.
+- **Closes the network** except for SSH and rxd's tuning port: inbound is
+  default-deny, SSH is key-only with keys synced from GitHub, rxd answers only
+  the LAN and tailnet, plus optional Tailscale.
 
 ## Quick start
 
@@ -113,10 +114,25 @@ The account is assumed to be `jroemer`; pass another with
 | `fm-93.3`, `fm-105.3` | broadcast FM | bypass |
 | `am-820` | 820 kHz AM | upconvert |
 
-`radio` says when the Ham It Up's switch needs flipping. rxd has no screen:
-tune it live over HTTP on `127.0.0.1:8073` or Hamlib rigctl on
-`127.0.0.1:4532`, and `radio save` keeps the result. How profiles and rxd
-work: [docs/radio.md](docs/radio.md#rxd).
+`radio` says when the Ham It Up's switch needs flipping. Tune rxd live with
+`rxd-tui`, from a browser at `http://<uconsole>:8073/` on any device on the
+LAN or tailnet, over HTTP on port 8073 or Hamlib rigctl on `127.0.0.1:4532`;
+`radio save` keeps the result.
+
+| `rxd-tui` key | Does |
+|---|---|
+| `←` / `→` | Tune by one step |
+| `↑` / `↓` | Step size |
+| `f` / `m` | Frequency / mode |
+| `[` / `]` | Bandwidth |
+| `g` / `G` | Gain |
+| `-` / `+` | Volume |
+| `?` / `q` | Help / quit |
+
+The browser UI has no authentication, so anyone on the LAN can tune the
+radio. To keep it to the device, set `RXD_HTTP=127.0.0.1:8073` in
+`/etc/rx/rxd.env` and run `systemctl --user restart 'rxd@*'`. How profiles
+and rxd work: [docs/radio.md](docs/radio.md#rxd).
 
 ### `radio mesh`: the LoRa mesh
 
@@ -160,6 +176,7 @@ Defaults from [NTX Mesh](https://ntxmesh.com/join/); details in
 | `chronyc sources` | Time sources; PPS `*` means GPS-locked |
 | `cgps -s` | GPS fix and satellites |
 | `rtl_test -t` | Prove the RTL-SDR opens, independent of rxd |
+| `rxd-tui` | Tune the receiver from a terminal |
 | `journalctl --user -u 'rxd@*'` | The receiver's log |
 | `chirp` | CHIRP, for programming handhelds |
 | `js8call` | Plain JS8Call, without retuning the SDR |
@@ -232,7 +249,8 @@ which ones survive: [docs/desktop.md](docs/desktop.md#why-window-management-sits
 - **Idempotent, so it is the maintenance tool too.** Re-running is the intended
   use; a run that changes nothing writes nothing, and `maint` is just that run.
 - **Closed by default.** Nothing reaches the device unsolicited but SSH, keys
-  only. Services that listen widely, like `meshtasticd`, stay local.
+  only, and rxd's tuning port from the LAN and tailnet. Services that listen
+  widely, like `meshtasticd`, stay local.
 - **Quiet until asked.** Nothing transmits or uploads on its own: JS8
   auto-reply and spotting are off, no mesh runs at boot, and neither mesh
   ever sends a position.

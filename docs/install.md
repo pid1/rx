@@ -73,14 +73,14 @@ Every section is skippable with `--skip NAME`, or run alone with `--only NAME`.
 | Section | What it does |
 |---|---|
 | `base` | Timezone (America/Chicago), hushlogin, sshd enabled, GitHub-backed `authorized_keys` sync, the `maint` maintenance command, hardware group membership |
-| `firewall` | Default-deny inbound: SSH and replies only, IPv4 and IPv6 (nftables) |
+| `firewall` | Default-deny inbound: SSH, rxd's HTTP from the LAN and tailnet, and replies, IPv4 and IPv6 (nftables) |
 | `desktop` | X11 + i3, autologin on tty1, Alacritty, Atkinson fonts, PipeWire, blanking disabled |
 | `claude` | Claude Code from Anthropic's signed apt repo |
 | `aio` | HackerGadgets AIO v2 metapackage, GPIO power rails, boot overlays |
 | `rtc` | PCF85063A over i2c, bound once the AIO rails are up (`uconsole-rtc`), `fake-hwclock` as fallback |
 | `gps` | UART + PPS overlays, serial console removed, `gpsd` on `/dev/ttyS0` |
 | `lora` | `meshtasticd` with its own config, the dashboard and map tiles; MeshCore (MeshCoreRPI, pinned); both clients; `rx-mesh`, so neither starts at boot |
-| `sdr` | `rtl-sdr`, DVB-T driver blacklisted, rxd and its `rxd@` user unit, `radio` profiles; purges `sdrpp-brown`/`sdrpp` |
+| `sdr` | `rtl-sdr`, DVB-T driver blacklisted, rxd and its `rxd@` user unit, `rxd-tui`, the browser UI, `/etc/rx/rxd.env`, `radio` profiles; purges `sdrpp-brown`/`sdrpp` |
 | `ham` | JS8Call + hamlib, receive-only GhostNet configuration, SDR→JS8Call loopback sink, CHIRP |
 | `tailscale` | Tailscale from its official repo |
 
