@@ -33,6 +33,8 @@ starting points. `vfo_offset`, left in older profiles, is no longer used.
 | `ghostnet` | 7.107 MHz USB → JS8Call | upconvert |
 | `js8` | 7.078 MHz USB → JS8Call | upconvert |
 | `wspr` | 7.0386 MHz USB → rxd's WSPR decoder, reported to WSPRnet | upconvert |
+| `js8-160m` … `js8-2m` | every band's JS8 dial (table below) | upconvert, but 6 m and 2 m bypass |
+| `wspr-2190m` … `wspr-2m` | every band's WSPR dial (table below) | upconvert, but 6 m and 2 m bypass |
 | `vhf` | 146.520 MHz FM (2 m calling) | bypass |
 | `dcara` | 146.920 MHz FM (DCARA) | bypass |
 | `uhf` | 446.000 MHz FM (70 cm calling) | bypass |
@@ -46,6 +48,77 @@ below 30 MHz the signal goes through the Ham It Up's 125 MHz offset, above it
 not, including when you retune live. `"Ham-It-Up"` or `"None"` pins it. The
 Ham It Up's bypass switch is the one thing software cannot change; `radio`
 says when to flip it.
+
+### JS8 and WSPR on every band
+
+One JS8 and one WSPR profile per band, on the standard dial (USB). 40 m keeps
+its old names, `js8` and `wspr`; `js8-40m` and `wspr-40m` are aliases.
+`radio --json` gives each profile's `band` and `plan` (whether rxd's band
+plan may pick it). Checked 2026-11-06 against JS8Call-improved 3.0.3's
+default list (`JS8_Main/FrequencyList.cpp`) and WSJT-X's
+(`models/FrequencyList.cpp`).
+
+| Band | JS8 dial, MHz | WSPR dial, MHz |
+|---|---|---|
+| 2190 m | — | 0.136000 |
+| 630 m | — | 0.474200 |
+| 160 m | 1.843500 | 1.836600 |
+| 80 m | 3.578000 | 3.568600 |
+| 60 m | 5.363000 | 5.364700 |
+| 40 m | 7.078000 (`js8`) | 7.038600 (`wspr`) |
+| 30 m | 10.130000 | 10.138700 |
+| 20 m | 14.078000 | 14.095600 |
+| 17 m | 18.104000 | 18.104600 |
+| 15 m | 21.078000 | 21.094600 |
+| 12 m | 24.922000 | 24.924600 |
+| 10 m | 28.078000 | 28.124600 |
+| 6 m | 50.318000 | 50.293000 |
+| 2 m | 144.178000 | 144.489000 |
+
+- JS8Call 2.2 (Debian's, on the uConsole) still lists 1.842 on 160 m and has
+  no 60 m; the current list moved 160 m to 1.8435 and added 5.363.
+- WSJT-X lists no 60 m WSPR. 5.3647 is where WSPRnet's 60 m spots are: in
+  the first week of November 2026 wspr.live had about 552,000 there and
+  190,000 on the older 5.2872.
+- 6 m and 2 m need the Ham It Up on BYPASS; everything else goes through
+  UPCONVERT, 2190 m and 630 m included.
+
+### Band plan
+
+rxd chooses the JS8 or WSPR band itself when its **band plan** is on Auto
+(the Digital view of the browser UI, `a` in `rxd-tui`, or
+`POST /api/bands {"plan": "auto"}`). On Manual it stays put. Picking a band
+yourself, from a picker or with `radio NAME`, sets it to Manual.
+
+- **With internet** it ranks the bands by N0NBH's calculated band conditions
+  from hamqsl.com (SFI, A and K, day and night per band group), NOAA SWPC's
+  solar flux and K index if hamqsl doesn't answer. It fetches at most every
+  45 minutes, with a 10 s timeout, and caches them on disk. It combines them
+  with the sun at the station's grid (day, gray line or night, from JS8Call's
+  `MyGrid` or `RXD_GRID`) and with what rxd has heard on each band at this
+  hour.
+- **Without internet** it scans the bands it hasn't heard at this hour, at
+  least two WSPR slots or the scan time each (6 minutes by default), keeps
+  the counts, and then picks the band that heard the most. What it hears,
+  per profile and UTC hour, is kept in `~/.local/share/rxd/bands.json` and
+  counts for half as much every 14 days. Spot counts outweigh the
+  conditions after a single good look.
+- **Bands:** every band is enabled by default, 2190 m and 630 m included
+  (Win's call, 2026-11-06: no assumptions about antennas); turn off the ones
+  without an antenna under *Bands and timing*.
+- **Ham It Up:** Auto only uses bands on the side the switch is on now (the
+  side the running profile needs), unless *Allow, I'll flip it* is set: on
+  UPCONVERT that is 2190 m to 10 m, on BYPASS 6 m and 2 m.
+- **First start:** Auto goes straight to the best-scoring band.
+- **Switching** goes through `radio NAME`, so a JS8 band starts JS8Call and
+  a WSPR band closes it. A switch waits for a WSPR slot's decode to finish,
+  and stays put unless another band scores 15 % better. The re-check
+  interval is 30 minutes by default.
+- **State:** settings in `~/.config/rx/bands.json`; where the plan is
+  (scanning, holding, why) in `~/.local/share/rxd/bandplan.json`; the last
+  conditions in `~/.local/share/rxd/conditions.json`. rxd restarts on every
+  switch and reads them back. `RXD_BANDS=off` in `/etc/rx/rxd.env` turns the
+  band plan off.
 
 ## rxd
 
