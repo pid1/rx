@@ -2261,12 +2261,12 @@ BLACKLIST
     #
     # A new rxd release is a PR here changing RXD_VERSION and RXD_SHA256.
     # The release build is reproducible, so this is also what
-    # scripts/release.py makes from the v0.3.0 tag.
+    # scripts/release.py makes from the v0.4.0 tag.
     # RX_RXD_TARBALL=/path/rxd-X.Y.Z.tar.gz installs that file instead of
     # downloading, for trying a build before it is published; it must still
     # match RXD_SHA256.
-    local RXD_VERSION=0.3.0
-    local RXD_SHA256=7f421b45b1ecccf5dc353b2b3cd90d6a1ee993c91e3ef7c0fb5027a745c48087
+    local RXD_VERSION=0.4.0
+    local RXD_SHA256=be6dc863bf1f588fc9b7b28c651010af1557feff762a43bfec24957012ded7af
     local rxd_tar="rxd-${RXD_VERSION}.tar.gz"
     local rxd_url="https://github.com/pid1/rxd/releases/download/v${RXD_VERSION}/${rxd_tar}"
     local rxd_cache="/var/cache/rx/${rxd_tar}"
@@ -2313,7 +2313,9 @@ BLACKLIST
       fi
     fi
 
-    # This station, for rxd and radio (rxd's docs/station.md): who it is, the
+    # This station, for rxd and radio (rxd's docs/station.md): who it is (the
+    # grid is the default; rxd takes the station's grid from the AIO's GPS,
+    # through gpsd, once it has a believable fix, and says which it uses), the
     # Nooelec behind the Ham It Up (opened by serial, however USB enumerated
     # it), the Ham It Up itself, whose UPCONVERT/BYPASS switch only a person
     # can flip, the speaker, and the local profiles.
@@ -2324,6 +2326,7 @@ BLACKLIST
   "sdr": {"serial": "${SDR_SERIAL}"},
   "upconverter": {"name": "Ham It Up", "hz": 125000000, "below_hz": 30000000, "switch": true},
   "sink": "Built-in Audio",
+  "gps": {"enabled": true, "gpsd": "127.0.0.1:2947"},
   "profiles": {
     "dcara":    {"description": "DCARA", "frequency": 146920000, "demod": "FM",
                  "demod_settings": {"bandwidth": 12500}, "rtl": {"gain": 20}},
