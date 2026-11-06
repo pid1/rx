@@ -612,9 +612,9 @@ MAINT
   # ---------------------------------------------------------------- firewall
 
   # Default-deny inbound. Nothing on this device needs to accept unsolicited
-  # traffic except SSH, and some of what it runs would otherwise be wide
-  # open -- meshtasticd serves an unauthenticated API (4403) and web client
-  # (443) on every interface, as packaged.
+  # traffic except SSH, and rxd's HTTP port from the LAN, and some of what it
+  # runs would otherwise be wide open -- meshtasticd serves an unauthenticated
+  # API (4403) and web client (443) on every interface, as packaged.
   #
   # Its own table and its own unit rather than /etc/nftables.conf: Debian's
   # file starts with `flush ruleset`, which would wipe the rules Tailscale
@@ -626,13 +626,25 @@ MAINT
 
     write_file /etc/rx/firewall.nft 0644 <<'NFT'
 #!/usr/sbin/nft -f
-# Managed by rx/setup.sh — inbound: SSH and replies only. Loaded by
-# rx-firewall.service. Replaces only its own table, never the ruleset.
+# Managed by rx/setup.sh — inbound: SSH, rxd's HTTP from the LAN, and
+# replies. Loaded by rx-firewall.service. Replaces only its own table, never
+# the ruleset.
 
 table inet rx_firewall
 delete table inet rx_firewall
 
 table inet rx_firewall {
+    # The LAN: private IPv4, IPv6 unique-local and link-local. The tailnet is
+    # matched by interface instead.
+    set lan4 {
+        type ipv4_addr; flags interval;
+        elements = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }
+    }
+    set lan6 {
+        type ipv6_addr; flags interval;
+        elements = { fc00::/7, fe80::/10 }
+    }
+
     chain input {
         type filter hook input priority filter; policy drop;
 
@@ -649,6 +661,13 @@ table inet rx_firewall {
 
         # Key-only (sshd_config.d/10-no-password.conf), on every interface.
         tcp dport 22 accept
+
+        # rxd's HTTP API and browser UI, from the LAN and the tailnet only.
+        # Unauthenticated: anyone allowed here can tune the radio. rxd
+        # listens on it only when /etc/rx/rxd.env says so.
+        ip saddr @lan4 tcp dport 8073 accept
+        ip6 saddr @lan6 tcp dport 8073 accept
+        iifname "tailscale0" tcp dport 8073 accept
     }
 
     # Not a router.
@@ -660,7 +679,7 @@ NFT
 
     write_file /etc/systemd/system/rx-firewall.service 0644 <<'FWUNIT'
 [Unit]
-Description=rx inbound firewall (SSH and replies only)
+Description=rx inbound firewall (SSH, rxd from the LAN, and replies)
 DefaultDependencies=no
 Wants=network-pre.target
 Before=network-pre.target shutdown.target
@@ -687,11 +706,11 @@ FWUNIT
       log "[dry-run] nft -c -f /etc/rx/firewall.nft, then load it"
     elif nft -c -f /etc/rx/firewall.nft; then
       run systemctl restart rx-firewall.service
-      log "firewall loaded: inbound SSH and replies only"
+      log "firewall loaded: inbound SSH, rxd HTTP from the LAN, and replies"
     else
       warn "firewall rules failed to parse; NOT loaded — the device is unfiltered"
     fi
-    note "Firewall: nothing reaches this device unsolicited except SSH on 22. Other machines can no longer resolve clockworkpi.local (mDNS answers are inbound); use its IP or Tailscale name. Rules: /etc/rx/firewall.nft; 'sudo nft list table inet rx_firewall'."
+    note "Firewall: nothing reaches this device unsolicited except SSH on 22, and rxd's HTTP on 8073 from private addresses and Tailscale. Other machines can no longer resolve clockworkpi.local (mDNS answers are inbound); use its IP or Tailscale name. Rules: /etc/rx/firewall.nft; 'sudo nft list table inet rx_firewall'."
   fi
 
   # ----------------------------------------------------------------- desktop
@@ -2217,12 +2236,14 @@ BLACKLIST
     # channel from the RTL-SDR and plays it to PipeWire, at about a tenth of
     # SDR++Brown's CPU on a CM4. librtlsdr0 and libpulse0 are loaded through
     # ctypes, so it needs no build step and no -dev packages. 'radio' starts
-    # and stops it as the rxd@PROFILE user service below; HTTP control is on
-    # 127.0.0.1:8073 and Hamlib NET rigctl on 127.0.0.1:4532.
+    # and stops it as the rxd@PROFILE user service below; HTTP control and the
+    # browser UI are on port 8073 (LAN-wide, per /etc/rx/rxd.env below) and
+    # Hamlib NET rigctl on 127.0.0.1:4532.
     #
-    # The copy below is generated from rxd/rxd.py by rxd/embed.sh, and
-    # build.sh refuses to publish when the two differ. Edit rxd/rxd.py, not
-    # this heredoc.
+    # The copies of rxd, rxd-tui and the browser UI are generated from
+    # rxd/rxd.py, rxd/rxd_tui.py and rxd/web/index.html by rxd/embed.sh, and
+    # build.sh refuses to publish when any differs. Edit those, not these
+    # heredocs.
     write_file /usr/local/bin/rxd 0755 <<'RXD'
 #!/usr/bin/env python3
 """rxd: a small RTL-SDR receiver daemon, the receiver behind `radio`.
@@ -3142,6 +3163,40 @@ if __name__ == "__main__":
 RXD
     log "installed rxd"
 
+    # The terminal client: tunes rxd over its HTTP API on this machine.
+    write_file /usr/local/bin/rxd-tui 0755 <<'RXDTUI'
+RXDTUI
+    log "installed rxd-tui"
+
+    # The browser UI, served by rxd at / on its HTTP port.
+    run install -d -m 0755 /usr/local/share/rxd
+    write_file /usr/local/share/rxd/index.html 0644 <<'RXDWEB'
+RXDWEB
+    log "installed the rxd browser UI"
+
+    # Where rxd listens when its command line does not say.
+    # Written once and then left alone, so turning the LAN off survives
+    # 'maint'. Rigctl stays on loopback: only JS8Call uses it.
+    if [[ -e /etc/rx/rxd.env ]]; then
+      log "kept /etc/rx/rxd.env as it is"
+    else
+      write_file /etc/rx/rxd.env 0644 <<'RXDENV'
+# Managed by rx/setup.sh, written once: edits here survive re-runs.
+# Where rxd listens, as HOST:PORT; read by rxd@.service. A --http or
+# --rigctl flag wins over these.
+#
+# RXD_HTTP=0.0.0.0:8073 serves rxd's API and browser UI to the LAN and the
+# tailnet (the firewall admits 8073 from nowhere else). There is no
+# authentication: anyone on the LAN can tune the radio. To keep it to this
+# machine, set RXD_HTTP=127.0.0.1:8073, then
+# 'systemctl --user restart rxd@*'.
+#
+# RXD_RIGCTL is left unset, so rigctl stays on 127.0.0.1:4532 for JS8Call.
+RXD_HTTP=0.0.0.0:8073
+RXDENV
+      log "wrote /etc/rx/rxd.env (HTTP on the LAN)"
+    fi
+
     # A template, never enabled: 'radio' starts and stops rxd@NAME itself, so
     # only one profile owns the dongle at a time. PipeWire runs per user here,
     # socket-activated, so rxd is ordered after its Pulse server rather than
@@ -3155,6 +3210,7 @@ Wants=pipewire-pulse.service
 After=pipewire-pulse.service wireplumber.service
 
 [Service]
+EnvironmentFile=-/etc/rx/rxd.env
 ExecStart=/usr/local/bin/rxd %i
 Restart=on-failure
 RestartSec=3
@@ -3965,6 +4021,7 @@ RADIOCOMP
 
     note "SDR needs the antenna on the 'SDR' IPEX pad (the GPS pad is a separate path). All four AIO rails (SDR, USB, GPS, LoRa) come up at boot — see docs/hardware.md for switching them."
     note "rxd: 'systemctl --user status rxd@NAME' and 'journalctl --user -u rxd@NAME' show the receiver for profile NAME; 'curl -s 127.0.0.1:8073/api/status' shows its frequency, mode, gain and dropped blocks. Test against a strong FM broadcast (88-108 MHz) before anything weak."
+    note "rxd-tui tunes rxd from a terminal ('?' lists its keys), and http://$(hostname):8073/ does the same from a browser anywhere on the LAN or tailnet. No authentication: anyone on the LAN can tune the radio. To keep it local, set RXD_HTTP=127.0.0.1:8073 in /etc/rx/rxd.env, then 'systemctl --user restart rxd@*'."
     note "If rxd plays silence, prove the hardware first with 'rtl_test -t' and 'timeout 10 rtl_test -s 2400000'. The dongle is behind the AIO's internal USB hub, so 'lost at least N bytes' there is a hub or power problem, not an rxd setting."
   fi
 

@@ -18,17 +18,10 @@ head -1 "$script" | grep -qx '#!/usr/bin/env bash' \
 tail -1 "$script" | grep -qx 'main "\$@"' \
   || { echo "script does not end with 'main \"\$@\"'" >&2; exit 1; }
 
-# setup.sh carries rxd inline, generated from rxd/rxd.py. Publishing a stale
-# copy would install a different rxd from the one in the repo.
-embedded=$(awk '
-  $0 == "RXD" && on { exit }
-  on { print }
-  $0 == "    write_file /usr/local/bin/rxd 0755 <<'"'"'RXD'"'"'" { on = 1 }
-' "$script")
-[[ -n $embedded ]] \
-  || { echo "no rxd heredoc found in $script" >&2; exit 1; }
-[[ $embedded == "$(cat rxd/rxd.py)" ]] \
-  || { echo "the rxd copy in $script differs from rxd/rxd.py; run rxd/embed.sh" >&2; exit 1; }
+# setup.sh carries rxd, rxd-tui and the browser UI inline, generated from
+# rxd/rxd.py, rxd/rxd_tui.py and rxd/web/index.html. Publishing a stale copy
+# would install something other than what is in the repo.
+rxd/embed.sh --check
 
 rm -rf dist
 mkdir -p dist

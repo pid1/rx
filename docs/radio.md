@@ -52,10 +52,23 @@ rxd runs as the systemd user unit **`rxd@NAME`**, one profile at a time, and
 restarts itself on failure. It reads the profile's JSON, demodulates one
 channel (USB, LSB, AM, FM, or WFM in mono) and plays it to the profile's
 PipeWire sink. There is no waterfall or spectrum, no bookmarks, no recording,
-and no stereo or RDS on broadcast FM. A TUI client and a browser UI are
-planned.
+and no stereo or RDS on broadcast FM.
 
-Tune it live on two local ports; `radio save` keeps whatever you tuned:
+Tune it live from **`rxd-tui`** in a terminal, from the **browser UI** at
+`http://<uconsole>:8073/` on any device on the LAN or tailnet, or over its
+two ports. `radio save` keeps whatever you tuned.
+
+| `rxd-tui` key | Does |
+|---|---|
+| `←` / `→` | Tune down / up by one step |
+| `↑` / `↓` | Larger / smaller step |
+| `f` | Type a frequency |
+| `m` | Next mode |
+| `[` / `]` | Narrower / wider bandwidth |
+| `g` / `G` | Gain down / up |
+| `-` / `+` | Volume down / up |
+| `?` | Help |
+| `q` | Quit (rxd keeps playing) |
 
 ```bash
 curl -s 127.0.0.1:8073/api/status                              # HTTP JSON
@@ -65,6 +78,14 @@ journalctl --user -u 'rxd@*'                                   # logs
 ```
 
 Frequencies on both ports are the dial frequency.
+
+**The LAN can tune it.** HTTP listens on every interface
+(`RXD_HTTP=0.0.0.0:8073` in `/etc/rx/rxd.env`), and the
+[firewall](maintenance.md#firewall) admits port 8073 from private addresses
+and Tailscale only. There is no authentication: anyone on the LAN can tune
+the radio. To keep it to the device, set `RXD_HTTP=127.0.0.1:8073` there and
+run `systemctl --user restart 'rxd@*'`; re-running setup keeps the change.
+Rigctl is always loopback only.
 
 **Why not SDR++.** SDR++Brown used about 220% CPU and leaked memory until the
 kernel killed it — twice on 2026-11-05, at about 3.5 GB each time, after one
