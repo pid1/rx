@@ -2529,15 +2529,14 @@ def js8(desc, dial):
     # The VFO sits 100 Hz under the dial, as tuned by hand for GhostNet; rxd
     # keeps that difference as a calibration.
     return {"description": desc, "frequency": dial - 100.0,
-            "offset": "Ham-It-Up", "demod": "USB",
+            "offset": "auto", "demod": "USB",
             "demod_settings": USB_JS8, "sink": JS8_SINK, "volume": 0.2090567648410797,
             "rtl": rtl(4), "js8call_dial": dial}
 
 
 def vhf(desc, hz, demod="FM", settings=NFM, gain=20):
-    # Straight into the dongle: the Ham It Up must be on bypass.
     return {"description": desc, "frequency": hz,
-            "offset": "None", "demod": demod, "demod_settings": settings,
+            "offset": "auto", "demod": demod, "demod_settings": settings,
             "sink": SPEAKER, "volume": 0.5, "rtl": rtl(gain)}
 
 
@@ -2550,9 +2549,9 @@ PROFILES = {
     "noaa":     vhf("NOAA weather", 162400000.0),
     "fm-93.3":  vhf("93.3 FM", 93300000.0, "WFM", WFM, gain=10),
     "fm-105.3": vhf("105.3 FM", 105300000.0, "WFM", WFM, gain=10),
-    # Below the R820T's range, so through the Ham It Up like HF.
-    "am-820":   dict(vhf("820 AM", 820000.0, "AM", AM, gain=4),
-                     offset="Ham-It-Up"),
+    # Below the R820T's range, so through the Ham It Up like HF: "auto"
+    # upconverts anything under 30 MHz.
+    "am-820":   vhf("820 AM", 820000.0, "AM", AM, gain=4),
 }
 
 
@@ -2655,8 +2654,19 @@ def set_active(name):
         fh.write(name + "\n")
 
 
+def upconverting(p):
+    """Whether rxd puts p through the Ham It Up's 125 MHz upconversion."""
+    # "auto" (the default) follows the frequency, as rxd does: the R820T
+    # cannot tune below about 24 MHz, so HF and AM broadcast go through the
+    # upconverter. "Ham-It-Up" and "None" pin it on or off.
+    mode = p.get("offset", "auto")
+    if mode == "auto":
+        return float(p["frequency"]) < float(p.get("upconvert_below_hz", 30e6))
+    return mode != "None"
+
+
 def summary(name, p):
-    path = "Ham It Up upconvert" if p["offset"] != "None" else "Ham It Up bypass"
+    path = "Ham It Up upconvert" if upconverting(p) else "Ham It Up bypass"
     return "%-9s %11.4f MHz %-4s %-19s %s" % (
         name, p["frequency"] / 1e6, p["demod"], path, p.get("description", ""))
 
@@ -2797,6 +2807,8 @@ def capture(p, st):
     """The profile p, updated with rxd's current tuning from status st."""
     p = copy.deepcopy(p)
     p.pop("vfo_offset", None)  # SDR++'s; rxd ignores it
+    # offset is left as it was: status reports the upconverter now in
+    # effect, and saving that would pin an "auto" profile to one side.
     if st.get("vfo_hz") is not None:
         p["frequency"] = float(st["vfo_hz"])  # the carrier, as rxd reads it
     if st.get("mode"):
@@ -2870,8 +2882,8 @@ def switch(name, focus, resume=False):
     print(summary(name, target))
     # The one setting no file can change.
     if prev and prev != name:
-        was = profile(prev)["offset"] != "None"
-        now = target["offset"] != "None"
+        was = upconverting(profile(prev))
+        now = upconverting(target)
         if was != now:
             say("flip the Ham It Up to %s" % ("UPCONVERT" if now else "BYPASS"),
                 "warning")
