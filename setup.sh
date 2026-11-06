@@ -8755,14 +8755,45 @@ def running(proc):
                           stdout=subprocess.DEVNULL).returncode == 0
 
 
+_desktop = {}
+
+
+def desktop():
+    """The environment for i3-msg and JS8Call: the desktop's, even when radio
+    runs from SSH, a service or rxd (band plan switches), where DISPLAY and
+    I3SOCK are unset. i3's socket is found the way i3 --get-socketpath would
+    be asked, or failing that from i3's runtime directory."""
+    if _desktop:
+        return _desktop
+    env = dict(os.environ)
+    env.setdefault("DISPLAY", ":0")
+    if not env.get("XAUTHORITY") and os.path.isfile(os.path.join(HOME, ".Xauthority")):
+        env["XAUTHORITY"] = os.path.join(HOME, ".Xauthority")
+    if not env.get("I3SOCK"):
+        sock = ""
+        try:
+            sock = subprocess.run(["i3", "--get-socketpath"], env=env, capture_output=True,
+                                  text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if not sock:
+            import glob
+            found = glob.glob("/run/user/%d/i3/ipc-socket.*" % os.getuid())
+            sock = max(found, key=os.path.getmtime) if found else ""
+        if sock:
+            env["I3SOCK"] = sock
+    _desktop.update(env)
+    return _desktop
+
+
 def has_window(pat):
-    tree = subprocess.run(["i3-msg", "-t", "get_tree"],
+    tree = subprocess.run(["i3-msg", "-t", "get_tree"], env=desktop(),
                           capture_output=True, text=True).stdout
     return re.search(r'"class":"' + pat, tree, re.I) is not None
 
 
 def i3(cmd):
-    subprocess.run(["i3-msg", "-q", cmd],
+    subprocess.run(["i3-msg", "-q", cmd], env=desktop(),
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -8782,7 +8813,7 @@ def close(proc, crit):
 
 
 def start(argv, pat):
-    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    subprocess.Popen(argv, env=desktop(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
     for _ in range(60):
         if has_window(pat):
