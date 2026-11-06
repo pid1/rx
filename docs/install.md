@@ -80,7 +80,7 @@ Every section is skippable with `--skip NAME`, or run alone with `--only NAME`.
 | `rtc` | PCF85063A over i2c, bound once the AIO rails are up (`uconsole-rtc`), `fake-hwclock` as fallback |
 | `gps` | UART + PPS overlays, serial console removed, `gpsd` on `/dev/ttyS0` |
 | `lora` | `meshtasticd` with its own config, the dashboard and map tiles; MeshCore (MeshCoreRPI, pinned); both clients; `rx-mesh`, so neither starts at boot |
-| `sdr` | `rtl-sdr`, DVB-T driver blacklisted, rxd with its JS8 decoder and its `rxd@` user unit, `rxd-tui`, the browser UI, `/etc/rx/rxd.env` (listen address, station call and grid), `radio` profiles; fetches JS8's JSC word table (pinned, checked) and the offline callsign database for the map; purges `sdrpp-brown`/`sdrpp` |
+| `sdr` | `rtl-sdr`, DVB-T driver blacklisted; rxd from [pid1/rxd](https://github.com/pid1/rxd) at the pinned release (`RXD_VERSION`, checked against `RXD_SHA256`, cached in `/var/cache/rx/`), whose installer adds `radio`, `rxd-tui`, the browser UI, the `rxd@` user unit, JS8's JSC word table and the callsign database; this station's `/etc/rxd/station.json` (call, grid, the Nooelec's serial, the Ham It Up, local profiles) and `/etc/rxd/rxd.env` (listen address); `radio mesh` (`radio-mesh`) |
 | `ham` | `wsjtx`, pinned to Debian's build, for `wsprd` (rxd's WSPR decoder; the WSJT-X GUI isn't used), and CHIRP |
 | `tailscale` | Tailscale from its official repo |
 

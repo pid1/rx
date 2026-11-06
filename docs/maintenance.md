@@ -12,7 +12,9 @@ One command, installed by the `base` section:
 
 1. `apt update`, `apt full-upgrade`, `apt autoremove --purge`
 2. re-fetches and re-applies `setup.sh` — idempotent, so only drift and newly
-   added configuration change
+   added configuration change. Without network it re-applies the last
+   setup.sh it fetched (`/var/cache/rx/setup.sh`), which installs rxd from
+   the release tarball cached beside it.
 3. reports whether a reboot is pending, and which packages want one
 
 Arguments pass through, so `sudo maint --dry-run` previews the configuration
@@ -66,7 +68,7 @@ confirms what sshd actually uses.
 Nothing reaches the device unsolicited except **SSH on 22**, from any
 interface, and **rxd's HTTP on 8073** from private addresses (10/8,
 172.16/12, 192.168/16, IPv6 `fc00::/7` and `fe80::/10`) and `tailscale0`
-([turning that off](radio.md#rxd)). Everything else inbound is dropped, IPv4 and IPv6, and nothing is
+([turning that off](radio.md#the-lan-can-tune-it)). Everything else inbound is dropped, IPv4 and IPv6, and nothing is
 forwarded. Replies to connections the device made itself still arrive, and so
 do the few packets IPv6 needs to work at all (neighbour discovery, router
 adverts, DHCPv6 replies). The `firewall` section installs it.

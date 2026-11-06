@@ -48,7 +48,8 @@ script that provisions a blank card re-applies the configuration on every
 
 - **Switches the SDR between setups in one command.** `radio NAME` closes what
   is running and brings NAME up tuned, playing, and resuming where you left it.
-- **Decodes JS8 and WSPR** from the SDR: rxd, a headless receiver, decodes
+- **Decodes JS8 and WSPR** from the SDR: [rxd](https://github.com/pid1/rxd), a
+  headless receiver installed at a pinned release, decodes
   both itself and shows them in its browser UI, with an offline map of the
   stations heard, and in rxd-tui. Receive only; the one upload is WSPR spots
   to WSPRnet, which a profile can turn off.
@@ -99,11 +100,15 @@ The account is assumed to be `jroemer`; pass another with
 | `radio off` | Save the active profile and stop rxd |
 | `radio resume` | Bring the active profile back (i3 runs this at login) |
 | `radio save [NAME]` | Keep rxd's current tuning in the active profile, or as a new one |
-| `radio reset NAME` | Back to the shipped default |
+| `radio reset NAME` | Back to the default |
 | `radio show NAME` | Print a profile |
 | `radio help` | All of the above |
 
-`Tab` completes profile names and subcommands.
+`Tab` completes profile names and subcommands. `radio`, rxd, `rxd-tui` and
+the browser UI come from [pid1/rxd](https://github.com/pid1/rxd), which
+setup.sh installs at a pinned release; the profiles below that aren't
+rxd's built-in ones (`dcara`, the broadcast stations) are this station's,
+from `/etc/rxd/station.json`.
 
 | Profile | Tuning | Ham It Up |
 |---|---|---|
@@ -135,8 +140,9 @@ plan picks among ([docs/radio.md](docs/radio.md)).
 
 The browser UI has no authentication, so anyone on the LAN can tune the
 radio. To keep it to the device, set `RXD_HTTP=127.0.0.1:8073` in
-`/etc/rx/rxd.env` and run `systemctl --user restart 'rxd@*'`. How profiles
-and rxd work: [docs/radio.md](docs/radio.md#rxd).
+`/etc/rxd/rxd.env` and run `systemctl --user restart 'rxd@*'`. This
+station's setup: [docs/radio.md](docs/radio.md). How rxd, `radio`, the band
+plan and the HTTP API work: [pid1/rxd](https://github.com/pid1/rxd).
 
 ### `radio mesh`: the LoRa mesh
 
