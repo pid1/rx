@@ -40,9 +40,11 @@ starting points. `vfo_offset`, left in older profiles, is no longer used.
 | `am-820` | 820 kHz AM | upconvert |
 
 All of them use the Nooelec behind the Ham It Up, which rxd opens by **serial
-number**, so it gets the right dongle however they enumerated. The Ham It
-Up's bypass switch is the one thing a file cannot change; `radio` says when to
-flip it.
+number**, so it gets the right dongle however they enumerated. Profiles use `"offset": "auto"`:
+below 30 MHz the signal goes through the Ham It Up's 125 MHz offset, above it
+not, including when you retune live. `"Ham-It-Up"` or `"None"` pins it. The
+Ham It Up's bypass switch is the one thing software cannot change; `radio`
+says when to flip it.
 
 ## rxd
 
@@ -57,7 +59,7 @@ Tune it live on two local ports; `radio save` keeps whatever you tuned:
 
 ```bash
 curl -s 127.0.0.1:8073/api/status                              # HTTP JSON
-curl -s -XPOST -d '{"freq":7078000}' 127.0.0.1:8073/api/tune   # freq, mode, bandwidth, gain_db
+curl -s -XPOST -d '{"freq":7078000}' 127.0.0.1:8073/api/tune   # freq, mode, bandwidth, gain_db, volume
 rigctl -m 2 -r 127.0.0.1:4532 f                                # Hamlib NET rigctl
 journalctl --user -u 'rxd@*'                                   # logs
 ```

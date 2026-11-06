@@ -2225,7 +2225,7 @@ BLACKLIST
     # this heredoc.
     write_file /usr/local/bin/rxd 0755 <<'RXD'
 #!/usr/bin/env python3
-"""rxd: a small RTL-SDR receiver daemon, a lighter stand-in for SDR++.
+"""rxd: a small RTL-SDR receiver daemon, the receiver behind `radio`.
 
   rxd PROFILE                 receive with a radio profile (a name under
                               ~/.config/rx/radio/ or a path to its JSON)
@@ -2242,7 +2242,7 @@ PipeWire/PulseAudio sink. Two control ports, both on 127.0.0.1 by default:
   4532  Hamlib NET rigctl (rig model 2), so JS8Call or `rigctl -m 2` can
         read and set the frequency and mode
   8073  HTTP JSON: GET /api/status, POST /api/tune {"freq": 7078000,
-        "mode": "USB", "bandwidth": 2800, "gain_db": 3.7}
+        "mode": "USB", "bandwidth": 2800, "gain_db": 3.7, "volume": 0.2}
 
 Frequencies on both ports are the dial, as JS8Call means it. A JS8 profile
 whose VFO sits off its js8call_dial (7077900 vs 7078000, tuned by hand)
@@ -2276,8 +2276,14 @@ from scipy import signal as sps  # noqa: E402
 
 STATE = os.path.expanduser("~/.config/rx/radio")
 AUDIO_RATE = 48000
-# Upconverter offsets by the names SDR++ files them under in a profile.
-OFFSETS = {"None": 0.0, "Manual": 0.0, "Ham-It-Up": 125e6}
+# A profile's "offset": "auto" (the default) upconverts below
+# upconvert_below_hz, since the R820T tunes no lower than about 24 MHz and
+# the Ham It Up is how HF gets in; "Ham-It-Up" always upconverts and "None"
+# (or SDR++'s "Manual") never does. The Ham It Up's own UPCONVERT/BYPASS
+# switch is physical: rxd can only report which way it should be.
+OFFSET_MODES = ("auto", "Ham-It-Up", "None", "Manual")
+UPCONVERTER_HZ = 125e6
+UPCONVERT_BELOW_HZ = 30e6
 # Profile sink descriptions -> PipeWire node names (None: default sink).
 SINKS = {"SDR to JS8 (virtual cable)": "SDR_to_JS8", "Built-in Audio": None}
 MODES = ("USB", "LSB", "AM", "FM", "WFM")
@@ -2305,8 +2311,9 @@ def load_profile(spec):
 class Settings:
     """What to receive. Shared between the control ports and the DSP thread."""
 
-    def __init__(self, p):
+    def __init__(self, p, name=None):
         self.lock = threading.Lock()
+        self.name = name
         self.apply_profile(p)
 
     def apply_profile(self, p):
@@ -2326,11 +2333,17 @@ class Settings:
             dial = float(p.get("js8call_dial", carrier))
             self.cal = dial - carrier
             self.dial = dial
-            self.upconverter = OFFSETS.get(p.get("offset", "None"), 0.0)
+            self.offset_mode = p.get("offset", "auto")
+            if self.offset_mode not in OFFSET_MODES:
+                raise ValueError("offset must be one of " + ", ".join(OFFSET_MODES))
+            self.upconverter_hz = float(p.get("upconverter_hz", UPCONVERTER_HZ))
+            self.upconvert_below = float(p.get("upconvert_below_hz", UPCONVERT_BELOW_HZ))
             rtl = p.get("rtl", {})
             self.serial = str(rtl.get("serial", ""))
             self.gain_index = rtl.get("gain")
-            self.gain_db = None  # set from the index once the dongle is open
+            # A saved gain_db wins; otherwise the index (SDR++'s convention)
+            # is looked up in the dongle's gain table once it is open.
+            self.gain_db = float(rtl["gain_db"]) if rtl.get("gain_db") is not None else None
             self.ppm = int(rtl.get("ppm", 0))
             self.bias_t = bool(rtl.get("biasT", False))
             self.sink = SINKS.get(p.get("sink"), p.get("sink"))
@@ -2339,12 +2352,22 @@ class Settings:
     def snapshot(self):
         with self.lock:
             return dict(mode=self.mode, bandwidth=self.bandwidth, dial=self.dial,
-                        cal=self.cal, upconverter=self.upconverter,
+                        cal=self.cal, upconverter=self.upconverter(),
+                        offset_mode=self.offset_mode,
                         agc_attack=self.agc_attack, agc_decay=self.agc_decay,
                         volume=self.volume, gain_db=self.gain_db,
                         version=self.version)
 
-    def update(self, freq=None, mode=None, bandwidth=None, gain_db=None):
+    def upconverter(self):
+        """The offset in effect for the current dial (call with the lock held)."""
+        if self.offset_mode == "Ham-It-Up":
+            return self.upconverter_hz
+        if self.offset_mode == "auto" and self.dial < self.upconvert_below:
+            return self.upconverter_hz
+        return 0.0
+
+    def update(self, freq=None, mode=None, bandwidth=None, gain_db=None,
+               volume=None):
         with self.lock:
             if mode is not None:
                 mode = mode.upper()
@@ -2362,6 +2385,11 @@ class Settings:
                 self.bandwidth = float(bandwidth)
             if gain_db is not None:
                 self.gain_db = float(gain_db)
+            if volume is not None:
+                volume = float(volume)
+                if not 0 <= volume <= 4:
+                    raise ValueError("volume must be between 0 and 4")
+                self.volume = volume
             self.version += 1
 
 
@@ -2401,7 +2429,7 @@ class RtlSource:
             sys.exit("rxd: dongle SN %s is not plugged in" % serial)
         self.dev = ctypes.c_void_p()
         if lib.rtlsdr_open(ctypes.byref(self.dev), index) != 0:
-            sys.exit("rxd: could not open dongle SN %s (is SDR++ holding it?)"
+            sys.exit("rxd: could not open dongle SN %s (is another rxd holding it? sudo fuser -v /dev/bus/usb/*/*)"
                      % serial)
         self.center = None
         self.rate = None
@@ -2840,8 +2868,11 @@ class Receiver:
 
     def status(self):
         snap = self.s.snapshot()
-        return {"freq": snap["dial"], "mode": snap["mode"],
-                "bandwidth": snap["bandwidth"], "gain_db": snap["gain_db"],
+        return {"profile": self.s.name, "freq": snap["dial"],
+                "vfo_hz": snap["dial"] - snap["cal"], "cal_hz": snap["cal"],
+                "mode": snap["mode"], "bandwidth": snap["bandwidth"],
+                "gain_db": snap["gain_db"], "volume": snap["volume"],
+                "offset_mode": snap["offset_mode"], "upconverter_hz": snap["upconverter"],
                 "level_dbfs": round(self.chain.level_db, 1) if self.chain else None,
                 "tuner_hz": self.src.center, "offset_hz": self.offset,
                 "sample_rate": self.chain.rate if self.chain else None,
@@ -2980,7 +3011,7 @@ class Api(BaseHTTPRequestHandler):
             doc = json.loads(self.rfile.read(n) or b"{}")
             if not isinstance(doc, dict):
                 raise ValueError("body must be a JSON object")
-            unknown = set(doc) - {"freq", "mode", "bandwidth", "gain_db"}
+            unknown = set(doc) - {"freq", "mode", "bandwidth", "gain_db", "volume"}
             if unknown:
                 raise ValueError("unknown field(s): " + ", ".join(sorted(unknown)))
             self.server.rx.s.update(**doc)
@@ -3011,7 +3042,7 @@ def main(argv=None):
 
     p, path = load_profile(a.profile)
     try:
-        settings = Settings(p)
+        settings = Settings(p, os.path.basename(path)[:-5])
     except ValueError as e:
         sys.exit("rxd: " + str(e))
     snap = settings.snapshot()
