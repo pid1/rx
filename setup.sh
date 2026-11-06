@@ -8455,6 +8455,12 @@ RXDUNIT
 
 Tab completes profile names (/usr/share/bash-completion/completions/radio).
 
+Every amateur band has a JS8 and a WSPR profile on its standard dial:
+js8-160m ... js8-2m and wspr-2190m ... wspr-2m. On 40 m they keep their old
+names, js8 and wspr (js8-40m and wspr-40m mean the same). 6 m and 2 m need
+the Ham It Up on BYPASS. rxd's band plan (Auto in its Digital view) picks
+among them by band conditions, time of day and what it has heard.
+
 A profile is tuning only: frequency, offset mode, demodulator and its
 settings, audio sink and volume, the RTL-SDR's settings and, for JS8
 profiles, JS8Call's dial. A WSPR profile ("decoder": "wspr") also says
@@ -8515,11 +8521,13 @@ AM = {"bandwidth": 10000.0}
 
 def js8(desc, dial):
     # The VFO sits 100 Hz under the dial, as tuned by hand for GhostNet; rxd
-    # keeps that difference as a calibration.
+    # keeps that difference as a calibration. "decoder": "js8" and the dial
+    # are all a JS8 profile says about decoding: JS8Call today (radio starts
+    # it on js8call_dial), rxd's own decoder when it has one.
     return {"description": desc, "frequency": dial - 100.0,
             "offset": "auto", "demod": "USB",
             "demod_settings": USB_JS8, "sink": JS8_SINK, "volume": 0.2090567648410797,
-            "rtl": rtl(4), "js8call_dial": dial}
+            "rtl": rtl(4), "decoder": "js8", "js8call_dial": dial}
 
 
 def wspr(desc, dial):
@@ -8537,10 +8545,69 @@ def vhf(desc, hz, demod="FM", settings=NFM, gain=20):
             "sink": SPEAKER, "volume": 0.5, "rtl": rtl(gain)}
 
 
+# Amateur bands, ITU Region 2 edges in Hz, lowest first: what band a
+# frequency is in, for `radio --json` and rxd's band plan.
+BANDS = (("2190m", 135700, 137800), ("630m", 472000, 479000),
+         ("160m", 1800000, 2000000), ("80m", 3500000, 4000000),
+         ("60m", 5250000, 5450000), ("40m", 7000000, 7300000),
+         ("30m", 10100000, 10150000), ("20m", 14000000, 14350000),
+         ("17m", 18068000, 18168000), ("15m", 21000000, 21450000),
+         ("12m", 24890000, 24990000), ("10m", 28000000, 29700000),
+         ("6m", 50000000, 54000000), ("2m", 144000000, 148000000),
+         ("1.25m", 222000000, 225000000), ("70cm", 420000000, 450000000))
+
+# Standard dial frequencies (USB), checked 2026-11-06. JS8: JS8Call's default
+# list (JS8Call-improved 3.0.3, JS8_Main/FrequencyList.cpp; the original
+# JS8Call 2.2 had 1842 kHz on 160 m and nothing on 60 m). WSPR: WSJT-X's
+# default list (models/FrequencyList.cpp), which has no 60 m; 5364.7 kHz is
+# where WSPRnet's 60 m spots are (wspr.live, 552,000 a week there against
+# 190,000 on the older 5287.2).
+JS8_DIALS = (("160m", 1843500), ("80m", 3578000), ("60m", 5363000), ("40m", 7078000),
+             ("30m", 10130000), ("20m", 14078000), ("17m", 18104000), ("15m", 21078000),
+             ("12m", 24922000), ("10m", 28078000), ("6m", 50318000), ("2m", 144178000))
+WSPR_DIALS = (("2190m", 136000), ("630m", 474200), ("160m", 1836600), ("80m", 3568600),
+              ("60m", 5364700), ("40m", 7038600), ("30m", 10138700), ("20m", 14095600),
+              ("17m", 18104600), ("15m", 21094600), ("12m", 24924600), ("10m", 28124600),
+              ("6m", 50293000), ("2m", 144489000))
+# 40 m keeps the names it always had; js8-40m and wspr-40m are aliases.
+BAND_NAMES = {("js8", "40m"): "js8", ("wspr", "40m"): "wspr"}
+
+
+def band_profile_name(mode, band):
+    return BAND_NAMES.get((mode, band), "%s-%s" % (mode, band))
+
+
+ALIASES = {"%s-40m" % m: n for (m, _), n in BAND_NAMES.items()}
+
+
+def band_of(hz):
+    """The amateur band hz is in ("20m"), or None."""
+    for name, lo, hi in BANDS:
+        if lo <= hz <= hi:
+            return name
+    return None
+
+
+def band_label(band):
+    return band[:-1] + " m" if band.endswith("m") and not band.endswith("cm") else band
+
+
+def band_profiles():
+    """The band plan's profiles, one per mode and band: {name: profile}."""
+    out = {}
+    for mode, dials, make, title in (("js8", JS8_DIALS, js8, "JS8"),
+                                     ("wspr", WSPR_DIALS, wspr, "WSPR")):
+        for band, dial in dials:
+            out[band_profile_name(mode, band)] = make(
+                "%s, %s" % (title, band_label(band)), float(dial) if mode == "wspr" else dial)
+    return out
+
+
+BAND_PLAN = band_profiles()
+
 PROFILES = {
     "ghostnet": js8("JS8 GhostNet, 40 m", 7107000),
-    "js8":      js8("JS8, 40 m", 7078000),
-    "wspr":     wspr("WSPR, 40 m", 7038600.0),  # WSPR's 40 m dial
+    **BAND_PLAN,
     "vhf":      vhf("2 m calling", 146520000.0),
     "dcara":    vhf("DCARA", 146920000.0),
     "uhf":      vhf("70 cm calling", 446000000.0),
@@ -8669,7 +8736,7 @@ def decoder(p):
 
 def summary(name, p):
     path = "Ham It Up upconvert" if upconverting(p) else "Ham It Up bypass"
-    return "%-9s %11.4f MHz %-4s %-19s %s" % (
+    return "%-10s %11.4f MHz %-4s %-19s %s" % (
         name, p["frequency"] / 1e6, p["demod"], path, p.get("description", ""))
 
 
@@ -9133,8 +9200,13 @@ def main():
     a = ap.parse_args()
     focus = not a.no_focus
 
+    if a.cmd in ALIASES:  # js8-40m and wspr-40m are js8 and wspr
+        a.cmd = ALIASES[a.cmd]
+    if a.arg in ALIASES and a.cmd in ("show", "reset", "save"):
+        a.arg = ALIASES[a.arg]
+
     if a.names:  # for tab completion
-        print("\n".join(known()))
+        print("\n".join(known() + sorted(ALIASES)))
     elif a.json:  # for rxd's browser UI: the profiles and which is active
         rows = []
         for n in known():
@@ -9144,6 +9216,8 @@ def main():
                          "mode": p["demod"], "upconvert": upconverting(p),
                          "js8": p.get("js8call_dial") is not None,
                          "decoder": decoder(p),
+                         "band": band_of(float(p.get("js8call_dial", p["frequency"]))),
+                         "plan": n in BAND_PLAN,
                          "saved": os.path.isfile(os.path.join(STATE, n + ".json"))})
         print(json.dumps({"active": active(), "profiles": rows}))
     elif a.cmd is None:
