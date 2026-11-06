@@ -24,7 +24,7 @@ The `sdr` section of setup.sh:
   lines.
 - **The station file**, `/etc/rxd/station.json` (rxd's
   [docs/station.md](https://github.com/pid1/rxd/blob/main/docs/station.md)),
-  rewritten on every run from setup.sh's config: callsign KA1PID at EM13lc,
+  rewritten on every run from setup.sh's config: the callsign and default grid,
   the Nooelec NESDR SMArt v5 by its serial (57818712, so rxd gets the right
   dongle however USB enumerated it), the Ham It Up (125 MHz, below 30 MHz,
   with its physical switch), the built-in speaker, and the local profiles
@@ -55,7 +55,7 @@ rxd's own profiles are the band plan (`js8-160m` … `js8-2m`, `wspr-2190m` …
 | `vhf` | 146.520 MHz FM (2 m calling) | bypass |
 | `dcara` | 146.920 MHz FM (DCARA), from the station file | bypass |
 | `uhf` | 446.000 MHz FM (70 cm calling) | bypass |
-| `noaa` | 162.550 MHz FM (NOAA weather; the strongest of the seven at EM13) | bypass |
+| `noaa` | 162.550 MHz FM (NOAA weather; the strongest of the seven here) | bypass |
 | `fm-93.3`, `fm-105.3` | broadcast WFM, mono, from the station file | bypass |
 | `am-820` | 820 kHz AM, from the station file | upconvert |
 
@@ -70,7 +70,8 @@ the side it's on unless *Allow, I'll flip it* is set.
 
 ## JS8 and WSPR here
 
-- **WSPR** spots go to WSPRnet as KA1PID at EM13lc, from the station file.
+- **WSPR** spots go to WSPRnet under the station file's callsign, at the grid rxd
+  is using (from the GPS once it has a steady fix, else the station file's).
   `POST /api/v1/tune {"wspr_report": false}`, or the Digital view, turns it
   off.
 - **JS8's JSC word table** is JS8Call's (GPL-3), so neither rx nor rxd
