@@ -3979,20 +3979,26 @@ It talks only to rxd's HTTP API, by default at http://127.0.0.1:8073, and
 has three views, like rxd's browser UI. The view follows the receiver's
 profile; 1, 2 and 3 pick one.
 
-  1 JS8     JS8Call's decodes, the clock, and a picker for the JS8
-            frequencies (Ghostnet or regular JS8Call). Nothing to tune.
-  2 Listen  a picker of broadcast FM, VHF/UHF and AM stations, with gain,
-            bandwidth, squelch (NFM) and the uConsole speaker's volume.
-  3 Manual  the full instrument: tuning, spectrum and waterfall.
+  1 Digital  the digital modes, with a picker for their profiles grouped
+             by mode (JS8: Ghostnet or regular JS8Call; WSPR). On JS8 it
+             shows JS8Call's decodes and the clock; on WSPR, rxd's own spots,
+             the two-minute cycle and the reporting to WSPRnet, which r turns
+             on and off. Nothing to tune.
+  2 Listen   a picker of broadcast FM, VHF/UHF and AM stations, with gain,
+             bandwidth, squelch (NFM) and the uConsole speaker's volume.
+  3 Manual   the full instrument: tuning, spectrum and waterfall.
 
 Picking a station or frequency switches rxd's profile; rxd restarts, which
 takes a few seconds. Leaving a JS8 profile asks first, since it closes
 JS8Call.
 
+Times are shown in this machine's time zone ($TZ), 24-hour.
+
 l plays the receiver's audio on this machine, through the first of pw-cat,
 paplay, aplay, ffplay or sox's play on PATH (or --player), so the TUI works
-as a remote listening station. [ ] set its volume here; M mutes the
-uConsole's own speaker meanwhile. --listen starts with it on.
+as a remote listening station; on JS8 the audio goes to JS8Call instead.
+[ ] set its volume here; M mutes the uConsole's own speaker meanwhile.
+--listen starts with it on.
 
 ? shows each view's keys. A typed frequency (f, in Manual) is MHz when it is
 under 2000 (7.078, 146.52), kHz under 100000 (14074) and Hz above that;
@@ -4002,6 +4008,7 @@ Status is shown with a symbol and a word as well as colour, and NO_COLOR is
 honoured. --ascii draws without Unicode block characters.
 """
 import argparse
+import calendar
 import collections
 import curses
 import json
@@ -4036,7 +4043,9 @@ GAIN_FALLBACK_MAX = 50.0               # 1 dB steps when rxd reports no gain tab
 LEVEL_LO, LEVEL_HI = -110.0, -10.0     # signal bar span, dBFS
 
 # The views, and which profiles belong to which (as in the browser UI).
-VIEWS = (("js8", "JS8"), ("listen", "Listen"), ("manual", "Manual"))
+VIEWS = (("digital", "Digital"), ("listen", "Listen"), ("manual", "Manual"))
+# The Digital view's picker groups its profiles by decoder, in this order.
+DECODERS = (("js8", "JS8"), ("wspr", "WSPR"))
 LISTEN_MODES = ("WFM", "FM", "AM")
 GROUPS = (("WFM", "Broadcast FM"), ("FM", "VHF · UHF"), ("AM", "AM"))
 # Listen's b cycles these: Narrow, Normal, Wide.
@@ -4052,6 +4061,7 @@ SPECTRUM_EVERY = 0.25   # about 4 a second, in Manual only
 RETRY_EVERY = 1.0       # while rxd is unreachable
 NO_SPECTRUM_EVERY = 5.0  # while rxd has no /api/spectrum
 JS8_EVERY = 2.5         # the decode feed, on a JS8 profile
+WSPR_EVERY = 3.0        # the spot feed, on a WSPR profile (spots come every 2 minutes)
 PROFILES_RETRY = 10.0   # after /api/profiles failed
 TIMEOUT = 0.8           # per request
 SLOW_TIMEOUT = 20.0     # /api/profiles and the switch run `radio --json`
@@ -4194,10 +4204,18 @@ def mode_label(mode):
     return "NFM" if mode == "FM" else (mode or "---")
 
 
+def decoder_of(d):
+    """What decodes a profile's (or a status's) audio: "js8", "wspr" or None.
+    An older rxd or `radio --json` has only the js8 flag."""
+    if "decoder" in d:
+        return d["decoder"] if d["decoder"] in dict(DECODERS) else None
+    return "js8" if d.get("js8") else None
+
+
 def profile_kind(p):
-    """Which view a profile belongs to: js8, listen or manual."""
-    if p.get("js8"):
-        return "js8"
+    """Which view a profile belongs to: digital, listen or manual."""
+    if decoder_of(p):
+        return "digital"
     return "listen" if p.get("mode") in LISTEN_MODES else "manual"
 
 
@@ -4205,9 +4223,19 @@ def status_kind(st):
     """The same for a status, when the profile list isn't available."""
     if not st or not st.get("mode"):
         return None
-    if st.get("js8"):
-        return "js8"
+    if decoder_of(st):
+        return "digital"
     return "listen" if st["mode"] in LISTEN_MODES else "manual"
+
+
+def group_digital(profiles):
+    """The Digital view's picker: [(mode title, [profiles])], JS8 then WSPR."""
+    out = []
+    for dec, title in DECODERS:
+        members = [p for p in profiles if decoder_of(p) == dec]
+        if members:
+            out.append((title, members))
+    return out
 
 
 def group_stations(profiles):
@@ -4223,8 +4251,8 @@ def group_stations(profiles):
 
 def picker_list(view, profiles):
     """The profiles a view's picker offers, in order."""
-    if view == "js8":
-        return [p for p in profiles if p.get("js8")]
+    if view == "digital":
+        return [p for _, members in group_digital(profiles) for p in members]
     if view == "listen":
         return [p for _, members in group_stations(profiles) for p in members]
     return []
@@ -4284,8 +4312,8 @@ def squelch_words(st, g):
     return "%s  %s Open (signal)" % (lvl, g.rx), "ok"
 
 
-def clock_words(clock, g):
-    """(text, role) for the clock, which JS8 needs within about a second."""
+def clock_words(clock, g, mode="JS8"):
+    """(text, role) for the clock, which JS8 and WSPR need within about a second."""
     c = clock if isinstance(clock, dict) else {}
     if c.get("synced") is True:
         src = c.get("source")
@@ -4293,7 +4321,7 @@ def clock_words(clock, g):
     if c.get("synced") is False:
         off = c.get("offset_s")
         extra = " (%.1f s off)" % abs(off) if isinstance(off, (int, float)) else ""
-        return "%s Clock not synced: JS8 won't decode%s" % (g.bad, extra), "bad"
+        return "%s Clock not synced: %s won't decode%s" % (g.bad, mode, extra), "bad"
     return "%s Clock unknown" % g.unknown, "warn"
 
 
@@ -4333,16 +4361,44 @@ def js8_key(line):
 
 def js8_filter(lines, text):
     """The lines whose callsigns or text contain text (any case)."""
-    f = (text or "").strip().upper()
-    return [x for x in lines if f in js8_key(x)] if f else list(lines)
+    return line_filter(lines, text, js8_key)
+
+
+UTC_TIME = re.compile(r"(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d)(?::(\d\d))?")
+
+
+def utc_epoch(t):
+    """A UTC time from rxd ("2026-11-05 14:03:15" or "2026-11-06T12:20:00Z") as Unix
+    time, or None."""
+    m = UTC_TIME.match(str(t or "").strip())
+    if not m:
+        return None
+    y, mo, d, hh, mm, ss = (int(x or 0) for x in m.groups())
+    try:
+        return calendar.timegm((y, mo, d, hh, mm, ss, 0, 0, 0))
+    except (ValueError, OverflowError):
+        return None
+
+
+def local_time(t, seconds=True):
+    """A UTC time from rxd in this machine's time zone, 24-hour: 08:03:15 (or 08:03)."""
+    e = utc_epoch(t)
+    if e is None:
+        return None
+    return time.strftime("%H:%M:%S" if seconds else "%H:%M", time.localtime(e))
 
 
 def js8_time(t):
+    """A decode's time, local. A bare time of day (no date) can't be converted and is
+    shown as it came."""
+    lt = local_time(t)
+    if lt:
+        return lt
     m = re.search(r"\d\d:\d\d:\d\d", str(t or ""))
     return m.group(0) if m else str(t or "--:--:--")[:8]
 
 
-JS8_HEADER = "UTC      SNR  From      Message"
+JS8_HEADER = "Time     SNR  From      Message"
 
 
 def format_js8(line, call, width, g):
@@ -4359,8 +4415,95 @@ def format_js8(line, call, width, g):
     return clip(s, width, g), mine
 
 
-def stations_heard(lines):
-    return len({x.get("from") for x in lines if x.get("from")})
+def stations_heard(lines, key="from"):
+    return len({x.get(key) for x in lines if x.get(key)})
+
+
+# ---- WSPR spots
+
+KM_PER_MILE = 1.609344
+WSPR_FORMAT = "%-5s  %-10s %-6s %5s %4s %4s %8s"
+WSPR_HEADER = WSPR_FORMAT % ("Time", "Call", "Grid", "Miles", "SNR", "dBm", "Audio Hz")
+
+
+def wspr_key(line):
+    return " ".join(str(line.get(k) or "") for k in ("call", "grid", "text")).upper()
+
+
+def line_filter(lines, text, key=js8_key):
+    """The lines whose callsigns or text contain text (any case)."""
+    f = (text or "").strip().upper()
+    return [x for x in lines if f in key(x)] if f else list(lines)
+
+
+def format_wspr(line, dial, width, g):
+    """One spot: local time, call, grid, miles, SNR, dBm and the audio offset."""
+    km = line.get("km")
+    miles = "%d" % round(km / KM_PER_MILE) if isinstance(km, (int, float)) else ""
+    snr, dbm, f = line.get("snr"), line.get("dbm"), line.get("freq")
+    off = "%d" % round(f - dial) if isinstance(f, (int, float)) and \
+        isinstance(dial, (int, float)) else ""
+    s = WSPR_FORMAT % (local_time(line.get("time"), False) or "--:--",
+                       str(line.get("call") or "?"), str(line.get("grid") or ""), miles,
+                       "%+d" % snr if isinstance(snr, int) else "?",
+                       "%d" % dbm if isinstance(dbm, int) else "?", off)
+    return clip(s.rstrip(), width, g)
+
+
+def slot_time(iso):
+    return local_time(iso, False) or "--:--"
+
+
+def wspr_cycle(w, g):
+    """(text, role) for where the two-minute cycle is."""
+    state = w.get("state")
+    if state == "recording":
+        return "%s Recording the %s slot" % (g.rx, slot_time(w.get("slot"))), "ok"
+    if state == "decoding":
+        slot = slot_time(w.get("decoding") or w.get("slot"))
+        return "%s Decoding the %s slot" % (g.wait, slot), "value"
+    if state == "waiting":
+        return "%s Next slot %s" % (g.wait, slot_time(w.get("slot"))), "label"
+    return "%s Cycle unknown" % g.unknown, "warn"
+
+
+def wspr_last(w):
+    last = w.get("last")
+    if not isinstance(last, dict) or not last.get("slot"):
+        return "No slot decoded yet"
+    n = last.get("spots") or 0
+    t = slot_time(last["slot"])
+    if not n:
+        return "No spots in the %s slot" % t
+    return "%d spot%s in the %s slot" % (n, "" if n == 1 else "s", t)
+
+
+def wspr_can_report(w):
+    """Whether r can turn reporting on and off: rxd has a callsign and grid."""
+    r = (w or {}).get("report")
+    return isinstance(r, dict) and not r.get("reason")
+
+
+def wspr_report_words(w, g):
+    """(text, role) for the reporting to WSPRnet, in words as well as colour."""
+    r = w.get("report")
+    if not isinstance(r, dict):
+        return "%s Reporting unknown" % g.unknown, "warn"
+    if r.get("reason"):
+        return "%s Not reporting: %s" % (g.stop, r["reason"]), "warn"
+    who = " ".join(x for x in (r.get("call"), r.get("grid")) if x)
+    if not r.get("enabled"):
+        return "%s Not reporting to WSPRnet (r reports as %s)" % (g.stop, who), "label"
+    pending = r.get("pending") or 0
+    if r.get("online") is False:
+        return "%s Offline: %d spot%s waiting" % (g.drop, pending, "" if pending == 1 else "s"), \
+            "warn"
+    if r.get("error"):
+        return "%s %s" % (g.bad, r["error"]), "bad"
+    text = "%s Reporting to WSPRnet as %s %s %d sent" % (g.rx, who, g.dot, r.get("sent") or 0)
+    if pending:
+        text += ", %d waiting" % pending
+    return text, "ok"
 
 
 # ---- audio here
@@ -4676,18 +4819,27 @@ def badge(reachable, status, dropping, g, switching=None):
 
 
 SHORT_LABELS = {"bandwidth": "bw", "volume": "vol", "speaker": "spkr", "station": "pick",
-                "switch": "pick", "squelch": "sq", "listen": "listen", "filter": "filter"}
+                "switch": "pick", "squelch": "sq", "listen": "listen", "filter": "filter",
+                "reporting": "report"}
 
 
-def help_items(g, view="manual", mode=None, listening=False):
-    """[(keys, label)] for a view's bottom line; ? and q always come last."""
+def help_items(g, view="manual", mode=None, listening=False, decoder=None, report=False):
+    """[(keys, label)] for a view's bottom line; ? and q always come last.
+    In Digital, decoder is the receiver's ("js8", "wspr" or None) and report
+    whether r can switch WSPR reporting."""
     k = g.keys
     ud = k["updown"]
-    if view == "js8":
-        items = [(ud + " Enter", "switch"), ("PgUp PgDn", "scroll"), ("/", "filter"),
-                 ("1 2 3", "view")]
-        if listening:
-            items.insert(3, ("l", "stop audio"))
+    if view == "digital":
+        # When they don't all fit, the ones just before the view keys go first.
+        items = [(ud + " Enter", "switch")]
+        if decoder == "wspr" and report:
+            items.append(("r", "reporting"))
+        if decoder != "js8":
+            items += [("l", "listen")] + ([("[ ]", "volume")] if listening else [])
+        items += [("PgUp PgDn", "scroll"), ("/", "filter")]
+        if decoder == "js8" and listening:
+            items.append(("l", "stop audio"))
+        items.append(("1 2 3", "view"))
     elif view == "listen":
         items = [(ud + " Enter", "station"), ("g G", "gain"), ("b", "bandwidth")]
         if mode == "FM":
@@ -4788,7 +4940,7 @@ class Poller:
 
     One thread polls status (and the spectrum, in Manual) and sends tunes;
     another does the slow things: the profile list, profile switches and
-    the JS8 decode feed."""
+    the decoder's feed (JS8 decodes or WSPR spots)."""
 
     def __init__(self, link, clock=time.monotonic):
         self.link = link
@@ -4816,10 +4968,12 @@ class Poller:
         self.profiles_retry_at = 0.0
         self.switch_req = None
         self.switch_acks = []      # (name, error or None)
+        # The decoder's feed: one of these fills at a time, the other is empty.
         self.js8_lines = collections.deque(maxlen=JS8_KEEP)
-        self.js8_seq = 0
-        self.js8_for = None        # the profile the lines are from
-        self.js8_state = "waiting"  # waiting, ok, missing or error
+        self.wspr_lines = collections.deque(maxlen=JS8_KEEP)
+        self.js8_state = self.wspr_state = "waiting"  # waiting, ok, missing or error
+        self.feed_seq = 0
+        self.feed_for = None       # (profile, decoder) the lines are from
         self.threads = []
 
     # called from the UI thread
@@ -4956,9 +5110,9 @@ class Poller:
             self._status()
         self.changed.set()
 
-    # the side thread: profiles, switches and JS8
+    # the side thread: profiles, switches and the decoder's feed
     def side(self):
-        next_js8 = 0.0
+        next_feed = 0.0
         while not self.halt.is_set():
             self.side_wake.clear()
             with self.lock:
@@ -4971,17 +5125,17 @@ class Poller:
                 self._load_profiles(st)
                 continue
             now = self.clock()
-            if reachable and st.get("js8"):
-                if st.get("profile") != self.js8_for:
-                    self._js8_reset(st.get("profile"))
-                    next_js8 = 0.0
-                if now >= next_js8:
-                    self._js8()
-                    next_js8 = self.clock() + JS8_EVERY
-            elif reachable and self.js8_for is not None:
-                self._js8_reset(None)
-            self.side_wake.wait(clamp(next_js8 - self.clock(), 0.05, 0.5)
-                                if st.get("js8") else 0.5)
+            dec = decoder_of(st)
+            if reachable and dec:
+                if (st.get("profile"), dec) != self.feed_for:
+                    self._feed_reset((st.get("profile"), dec))
+                    next_feed = 0.0
+                if now >= next_feed:
+                    self._feed(dec)
+                    next_feed = self.clock() + (WSPR_EVERY if dec == "wspr" else JS8_EVERY)
+            elif reachable and self.feed_for is not None:
+                self._feed_reset(None)
+            self.side_wake.wait(clamp(next_feed - self.clock(), 0.05, 0.5) if dec else 0.5)
 
     def _profiles_due(self, st):
         with self.lock:
@@ -5028,37 +5182,41 @@ class Poller:
             self.switch_acks.append((name, err))
         self.changed.set()
 
-    def _js8_reset(self, profile):
+    def _feed_reset(self, key):
         with self.lock:
             self.js8_lines.clear()
-            self.js8_seq = 0
-            self.js8_for = profile
-            self.js8_state = "waiting"
+            self.wspr_lines.clear()
+            self.feed_seq = 0
+            self.feed_for = key
+            self.js8_state = self.wspr_state = "waiting"
         self.changed.set()
 
-    def _js8(self):
+    def _feed(self, dec):
+        """New lines from /api/js8 or /api/wspr, which number them the same way."""
+        lines = self.wspr_lines if dec == "wspr" else self.js8_lines
         try:
-            code, doc = self.link.get("/api/js8?after=%d" % self.js8_seq, timeout=3.0)
+            code, doc = self.link.get("/api/%s?after=%d" % (dec, self.feed_seq), timeout=3.0)
         except OSError:
             return  # the status thread reports rxd's absence
         with self.lock:
             if code == 200 and isinstance(doc.get("lines"), list):
-                seq = doc.get("seq") if isinstance(doc.get("seq"), int) else self.js8_seq
-                if seq < self.js8_seq:  # rxd restarted and numbers from 1 again
-                    self.js8_lines.clear()
-                    self.js8_seq = 0
+                seq = doc.get("seq") if isinstance(doc.get("seq"), int) else self.feed_seq
+                if seq < self.feed_seq:  # rxd restarted and numbers from 1 again
+                    lines.clear()
+                    self.feed_seq = 0
                     self.side_wake.set()
                     return
                 new = sorted((x for x in doc["lines"] if isinstance(x, dict)
-                              and (x.get("seq") or 0) > self.js8_seq),
+                              and (x.get("seq") or 0) > self.feed_seq),
                              key=lambda x: x.get("seq") or 0)
-                self.js8_lines.extend(new)
-                self.js8_seq = max(self.js8_seq, seq)
-                self.js8_state = "ok"
+                lines.extend(new)
+                self.feed_seq = max(self.feed_seq, seq)
+                state = "ok"
             elif code == 404:
-                self.js8_state = "missing"
+                state = "missing"
             else:
-                self.js8_state = "error: " + (doc.get("error") or "HTTP %d" % code)
+                state = "error: " + (doc.get("error") or "HTTP %d" % code)
+            setattr(self, dec + "_state", state)
         self.changed.set()
 
 
@@ -5405,7 +5563,7 @@ class App:
         self.lo = self.hi = None  # smoothed spectrum range
         self.wf_cache = {}      # waterfall rows already resampled to the screen
         # views
-        self.view = None        # js8, listen or manual; None until rxd says
+        self.view = None        # digital, listen or manual; None until rxd says
         self.view_for = None    # the profile the view was chosen for
         self.pinned = False     # Manual, chosen by the user, stays
         self.cursor = 0
@@ -5414,10 +5572,11 @@ class App:
         self.sq_level = SQUELCH_DEFAULT
         self.mute_prev = None   # the uConsole volume M will restore
         self.local_vol = 100    # percent, for audio played here
+        # the Digital view's list (JS8 decodes or WSPR spots)
         self.js8_filter = ""
         self.js8_scroll = 0     # lines back from the newest
         self.js8_seen = None    # (profile, matching lines) at the last draw
-        self.js8_page = 10      # decode rows on screen, for PgUp and PgDn
+        self.js8_page = 10      # rows on screen, for PgUp and PgDn
         self.want_listen = listen  # --listen: start once rxd says which mode
 
     # ---- state
@@ -5428,9 +5587,20 @@ class App:
                      spec_state=self.p.spec_state, profiles=self.p.profiles,
                      profiles_state=self.p.profiles_state,
                      profiles_error=getattr(self.p, "profiles_error", ""),
-                     js8=list(self.p.js8_lines), js8_state=self.p.js8_state)
-        s["status"].update(self.overrides)
+                     js8=list(self.p.js8_lines), js8_state=self.p.js8_state,
+                     wspr=list(getattr(self.p, "wspr_lines", ())),
+                     wspr_state=getattr(self.p, "wspr_state", "waiting"))
+        st = s["status"]
+        st.update(self.overrides)
+        w = st.get("wspr")
+        if "wspr_report" in self.overrides and isinstance(w, dict) and \
+                isinstance(w.get("report"), dict):  # sent, not yet confirmed
+            st["wspr"] = dict(w, report=dict(w["report"], enabled=self.overrides["wspr_report"]))
         return s
+
+    def decoder(self, s):
+        """The receiver's decoder: "js8", "wspr" or None."""
+        return decoder_of(s["status"]) if s["status"] else None
 
     def profile_list(self, s):
         return (s["profiles"] or {}).get("profiles") or []
@@ -5448,7 +5618,7 @@ class App:
 
     def mismatch(self, s):
         k = self.kind(s)
-        return self.view in ("js8", "listen") and k is not None and k != self.view
+        return self.view in ("digital", "listen") and k is not None and k != self.view
 
     def drain(self):
         for sent, err in self.p.take_acks():
@@ -5557,8 +5727,8 @@ class App:
             self.pick_view(VIEWS[ch - ord("1")][0], s)
         elif ch == ord("l"):
             self.toggle_audio(s)
-        elif self.view == "js8":
-            self.js8_key(ch, s)
+        elif self.view == "digital":
+            self.digital_key(ch, s)
         elif self.view == "listen":
             self.listen_key(ch, s)
         elif self.view == "manual":
@@ -5609,7 +5779,8 @@ class App:
             return "%s Can't list profiles: %s" % (self.g.bad, s["profiles_error"])
         if not s["profiles"]:
             return "Loading profiles from rxd" + self.g.ellipsis
-        return "No %s profiles are saved." % ("JS8" if self.view == "js8" else "station")
+        return "No %s profiles are saved." % ("JS8 or WSPR" if self.view == "digital"
+                                              else "station")
 
     def select(self, p, s):
         st = s["status"]
@@ -5621,7 +5792,7 @@ class App:
             self.say("Not switched: can't reach rxd", "err")
         else:
             cur = self.active_profile(s)
-            if st.get("js8") or (cur and cur.get("js8")):
+            if decoder_of(st) == "js8" or (cur and decoder_of(cur) == "js8"):
                 self.confirm = p
             else:
                 self.do_switch(p, s)
@@ -5641,8 +5812,8 @@ class App:
         elif self.audio.on:
             self.audio.stop()
             self.say("%s Stopped listening here" % self.g.stop)
-        elif self.view == "js8":
-            self.say("No audio in JS8: it goes to JS8Call. 2 or 3 to listen.")
+        elif self.decoder(s) == "js8":
+            self.say("No audio here on JS8: it goes to JS8Call. 2 or 3 to listen.")
         else:
             self.audio.start(rate_for(s["status"].get("mode")))
 
@@ -5659,8 +5830,8 @@ class App:
 
     def mute_key(self, s):
         st = s["status"]
-        if self.view == "js8":
-            self.say("Not in JS8: the receiver's audio feeds JS8Call")
+        if self.view == "digital" and self.decoder(s) == "js8":
+            self.say("Not on JS8: the receiver's audio feeds JS8Call")
         elif st.get("volume") is None:
             self.not_yet()
         elif self.mute_prev is not None:
@@ -5694,7 +5865,7 @@ class App:
         else:
             self.send(gain_db=g)
 
-    def js8_key(self, ch, s):
+    def digital_key(self, ch, s):
         if self.picker_key(ch, s):
             return
         if ch in (curses.KEY_PPAGE, curses.KEY_NPAGE):
@@ -5707,8 +5878,28 @@ class App:
                 self.js8_filter, self.js8_scroll = "", 0
         elif ch == ord("M"):
             self.mute_key(s)
+        elif ch == ord("r"):
+            self.report_key(s)
+        elif ch in (ord("["), ord("]")) and self.decoder(s) != "js8":
+            self.local_volume_key(ch)
         else:
             self.other_key(ch)
+
+    def report_key(self, s):
+        """r: WSPR reporting to WSPRnet on / off."""
+        st = s["status"]
+        w = st.get("wspr")
+        if self.decoder(s) != "wspr" or self.mismatch(s):
+            self.say("r turns WSPR reporting on and off; the receiver isn't on WSPR")
+        elif not isinstance(w, dict) or not isinstance(w.get("report"), dict):
+            self.not_yet()
+        elif not wspr_can_report(w):
+            self.say("%s Can't report: %s" % (self.g.stop, w["report"]["reason"]), "err")
+        else:
+            on = not w["report"].get("enabled")
+            self.send(wspr_report=on)
+            self.say("%s %s" % ((self.g.rx, "Reporting spots to WSPRnet") if on else
+                                (self.g.stop, "Stopped reporting to WSPRnet")))
 
     def listen_key(self, ch, s):
         st = s["status"]
@@ -5829,8 +6020,8 @@ class App:
         st = s["status"]
         self.draw_bar(scr, s)
         bottom = h - 2           # message line; help on h - 1
-        if self.view == "js8":
-            self.draw_js8(scr, s, 1, bottom)
+        if self.view == "digital":
+            self.draw_digital(scr, s, 1, bottom)
         elif self.view == "listen":
             self.draw_listen(scr, s, 1, bottom)
         elif self.view == "manual":
@@ -5841,7 +6032,9 @@ class App:
         self.draw_message(scr, s, bottom)
         x = 1
         listening = bool(self.audio and self.audio.on)
-        items = help_items(g, self.view or "manual", st.get("mode"), listening)
+        items = help_items(g, self.view or "manual", st.get("mode"), listening,
+                           None if self.mismatch(s) else self.decoder(s),
+                           wspr_can_report(st.get("wspr")))
         for text, r in help_line(w - 2, g, items):
             scr.put(h - 1, x, text, r)
             x += len(text)
@@ -5967,29 +6160,43 @@ class App:
         if first + n < len(rows):
             scr.put(y1 - 1, w - 2, self.g.keys["down"][:1], "label")
 
-    def draw_js8(self, scr, s, y, bottom):
+    def draw_digital(self, scr, s, y, bottom):
+        """The Digital view: the picker, the receiver and clock, then JS8's decodes
+        or WSPR's cycle, reporting and spots, whichever the receiver decodes."""
         g, w = self.g, scr.w
         st = s["status"]
         mis = self.mismatch(s)
         if mis:
-            self.draw_note(scr, s, y, "a JS8 frequency")
+            self.draw_note(scr, s, y, "a JS8 or WSPR frequency")
             y += 2
         items = self.picker(s)
         if not items:
             scr.put(y, 2, g.text(self.picker_empty(s)), "dim")
             y += 2
         else:
-            rows = []
-            for i, p in enumerate(items):
-                sub = "%s%s %s" % (p.get("description") or "", " " + g.dot if p.get("description")
-                                   else "", short_mhz(p.get("freq") or 0))
-                rows.append(self.picker_row(p, s, i, "%-10s" % p.get("name"), sub.strip()))
-            n = min(len(rows), 4 if not mis else bottom - y - 1)
+            rows, i = [], 0
+            for title, members in group_digital(self.profile_list(s)):
+                rows.append(("group", title))
+                for p in members:
+                    sub = "%s%s %s" % (p.get("description") or "",
+                                       " " + g.dot if p.get("description") else "",
+                                       short_mhz(p.get("freq") or 0))
+                    rows.append(self.picker_row(p, s, i, "%-10s" % p.get("name"), sub.strip()))
+                    i += 1
+            room = bottom - y
+            n = min(len(rows), room - 1 if mis else
+                    min(max(2, room // 3), 8 if room >= 30 else 5))
             self.draw_picker_rows(scr, rows, y, y + n)
             y += n + 1
         if mis:
             return
-        lines = s["js8"]
+        dec = self.decoder(s)
+        wspr = dec == "wspr"
+        lines = s["wspr"] if wspr else s["js8"]
+
+        def put(y, x, text, role=""):
+            if y < bottom:
+                scr.put(y, x, text, role)
         # status: Ham It Up, receiver, level, stations heard
         sym, word, role = badge(s["reachable"], st, self.p.dropping(), g, self.switching)
         x = 1
@@ -6000,7 +6207,7 @@ class App:
                  ("   ", ""), ("%s %s" % (sym, word), role), ("   Signal ", "label")]
         lvl = st.get("level_dbfs")
         parts.append(("%.1f dBFS" % lvl if lvl is not None else "--- dBFS", "value"))
-        heard = stations_heard(lines)
+        heard = stations_heard(lines, "call" if wspr else "from")
         tail = "%d station%s heard" % (heard, "" if heard == 1 else "s")
         used = sum(len(t) for t, _ in parts)
         barw = clamp(w - used - len(tail) - 8, 0, 20)
@@ -6008,21 +6215,27 @@ class App:
             parts += [(" ", ""), (level_bar(lvl, barw, g), "spec")]
         parts += [("   ", ""), (tail, "value")]
         for t, r in parts:
-            scr.put(y, x, t[:max(0, w - 1 - x)], r)
+            put(y, x, t[:max(0, w - 1 - x)], r)
             x += len(t)
         y += 1
-        ctext, crole = clock_words(st.get("clock"), g)
+        ctext, crole = clock_words(st.get("clock"), g, "WSPR" if wspr else "JS8")
         if crole == "bad":
-            scr.put(y, 0, " " * w, "bad")
-            scr.put(y, 1, clip(ctext + ". Check chrony and the GPS.", w - 2, g), "bad")
+            put(y, 0, " " * w, "bad")
+            put(y, 1, clip(ctext + ". Check chrony and the GPS.", w - 2, g), "bad")
         else:
-            scr.put(y, 1, clip(ctext, w - 2, g), crole)
+            put(y, 1, clip(ctext, w - 2, g), crole)
         y += 1
-        if self.audio and self.audio.on:
+        if wspr:
+            y = self.draw_wspr_status(scr, st.get("wspr"), y, bottom)
+        if self.audio and self.audio.on and y < bottom:
             y = self.draw_audio_row(scr, y)
         y += 1 if bottom - y > 8 else 0
-        # decodes
-        shown = js8_filter(lines, self.js8_filter)
+        # decodes or spots
+        if wspr:
+            header, key = WSPR_HEADER, wspr_key
+        else:
+            header, key = JS8_HEADER, js8_key
+        shown = line_filter(lines, self.js8_filter, key)
         area = bottom - y - 1
         self.js8_page = max(area, 1)
         prof = st.get("profile")
@@ -6030,6 +6243,8 @@ class App:
             self.js8_scroll += max(0, len(shown) - self.js8_seen[1])  # stay put as lines arrive
         self.js8_seen = (prof, len(shown))
         self.js8_scroll = clamp(self.js8_scroll, 0, max(0, len(shown) - area))
+        if y >= bottom:
+            return
         info = ""
         if self.js8_filter:
             info = "Filter %s: %d of %d  (Esc clears)" % (
@@ -6037,20 +6252,24 @@ class App:
         if self.js8_scroll:
             info = ("%s %d back, PgDn for newest" % (g.drop, self.js8_scroll)) + \
                 ("   " + info if info else "")
-        scr.put(y, 1, JS8_HEADER, "head")
+        scr.put(y, 1, clip(header, w - 2, g), "head")
         if info:
-            scr.put(y, max(len(JS8_HEADER) + 3, w - len(info) - 2),
-                    clip(info, w - len(JS8_HEADER) - 5, g), "warn" if self.js8_scroll else "label")
+            scr.put(y, max(len(header) + 3, w - len(info) - 2),
+                    clip(info, w - len(header) - 5, g), "warn" if self.js8_scroll else "label")
         y += 1
         if area <= 0:
             return
         if not shown:
-            if s["js8_state"] == "missing":
-                text = "%s This rxd has no JS8 feed." % g.bad
-            elif str(s["js8_state"]).startswith("error"):
-                text = "%s No decodes: %s" % (g.bad, s["js8_state"][7:])
+            state = s["wspr_state"] if wspr else s["js8_state"]
+            what = "spots" if wspr else "decodes"
+            if state == "missing":
+                text = "%s This rxd has no %s feed." % (g.bad, "WSPR" if wspr else "JS8")
+            elif str(state).startswith("error"):
+                text = "%s No %s: %s" % (g.bad, what, state[7:])
             elif self.js8_filter and lines:
                 text = "No lines with %s. / changes the filter, Esc clears it." % self.js8_filter
+            elif wspr:
+                text = "No spots yet. They appear here as each two-minute slot is decoded."
             else:
                 text = "No decodes yet. They appear here as JS8Call hears them."
             scr.put(y, 2, clip(text, w - 3, g), "dim")
@@ -6059,8 +6278,40 @@ class App:
         view = shown[max(0, end - area):end]
         call = st.get("js8_call")
         for i, line in enumerate(view):
+            if wspr:
+                scr.put(y + i, 1, format_wspr(line, st.get("freq"), w - 2, g))
+                continue
             text, mine = format_js8(line, call, w - 2, g)
             scr.put(y + i, 1, text.ljust(w - 2) if mine else text, "mine" if mine else "")
+
+    def draw_wspr_status(self, scr, wsp, y, bottom):
+        """WSPR's cycle, last slot, reporting and any error; returns the next row."""
+        g, w = self.g, scr.w
+
+        def put(text, role):
+            if y < bottom:
+                scr.put(y, 1, clip(g.text(text), w - 2, g), role)
+        if not isinstance(wsp, dict):
+            put("%s Waiting for the WSPR decoder" % g.wait, "dim")
+            return y + 1
+        ctext, crole = wspr_cycle(wsp, g)
+        last = wspr_last(wsp)
+        if len(ctext) + 3 + len(last) <= w - 2:
+            put(ctext, crole)
+            if y < bottom:
+                scr.put(y, 1 + len(ctext) + 3, last, "value")
+            y += 1
+        else:
+            put(ctext, crole)
+            y += 1
+            put(last, "value")
+            y += 1
+        put(*wspr_report_words(wsp, g))
+        y += 1
+        if wsp.get("error"):
+            put("%s %s" % (g.bad, wsp["error"]), "err")
+            y += 1
+        return y
 
     def draw_listen(self, scr, s, y, bottom):
         g, w, h = self.g, scr.w, scr.h
@@ -6283,21 +6534,26 @@ class App:
     def help_lines(self):
         k = self.g.keys
         ud = k["updown"]
-        views = ["1 2 3     JS8, Listen or Manual view"]
-        if self.view == "js8":
+        views = ["1 2 3     Digital, Listen or Manual view"]
+        if self.view == "digital":
             body = [
-                "rxd-tui: JS8",
+                "rxd-tui: Digital (JS8 and WSPR)",
                 "",
-                "%-9s pick a JS8 frequency; Enter switches" % ud,
-                "PgUp PgDn scroll back through the decodes / forward",
+                "%-9s pick a JS8 or WSPR frequency; Enter switches" % ud,
+                "PgUp PgDn scroll back through the decodes or spots",
+                "          / forward",
                 "/         show only lines with a callsign; Esc",
                 "          shows them all again",
-                "l         stop the audio here, if it's playing",
+                "r         WSPR: report spots to WSPRnet / stop",
+                "l         play the audio on this machine / stop",
+                "          (not on JS8: its audio goes to JS8Call)",
+                "[ ]       volume of the audio here",
             ] + views + [
                 "",
-                "%s marks lines to your callsign. JS8 needs the" % self.g.mine,
-                "clock right to about a second, so the clock's",
-                "state is shown under the receiver's.",
+                "%s marks JS8 lines to your callsign. JS8 and WSPR" % self.g.mine,
+                "need the clock right to about a second, so the",
+                "clock's state is shown under the receiver's.",
+                "Times are this machine's local time.",
             ]
         elif self.view == "listen":
             body = [
@@ -6623,11 +6879,12 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
 .jstat{display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;padding:8px 12px}
 @media (min-width:700px){.jstat{grid-template-columns:repeat(5,auto);justify-content:space-between}}
 .wrap>*{order:0}
-body[data-view=manual] #aPick,body[data-view=manual] #js8,body[data-view=manual] #listenCard{order:1}
+body[data-view=manual] #aPick,body[data-view=manual] #js8,body[data-view=manual] #wspr,body[data-view=manual] #listenCard{order:1}
+body[data-view=digital] #listenCard,body[data-view=digital] #js8,body[data-view=digital] #wspr{order:1}
 body[data-view=manual] #pmsg,#appear0{order:2}
-body[data-view=js8] .jlist{max-height:none;overflow:visible}
+body[data-view=digital] .jlist{max-height:none;overflow:visible}
 @media (min-width:900px){
-  body[data-view=listen] .wrap,body[data-view=js8] .wrap{max-width:1100px}
+  body[data-view=listen] .wrap,body[data-view=digital] .wrap{max-width:1100px}
   body[data-view=listen] .wrap{grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start;grid-auto-flow:row dense}
   body[data-view=listen] .wrap>*{grid-column:1/-1}
   body[data-view=listen] #now,body[data-view=listen] .top,body[data-view=listen] #listenCard,body[data-view=listen] #qual{grid-column:1}
@@ -6661,6 +6918,15 @@ dialog .row2{margin-top:6px}
 .jl .jx{flex-basis:100%;font-size:17px;overflow-wrap:anywhere}
 .jl.me{background:var(--pass);border-left:5px solid var(--accent);padding-left:8px}
 @media (min-width:900px){.jl .jx{flex:1 1 300px}}
+.wst{display:grid;grid-template-columns:1fr;gap:6px 12px;padding:8px 12px}
+@media (min-width:700px){.wst{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.wst .banner{grid-column:1/-1;margin:4px 0 0}
+.wrep{grid-column:1/-1;margin-top:4px}
+.wrep .lbl .val{color:var(--fg);font-size:19px}
+.wl .wc{font-size:20px;font-weight:750}
+.wl .wg{font-size:18px;font-weight:650}
+.wl .wd{font-size:18px}
+.wl .wx{flex-basis:100%;font-size:16px;font-weight:600;color:var(--dim)}
 </style>
 </head>
 <body>
@@ -6703,11 +6969,11 @@ dialog .row2{margin-top:6px}
   <button type="button" class="btn wide" id="mute" aria-pressed="false" disabled>Mute uConsole speaker</button>
   <p class="note">Audio may stop when the phone locks or the browser goes to the background.</p>
 </section>
-<section class="card" id="jPick" data-v="js8">
-  <div class="lbl"><span>JS8 frequency</span></div>
-  <div id="jPickL" class="plist"></div>
+<section class="card" id="jPick" data-v="digital">
+  <div class="lbl"><span>Mode and frequency</span></div>
+  <div id="jPickL"></div>
 </section>
-<section class="card jstat" id="jStat" data-v="js8" data-live>
+<section class="card jstat" id="jStat" data-v="digital" data-live>
   <div><span class="k">Ham It Up</span><span id="jHiu" class="v">—</span></div>
   <div><span class="k">Receiver</span><span id="jRx" class="v">—</span></div>
   <div><span class="k">Signal</span><span id="jLvl" class="v">— dBFS</span></div>
@@ -6715,12 +6981,28 @@ dialog .row2{margin-top:6px}
   <div><span class="k">Clock</span><span id="jClock" class="v">—</span></div>
   <p id="jClockBad" class="banner jclock" role="alert" hidden></p>
 </section>
-<section class="card" id="js8" data-v="js8 manual" data-live hidden>
+<section class="card wst" id="wStat" data-v="digital" data-live hidden>
+  <div><span class="k">Cycle</span><span id="wCycle" class="v">—</span></div>
+  <div><span class="k">Last slot</span><span id="wLast" class="v">—</span></div>
+  <div><span class="k">Reporting</span><span id="wRep" class="v">—</span></div>
+  <p id="wErr" class="banner" role="alert" hidden></p>
+  <div id="wRepSl" class="wrep" hidden><div class="lbl"><span>Report spots to WSPRnet</span><span id="wRepS" class="val">—</span></div>
+    <div class="row2" role="group" aria-label="Report spots to WSPRnet"><button type="button" class="btn" id="wRepOff">Off</button><button type="button" class="btn" id="wRepOn">On</button></div>
+    <p id="wMsg" class="msg" role="status" hidden></p></div>
+</section>
+<section class="card" id="js8" data-v="digital manual" data-live hidden>
   <div class="lbl"><span>JS8 decodes, newest first</span><span id="jCount"></span></div>
   <div class="jf"><input type="text" id="jFilter" placeholder="Filter by callsign" aria-label="Filter decodes by callsign" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="done">
     <button type="button" class="btn" id="jClear" hidden>Clear</button></div>
   <p id="jMsg" class="jmsg" role="status"></p>
   <ol id="jList" class="jlist"></ol>
+</section>
+<section class="card" id="wspr" data-v="digital manual" data-live hidden>
+  <div class="lbl"><span>WSPR spots, newest first</span><span id="wCount"></span></div>
+  <div class="jf"><input type="text" id="wFilter" placeholder="Filter by callsign or grid" aria-label="Filter spots by callsign or grid" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="done">
+    <button type="button" class="btn" id="wClear" hidden>Clear</button></div>
+  <p id="wsMsg" class="jmsg" role="status"></p>
+  <ol id="wList" class="jlist"></ol>
 </section>
 <section class="card" id="lPick" data-v="listen">
   <div class="lbl"><span>Stations</span></div>
@@ -6824,6 +7106,23 @@ function fmtHz(v) {
   return [String(v), "Hz"];
 }
 function fmtBw(v) { const p = fmtHz(v); return p[0] + " " + p[1]; }
+// rxd sends UTC: "2026-11-06 10:47:03" (JS8Call) or "2026-11-06T12:20:00Z".
+// Everything shown is the browser's local time, 24 hour.
+function utcDate(t) {
+  const m = /^(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d)(?::(\d\d))?/.exec(String(t || ""));
+  return m ? new Date(Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0))) : null;
+}
+const p2 = n => String(n).padStart(2, "0");
+function hhmm(d, secs) { return p2(d.getHours()) + ":" + p2(d.getMinutes()) + (secs ? ":" + p2(d.getSeconds()) : ""); }
+// a time for a list line: the day too when it isn't today
+function lineTime(t, secs) {
+  const d = utcDate(t);
+  if (!d) return String(t || "");
+  const today = new Date().toDateString() === d.toDateString();
+  return (today ? "" : d.toLocaleDateString(undefined, {month: "short", day: "numeric"}) + " ") + hhmm(d, secs);
+}
+function slotTime(t) { const d = utcDate(t); return d ? hhmm(d) : "—"; }
+function signed(n) { return (n > 0 ? "+" : n < 0 ? "−" : "") + Math.abs(n); }
 function parseFreq(t) {
   t = t.trim().toLowerCase().replace(/[\s,_']/g, "");
   const m = t.match(/^(\d+(?:\.\d*)?|\.\d+)(mhz|m|khz|k|hz)?$/);
@@ -6996,14 +7295,16 @@ function applyStatus(s) {
 
   syncMute();
   autoView();
-  if (A.on && s.js8 && view === "js8") stopListen();
-  const vk = [view, curKind(), !!s.js8, profAvail, A.on].join();
+  // JS8's audio is only tones; WSPR's speaker is muted by design, so the phone may listen
+  if (A.on && pdec(s) === "js8" && view === "digital") stopListen();
+  const vk = [view, curKind(), pdec(s), profAvail, A.on].join();
   if (vk !== viewKey) { viewKey = vk; renderView(); }
   renderProfiles(); renderQual();
   renderJs8Stat(s, $("sRx").textContent, $("sRx").className);
+  renderWsprStat(s);
   if (profAvail && profiles && !switching && !profLoading && s.profile !== profiles.active && s.profile !== profAskedFor) loadProfiles();
   if (A.on && rateFor(s.mode) !== A.want) connectAudio();
-  js8Sync();
+  js8Sync(); wsprSync();
 }
 
 function renderFreq() {
@@ -7354,23 +7655,29 @@ const mq = window.matchMedia("(prefers-color-scheme: dark)");
 
 
 // ---------------------------------------------------------------- profiles and views
-// Views follow the active profile's kind: JS8 profiles get the decode stream,
-// WFM/FM/AM get the station picker and Listen, anything else gets Manual.
+// Views follow the active profile's kind: digital profiles (a JS8 or WSPR
+// decoder) get the decodes, WFM/FM/AM get the station picker and Listen,
+// anything else gets Manual.
 // Manual is the only view that sticks, and only because the user chose it.
 const LISTEN_MODES = ["WFM", "FM", "AM"];
 const GROUPS = [["WFM", "Broadcast FM"], ["FM", "VHF · UHF"], ["AM", "AM"]];
-const VIEWS = [["js8", "JS8"], ["listen", "Listen"], ["manual", "Manual", "tuning"]];
+const VIEWS = [["digital", "Digital"], ["listen", "Listen"], ["manual", "Manual", "tuning"]];
+const DECODERS = [["js8", "JS8"], ["wspr", "WSPR"]];
 let profiles = null, profAvail = true, profLoading = false, profAskedFor = null;
 let switching = null, switchTimer = 0, flipText = "";
 let view = load("view") === "manual" ? "manual" : null, viewFor = null;
-function pkind(p) { return p.js8 ? "js8" : LISTEN_MODES.indexOf(p.mode) >= 0 ? "listen" : "manual"; }
+// rxd and radio say "decoder"; older ones only the js8 flag
+function pdec(p) { return p.decoder !== undefined ? p.decoder || null : p.js8 ? "js8" : null; }
+function pkind(p) { return pdec(p) ? "digital" : LISTEN_MODES.indexOf(p.mode) >= 0 ? "listen" : "manual"; }
+function curDec() { if (st) return pdec(st); const p = activeProf(); return p ? pdec(p) : null; }
+function decName(d) { const x = DECODERS.find(x => x[0] === d); return x ? x[1] : "digital"; }
 function activeName() { return (st && st.profile) || (profiles && profiles.active) || null; }
 function activeProf() { const n = activeName(); return (profiles && profiles.profiles.find(p => p.name === n)) || null; }
 function curKind() {
   const p = activeProf();
   if (p) return pkind(p);
   if (!st) return null;
-  return st.js8 ? "js8" : LISTEN_MODES.indexOf(st.mode) >= 0 ? "listen" : "manual";
+  return pdec(st) ? "digital" : LISTEN_MODES.indexOf(st.mode) >= 0 ? "listen" : "manual";
 }
 function curUp() { return !!(st && st.upconverter_hz > 0); }
 function hiuWord(up) { return up ? "UPCONVERT" : "BYPASS"; }
@@ -7426,10 +7733,13 @@ function renderView() {
     if (el.parentElement.closest("[data-v]")) { el.hidden = el.dataset.v.split(" ").indexOf(v) < 0; continue; }
     el.hidden = !v || el.dataset.v.split(" ").indexOf(v) < 0 || (el.hasAttribute("data-live") && mis);
   }
-  // the decodes need a JS8 profile; Listen stays reachable while audio plays
-  if (!(st && st.js8)) $("js8").hidden = true;
-  $("jCount").hidden = v === "js8";
-  if (A.on && v === "js8") $("listenCard").hidden = false;
+  // each decode list needs its decoder; Listen stays reachable while audio
+  // plays, and on WSPR, where the phone is the only way to hear it
+  const dec = curDec();
+  if (!st || pdec(st) !== "js8") $("js8").hidden = true;
+  if (!st || pdec(st) !== "wspr") $("wspr").hidden = $("wStat").hidden = true;
+  $("jCount").hidden = $("wCount").hidden = v === "digital";
+  if (v === "digital" && (A.on || (dec === "wspr" && !mis))) $("listenCard").hidden = false;
   $("aPick").hidden = $("aPick").hidden || !profiles;
   $("lPick").hidden = $("lPick").hidden || !profAvail;
   $("jPick").hidden = $("jPick").hidden || !profAvail;
@@ -7437,7 +7747,7 @@ function renderView() {
   if (mis && st && !switching) {
     const p = activeProf();
     nt.textContent = "Receiver is on " + st.profile + (p && p.description ? " (" + p.description + ")" : "") + ". " +
-      (v === "js8" ? "Pick a JS8 frequency to switch." : "Pick a station to switch.");
+      (v === "digital" ? "Pick a digital mode to switch." : "Pick a station to switch.");
     nt.hidden = false;
   } else nt.hidden = true;
   // RF gain and the speaker slider live in whichever view shows them
@@ -7476,20 +7786,22 @@ function renderProfiles() {
     if (!list.length) { const m = document.createElement("span"); m.className = "jmsg"; m.textContent = "No profiles of this kind are saved."; box.appendChild(m); return; }
     for (const p of list) box.appendChild(f(p));
   };
-  if (view === "js8") mk("jPickL", all.filter(p => p.js8), p => profBtn(p, p.name, (p.description ? p.description + " · " : "") + fmtMHz(p.freq)));
-  if (view === "manual") mk("aPickL", all, p => profBtn(p, pdesc(p), p.name + " · " + fmtMHz(p.freq) + " · " + p.mode + (p.js8 ? " · JS8" : "")));
-  if (view === "listen") {
-    const box = $("lPickL"); box.textContent = "";
-    const ls = all.filter(p => pkind(p) === "listen");
-    if (!profiles || !ls.length) { mk("lPickL", ls, null); return; }
-    for (const [m, title] of GROUPS) {
-      const g = ls.filter(p => p.mode === m);
+  const grouped = (id, ls, groups, f) => {
+    if (!profiles || !ls.length) { mk(id, ls, null); return; }
+    const box = $(id); box.textContent = "";
+    for (const [k, title, test] of groups) {
+      const g = ls.filter(test);
       if (!g.length) continue;
       const h = document.createElement("div"); h.className = "pgroup"; h.textContent = title; box.appendChild(h);
       const l = document.createElement("div"); l.className = "plist"; box.appendChild(l);
-      for (const p of g) l.appendChild(profBtn(p, pdesc(p), fmtMHz(p.freq) + " · " + (p.mode === "FM" ? "NFM" : p.mode)));
+      for (const p of g) l.appendChild(f(p));
     }
-  }
+  };
+  if (view === "digital") grouped("jPickL", all.filter(p => pdec(p)), DECODERS.map(([d, t]) => [d, t, p => pdec(p) === d]),
+    p => profBtn(p, p.name, (p.description ? p.description + " · " : "") + fmtMHz(p.freq)));
+  if (view === "manual") mk("aPickL", all, p => profBtn(p, pdesc(p), p.name + " · " + fmtMHz(p.freq) + " · " + p.mode + (pdec(p) ? " · " + decName(pdec(p)) : "")));
+  if (view === "listen") grouped("lPickL", all.filter(p => pkind(p) === "listen"), GROUPS.map(([m, t]) => [m, t, p => p.mode === m]),
+    p => profBtn(p, pdesc(p), fmtMHz(p.freq) + " · " + (p.mode === "FM" ? "NFM" : p.mode)));
 }
 
 // switching
@@ -7499,7 +7811,7 @@ $("dlgNo").onclick = () => dlg.close();
 $("dlgYes").onclick = () => { dlg.close(); if (dlgAct) dlgAct(); };
 dlg.addEventListener("close", () => { dlgAct = null; });
 function askSwitch(p) {
-  const cur = activeProf(), leavingJs8 = !!((st && st.js8) || (cur && cur.js8));
+  const cur = activeProf(), leavingJs8 = curDec() === "js8" || !!(cur && pdec(cur) === "js8");
   if (!leavingJs8) return doSwitch(p);
   $("dlgT").textContent = "Switch to " + p.name + "?";
   const b = $("dlgB"); b.textContent = "";
@@ -7533,7 +7845,7 @@ function finishSwitch() {
     $("flip").hidden = false;
   }
   if (muted() && st.volume > 0) { store("spkprev", String(st.volume)); tune({volume: 0}, 0); }
-  jKey = null;
+  jKey = null; wKey = null;
   renderConn(); renderView();
   loadProfiles();
 }
@@ -7776,7 +8088,7 @@ renderAudio();
 const JMAX = 500;
 let jOn = false, jKey = null, jSeq = 0, jTimer = 0, jHeard = new Map(), jFilt = "";
 function js8Sync() {
-  const want = !!(st && st.js8);
+  const want = !!(st && pdec(st) === "js8");
   if (want && st.profile !== jKey) {
     jKey = st.profile; jOn = true; jSeq = 0; jHeard = new Map();
     $("jList").textContent = ""; setText($("jMsg"), "Loading decodes");
@@ -7815,9 +8127,8 @@ function addJs8(lines) {
     li.dataset.k = [fr, l.to || "", l.text || ""].join(" ").toUpperCase();
     li.dataset.f = fr;
     const add = (tag, cls, t) => { const e = document.createElement(tag); e.className = cls; e.textContent = t; li.appendChild(e); };
-    const tm = /\d\d:\d\d:\d\d/.exec(String(l.time || ""));
-    add("span", "jt", (tm ? tm[0] : String(l.time || "")) + " UTC");
-    add("span", "js", typeof l.snr === "number" ? "SNR " + (l.snr > 0 ? "+" : l.snr < 0 ? "−" : "") + Math.abs(l.snr) : "SNR —");
+    add("span", "jt", lineTime(l.time, true));
+    add("span", "js", typeof l.snr === "number" ? "SNR " + signed(l.snr) : "SNR —");
     add("b", "jfr", fr);
     if (mine) add("span", "jme", "◆ " + (call || "You"));
     let text = String(l.text || "");
@@ -7853,13 +8164,13 @@ $("jFilter").oninput = () => {
 };
 $("jClear").onclick = () => { $("jFilter").value = ""; $("jFilter").oninput(); $("jFilter").focus(); };
 function renderJs8Stat(s, rxText, rxCls) {
-  if (view !== "js8") return;
+  if (view !== "digital") return;
   setText($("jHiu"), s.upconverter_hz > 0 ? "⇅ UPCONVERT" : "→ BYPASS", "v");
   setText($("jRx"), rxText, rxCls);
   const lv = s.level_dbfs;
   setText($("jLvl"), typeof lv === "number" ? (lv < 0 ? "−" : "") + Math.abs(lv).toFixed(1) + " dBFS" : "— dBFS", "v");
-  // JS8's 15 s slots fail silently past about 2 s of clock error, so a
-  // clock that isn't synced is the first thing to say.
+  // JS8's 15 s slots and WSPR's 2 min ones fail silently past about 2 s of
+  // clock error, so a clock that isn't synced is the first thing to say.
   const c = s.clock || {};
   if (c.synced === true) setText($("jClock"), "● Synced" + (c.source ? " (" + c.source + ")" : ""), "v ok");
   else if (c.synced === false) setText($("jClock"), "✕ Not synced", "v bad");
@@ -7868,14 +8179,138 @@ function renderJs8Stat(s, rxText, rxCls) {
   bad.hidden = c.synced !== false;
   if (c.synced === false) {
     const off = typeof c.offset_s === "number" ? " It is " + Math.abs(c.offset_s).toFixed(1) + " s " + (c.offset_s > 0 ? "fast" : "slow") + "." : "";
-    setText(bad, "✕ Clock not synced: JS8 won't decode until it is." + off + " No GPS fix and no network? Check chronyc sources.");
+    setText(bad, "✕ Clock not synced: " + decName(pdec(s)) + " won't decode until it is." + off + " No GPS fix and no network? Check chronyc sources.");
   }
 }
+
+// ---------------------------------------------------------------- WSPR spots
+let wOn = false, wKey = null, wSeq = 0, wTimer = 0, wHeard = new Map(), wFilt = "", wBusy = false;
+function wsprSync() {
+  const want = !!(st && pdec(st) === "wspr");
+  if (want && st.profile !== wKey) {
+    wKey = st.profile; wOn = true; wSeq = 0; wHeard = new Map();
+    $("wList").textContent = ""; setText($("wsMsg"), "Loading spots");
+    pollWspr();
+  } else if (!want && wOn) { wOn = false; wKey = null; clearTimeout(wTimer); }
+}
+async function pollWspr() {
+  clearTimeout(wTimer);
+  if (!wOn) return;
+  if (document.hidden) { wTimer = setTimeout(pollWspr, 5000); return; }
+  const key = wKey;
+  try {
+    const r = await api("/api/wspr?after=" + wSeq);
+    if (key !== wKey) return;
+    if (r.ok && r.doc && Array.isArray(r.doc.lines)) {
+      addWspr(r.doc.lines.filter(l => l.seq > wSeq).sort((a, b) => a.seq - b.seq));
+      if (typeof r.doc.seq === "number") wSeq = Math.max(wSeq, r.doc.seq);
+      wStatus("");
+    } else wStatus(r.status === 404 ? "✕ This rxd has no WSPR feed." : "✕ No spots: " + ((r.doc && r.doc.error) || "HTTP " + r.status));
+  } catch (e) {}
+  if (wOn && key === wKey) wTimer = setTimeout(pollWspr, 5000);
+}
+function fmtPower(dbm) {
+  const w = Math.pow(10, (dbm - 30) / 10);
+  const mw = w * 1000;
+  return dbm + " dBm (" + (w >= 1 ? trim(w, 1) + " W" : (mw < 10 ? trim(mw, 1) : String(Math.round(mw))) + " mW") + ")";
+}
+function wMatch(li) { return !wFilt || li.dataset.k.indexOf(wFilt) >= 0; }
+function addWspr(lines) {
+  if (!lines.length) return wStatus("");
+  const list = $("wList"), frag = document.createDocumentFragment(), dial = st ? st.freq : null;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i], li = document.createElement("li"), call = String(l.call || "?");
+    li.className = "jl wl";
+    li.dataset.k = [call, l.grid || ""].join(" ").toUpperCase();
+    li.dataset.f = call;
+    const add = (tag, cls, t) => { const e = document.createElement(tag); e.className = cls; e.textContent = t; li.appendChild(e); };
+    add("span", "jt", lineTime(l.time));
+    add("b", "wc", call);
+    if (l.grid) add("span", "wg", l.grid);
+    if (typeof l.km === "number") add("span", "wd", Math.round(l.km * 0.621371).toLocaleString() + " mi");
+    const x = [typeof l.snr === "number" ? "SNR " + signed(l.snr) + " dB" : "SNR —"];
+    if (typeof l.dbm === "number") x.push(fmtPower(l.dbm));
+    if (typeof l.freq === "number" && typeof dial === "number") x.push("Audio " + Math.round(l.freq - dial) + " Hz");
+    add("span", "wx", x.map(t => t.replace(/ /g, "\u00a0")).join(" · "));
+    li.hidden = !wMatch(li);
+    wHeard.set(call, (wHeard.get(call) || 0) + 1);
+    frag.appendChild(li);
+  }
+  list.insertBefore(frag, list.firstChild);
+  while (list.children.length > JMAX) {
+    const f = list.lastChild.dataset.f, n = wHeard.get(f) - 1;
+    if (n > 0) wHeard.set(f, n); else wHeard.delete(f);
+    list.removeChild(list.lastChild);
+  }
+  wStatus("");
+}
+function wStatus(err) {
+  const list = $("wList"), n = wHeard.size;
+  let shown = 0; if (wFilt) for (const li of list.children) if (!li.hidden) shown++;
+  setText($("wCount"), n + (n === 1 ? " station heard" : " stations heard"));
+  if (st && pdec(st) === "wspr") setText($("jHeard"), n + (n === 1 ? " station" : " stations"), "v");
+  if (err) setText($("wsMsg"), err);
+  else if (!list.children.length) setText($("wsMsg"), "No spots yet. They appear here after each two-minute slot is decoded.");
+  else if (wFilt) setText($("wsMsg"), shown ? "Showing " + shown + " of " + list.children.length + " spots with " + wFilt : "No spots with " + wFilt + ".");
+  else setText($("wsMsg"), "");
+}
+$("wFilter").oninput = () => {
+  wFilt = $("wFilter").value.trim().toUpperCase();
+  $("wClear").hidden = !wFilt;
+  for (const li of $("wList").children) li.hidden = !wMatch(li);
+  wStatus("");
+};
+$("wClear").onclick = () => { $("wFilter").value = ""; $("wFilter").oninput(); $("wFilter").focus(); };
+function renderWsprStat(s) {
+  const w = s.wspr;
+  if (!w || view !== "digital") return;
+  const slot = slotTime(w.decoding || w.slot);
+  if (w.state === "recording") setText($("wCycle"), "● Recording the " + slot + " slot", "v ok");
+  else if (w.state === "decoding") setText($("wCycle"), "◆ Decoding the " + slot + " slot", "v");
+  else setText($("wCycle"), "■ Next slot " + slot, "v");
+  const L = w.last;
+  if (!L) setText($("wLast"), "No slot decoded yet", "v dimc");
+  else setText($("wLast"), (L.spots ? L.spots + (L.spots === 1 ? " spot" : " spots") : "No spots") + " in the " + slotTime(L.slot) + " slot", "v");
+  const e = $("wErr");
+  e.hidden = !w.error;
+  if (w.error) setText(e, "✕ WSPR decoder: " + w.error);
+  const p = w.report || {}, id = [p.call, p.grid].filter(Boolean).join(" ");
+  if (!p.enabled) setText($("wRep"), "■ Not reporting" + (p.reason ? ": " + p.reason : ""), "v dimc");
+  else if (p.online === false) setText($("wRep"), "▲ Offline: " + (p.pending || 0) + (p.pending === 1 ? " spot" : " spots") + " waiting", "v warn");
+  else if (p.error) setText($("wRep"), "✕ " + p.error, "v bad");
+  else setText($("wRep"), "● Reporting to WSPRnet" + (id ? " as " + id : "") + " · " + (p.sent || 0) + " sent" +
+    (p.pending ? " · " + p.pending + " waiting" : ""), "v ok");
+  // the switch only where reporting can be on: a callsign and grid are set
+  $("wRepSl").hidden = !!p.reason;
+  const on = !!p.enabled, dis = wBusy || conn !== "ok" || !!switching;
+  setText($("wRepS"), on ? "On" : "Off", "val");
+  for (const [id2, v] of [["wRepOff", false], ["wRepOn", true]]) {
+    const b = $(id2);
+    b.setAttribute("aria-pressed", String(on === v));
+    setText(b, (on === v ? "● " : "") + (v ? "On" : "Off"));
+    b.disabled = dis;
+  }
+}
+async function setReport(on) {
+  if (!st || !st.wspr || wBusy) return;
+  wBusy = true; $("wMsg").hidden = true; renderWsprStat(st);
+  let msg = "";
+  try {
+    const r = await api("/api/tune", {wspr_report: on});
+    if (r.ok && r.doc && typeof r.doc.freq === "number") { wBusy = false; applyStatus(r.doc); return; }
+    msg = "rxd refused: " + ((r.doc && r.doc.error) || "HTTP " + r.status);
+  } catch (e) { msg = "Could not reach rxd. Reporting is unchanged."; }
+  wBusy = false;
+  setText($("wMsg"), "✕ " + msg); $("wMsg").hidden = false;
+  if (st) renderWsprStat(st);
+}
+$("wRepOff").onclick = () => setReport(false);
+$("wRepOn").onclick = () => setReport(true);
 
 // ---------------------------------------------------------------- start
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
-    pollStatus(); pollSpecSoon(); if (jOn) pollJs8();
+    pollStatus(); pollSpecSoon(); if (jOn) pollJs8(); if (wOn) pollWspr();
     if (A.on && A.ctx && A.ctx.state !== "running") A.ctx.resume().catch(() => {});
     renderAudio();
   }
