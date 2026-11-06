@@ -49,8 +49,9 @@ script that provisions a blank card re-applies the configuration on every
 - **Switches the SDR between setups in one command.** `radio NAME` closes what
   is running and brings NAME up tuned, playing, and resuming where you left it.
 - **Decodes JS8 and WSPR** from the SDR: rxd, a headless receiver, decodes
-  both itself and shows them in its browser UI and rxd-tui. Receive only;
-  the one upload is WSPR spots to WSPRnet, which a profile can turn off.
+  both itself and shows them in its browser UI, with an offline map of the
+  stations heard, and in rxd-tui. Receive only; the one upload is WSPR spots
+  to WSPRnet, which a profile can turn off.
 - **Keeps time without a network**, from GPS PPS, the AIO's RTC and chrony.
 - **Runs a LoRa mesh node** on the AIO's SX1262, Meshtastic or MeshCore, on
   the North Texas community's settings, with node lists, messaging, a

@@ -182,9 +182,17 @@ decoder (`/usr/local/lib/rxd/js8.py`; how it works and how well, in
 - **Audio:** the speaker plays the band quietly (volume 0.2), and the browser
   UI and `rxd-tui -l` can listen, like any profile. The decoder takes the
   audio before the volume, so muting doesn't stop it.
-- **Compressed free text** needs JS8's JSC word table, which rx doesn't
-  ship. Without it, those words show as `……`; heartbeats, CQs, directed
-  commands, SNR reports, callsigns and grids all decode.
+- **Compressed free text** needs JS8's JSC word table. It is JS8Call's
+  (GPL-3), so rx doesn't carry it. setup.sh fetches it from JS8Call's
+  repository at a pinned commit, checks its SHA-256, and imports it into
+  `~/.local/share/rxd/js8/jsc_map.txt`. Without it, those words show as
+  `……`; heartbeats, CQs, directed commands, SNR reports, callsigns and grids
+  decode regardless.
+- **The map** in the Digital view plots the stations heard, at their grid
+  square, on offline tiles. Stations that never send a grid are placed from
+  an offline callsign database (FCC licences, else the country), which
+  setup.sh downloads and `maint` keeps current. Details in
+  [rxd/README.md](../rxd/README.md#station-map-and-the-callsign-database).
 
 JS8 and WSPR profiles warn if chrony is not synchronised: both modes'
 slots tolerate about 2 s of clock error and fail silently beyond it.

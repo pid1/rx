@@ -2285,6 +2285,7 @@ import re
 import signal
 import socket
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -5115,6 +5116,367 @@ def make_bands(rx, js8):
     return bp
 
 
+# ---------------------------------------------------------------------- map
+# The web UI's station map. Two endpoints, both read-only:
+#   GET /tiles/Z/X/Y.png  offline raster tiles (z/x/y, Web Mercator), from
+#                         $RXD_TILES or the tree setup.sh installs for
+#                         meshtastic-ui: ~/.portduino/default/maps/<style>/
+#                         (OSM standard style, zoom 1-6 worldwide). Nothing
+#                         is ever fetched from the internet.
+#   GET /tiles/info.json  whether there are tiles, and which zooms
+#   GET /api/stations     stations heard by JS8 and WSPR that have a grid,
+#                         one per mode and call, at their grid square's centre
+# Grids for JS8 stations come from their own heartbeats and CQs ("Q1ABC: @HB
+# HEARTBEAT FN31"), in rxd's JS8 logs: DIRECTED.TXT keeps the grid of those,
+# and ALL.TXT beside it has every frame, including those of messages that
+# never finished. Learned grids are kept in $RXD_GRIDS
+# (~/.local/share/rxd/grids.json) so a station that heartbeats once stays on
+# the map when it's heard again later. No online callsign lookups.
+
+TILE_DIRS = (os.environ.get("RXD_TILES", ""), "~/.portduino/default/maps", "/maps")
+TILE_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
+TILE_PATH = re.compile(r"^/tiles/(\d{1,2})/(\d{1,7})/(\d{1,7})\.(png|jpg|jpeg|webp)$")
+GRIDS_FILE = os.path.expanduser(os.environ.get("RXD_GRIDS", "~/.local/share/rxd/grids.json"))
+TILE_ATTRIBUTION = "\u00a9 OpenStreetMap contributors"
+
+
+def tile_root(dirs=TILE_DIRS):
+    """The first directory holding a z/x/y tree, as (path, sorted zooms), else (None, [])."""
+    for d in dirs:
+        if not d:
+            continue
+        d = os.path.expanduser(d)
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        zooms = sorted(int(n) for n in names if n.isdigit() and os.path.isdir(os.path.join(d, n)))
+        if zooms:
+            return os.path.realpath(d), zooms
+        # meshtastic-ui's layout: maps/<style>/z/x/y, OSM's style first
+        for style in sorted(names, key=lambda n: (n not in ("openstreetmap", "osm"), n)):
+            sub = os.path.join(d, style)
+            try:
+                zs = sorted(int(n) for n in os.listdir(sub) if n.isdigit())
+            except OSError:
+                continue
+            if zs:
+                return os.path.realpath(sub), zs
+    return None, []
+
+
+def tile_file(root, path):
+    """The file for /tiles/Z/X/Y.ext under root, or None for anything else."""
+    m = TILE_PATH.match(path)
+    if not root or not m:
+        return None, None
+    z, x, y = int(m[1]), int(m[2]), int(m[3])
+    if z > 22 or x >= 1 << z or y >= 1 << z:
+        return None, None
+    f = os.path.realpath(os.path.join(root, str(z), str(x), "%d.%s" % (y, m[4])))
+    if not f.startswith(root + os.sep) or not os.path.isfile(f):
+        return None, None
+    return f, TILE_TYPES[m[4]]
+
+
+def serve_tile(h, path):
+    root, zooms = getattr(h.server, "tile_root", None) or tile_root()
+    if path == "/tiles/info.json":
+        return h.send(200, {"available": bool(root), "zooms": zooms,
+                            "min": zooms[0] if zooms else None, "max": zooms[-1] if zooms else None,
+                            "attribution": TILE_ATTRIBUTION if root else None})
+    f, ctype = tile_file(root, path)
+    if not f:
+        return h.send(404, {"error": "no such tile"})
+    with open(f, "rb") as fh:
+        body = fh.read()
+    h.send_response(200)
+    h.send_header("Content-Type", ctype)
+    h.send_header("Content-Length", str(len(body)))
+    h.send_header("Cache-Control", "max-age=86400")
+    h.end_headers()
+    h.wfile.write(body)
+
+
+def js8_grid(text):
+    """(call, grid) from a JS8 heartbeat or CQ that carries one, else None."""
+    frm, _, body = (text or "").replace("\u2662", "").partition(":")
+    frm, words = frm.strip(), body.split()
+    if len(words) < 2 or not CALLSIGN.match(frm) or not GRID.match(words[-1]):
+        return None
+    if not {"HEARTBEAT", "CQ", "GRID"} & set(words[:-1]):
+        return None
+    g = words[-1]
+    return frm, g[:4].upper() + g[4:].lower()
+
+
+# ALL.TXT, one line per JS8 frame:
+# "2026-11-06 10:47:00-11  0.3  605 B  3+pVJzNoOkJW         3    WD4UQ: @HB HEARTBEAT EM88"
+JS8_ALL_LINE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\s*([+-]?\d+)\s+[+-]?\d+\.\d+\s+\d+\s+"
+                          r"\S\s+\S+\s+\d+\s+(.*\S)\s*$")
+
+
+def iso_utc(t):
+    """'2026-11-06 10:47:03' or '2026-11-06T12:20:00Z' (both UTC) -> '2026-11-06T10:47:03Z'."""
+    m = re.match(r"^(\d{4}-\d\d-\d\d)[ T](\d\d:\d\d)(:\d\d)?", t or "")
+    return "%sT%s%sZ" % (m[1], m[2], m[3] or ":00") if m else None
+
+
+# The offline callsign database rxd/callsign_db.py builds (FCC licences
+# geocoded to 6-character grids, ZIP centroids, and cty.dat prefixes for
+# everyone else). Read-only here; reopened when the updater replaces it.
+CALLSIGNS_DB = os.path.expanduser(os.environ.get("RXD_CALLSIGNS", "~/.local/share/rxd/callsigns.sqlite"))
+# call suffixes that say how, not where: /P portable, /M mobile, /QRP ...
+CALL_SUFFIXES = {"P", "M", "QRP", "QRPP", "A", "LH", "R", "B", "J", "Y"}
+
+
+class CallBook:
+    """call -> {"grid", "prec": "addr" | "zip" | "country", "region"}, or None."""
+
+    def __init__(self, path=None):
+        self.path = path or CALLSIGNS_DB
+        self.con = self.stamp = None
+        self.memo = {}
+
+    def db(self):
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            st = None
+        stamp = st and (st.st_ino, st.st_mtime_ns)
+        if stamp != self.stamp:
+            if self.con:
+                self.con.close()
+            self.con, self.stamp, self.memo = None, stamp, {}
+            if st:
+                try:
+                    self.con = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(self.path),
+                                               uri=True, check_same_thread=False)
+                    self.con.execute("SELECT 1 FROM calls LIMIT 1")
+                except sqlite3.Error as e:
+                    log("callsign database %s unusable: %s" % (self.path, e))
+                    self.con = None
+        return self.con
+
+    def country(self, con, s):
+        keys = ["=" + s] + [s[:n] for n in range(len(s), 0, -1)]
+        rows = dict((k, (g, e)) for k, g, e in con.execute(
+            "SELECT prefix, grid, entity FROM prefixes WHERE prefix IN (%s)" % ",".join("?" * len(keys)),
+            keys))
+        for k in keys:
+            if k in rows:
+                return {"grid": rows[k][0], "prec": "country", "region": rows[k][1]}
+        return None
+
+    def lookup(self, call):
+        con = self.db()
+        call = (call or "").strip().upper()
+        if not con or not call:
+            return None
+        if call in self.memo:
+            return self.memo[call]
+        try:
+            self.memo[call] = r = self.find(con, call)
+        except sqlite3.Error:
+            r = None
+        return r
+
+    def find(self, con, call):
+        parts = [p for p in call.split("/") if p]
+        if not parts or any(p in ("MM", "AM") for p in parts[1:]):
+            return None  # at sea or in the air
+        r = con.execute("SELECT grid, entity FROM prefixes WHERE prefix=?", ("=" + call,)).fetchone()
+        if r:
+            return {"grid": r[0], "prec": "country", "region": r[1]}
+        full = [p for p in parts if CALLSIGN.match(p)]
+        home = max(full, key=len) if full else parts[0]
+        rest = [p for p in parts if p != home and p not in CALL_SUFFIXES]
+        if rest:  # VE3/KA1PID, EA8/K1ABC, KA1PID/4: operating away from home
+            where = rest[0]
+            if where.isdigit():
+                where = home
+            return self.country(con, where)
+        r = con.execute("SELECT grid, prec, region FROM calls WHERE call=?", (home,)).fetchone()
+        if r:
+            return {"grid": r[0], "prec": r[1], "region": r[2]}
+        return self.country(con, home)
+
+
+class StationMap:
+    """Heard stations with a grid, merged per mode and call, for /api/stations."""
+
+    ALL_TAIL = 262144
+
+    def __init__(self, js8=None, wspr=None, all_path=None, grids_path=None, clock=time.time,
+                 me=None, book=None):
+        self.js8 = js8                # a Js8Feed (or anything with since())
+        self.book = book if book is not None else CallBook()  # the offline callsign database
+        self.wspr = wspr              # a callable returning the WsprDecoder or None
+        self.all_path = all_path if all_path is not None else \
+            os.path.join(os.path.dirname(JS8_LOG), "ALL.TXT")
+        self.grids_path = grids_path if grids_path is not None else GRIDS_FILE
+        self.clock = clock
+        self.me = me if me is not None else station_id()
+        self.lock = threading.Lock()
+        self.grids = {}               # call -> {"grid", "time"}
+        self.heard = {}               # call -> JS8 frames from ALL.TXT: {"time", "snr", "freq"}
+        self.all_pos = self.all_inode = None
+        self.dirty = False
+        try:
+            with open(self.grids_path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            self.grids = {c: v for c, v in doc.items()
+                          if isinstance(v, dict) and GRID.match(str(v.get("grid", "")))}
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    @staticmethod
+    def lines(src):
+        if src is None:
+            return []
+        lk = getattr(src, "lock", None)
+        if isinstance(getattr(src, "lines", None), collections.deque) and lk is not None:
+            if hasattr(src, "refresh"):
+                src.since(1 << 62)  # reads anything new in the log
+            with lk:
+                return list(src.lines)
+        return src.since(0).get("lines", [])
+
+    def learn(self, call, grid, t):
+        old = self.grids.get(call)
+        if old and (t or "") < (old.get("time") or ""):
+            return  # an older frame: keep the newer grid
+        if not old or old["grid"] != grid:
+            self.dirty = True
+        self.grids[call] = {"grid": grid, "time": t}
+
+    def read_all(self):
+        """New heartbeat and CQ frames with grids from ALL.TXT."""
+        try:
+            st = os.stat(self.all_path)
+        except OSError:
+            return
+        if self.all_inode != st.st_ino or (self.all_pos or 0) > st.st_size:
+            self.all_inode, self.all_pos = st.st_ino, max(st.st_size - self.ALL_TAIL, 0)
+        if self.all_pos == st.st_size:
+            return
+        with open(self.all_path, "rb") as fh:
+            fh.seek(self.all_pos)
+            data = fh.read()
+        cut = data.rfind(b"\n") + 1
+        self.all_pos += cut
+        for raw in data[:cut].decode("utf-8", "replace").split("\n"):
+            m = JS8_ALL_LINE.match(raw)
+            cg = m and js8_grid(m[3])
+            if cg:
+                t = iso_utc(m[1])
+                self.learn(cg[0], cg[1], t)
+                self.heard.setdefault(cg[0], []).append({"time": t, "snr": int(m[2])})
+                del self.heard[cg[0]][:-50]
+
+    def save(self):
+        if not self.dirty:
+            return
+        self.dirty = False
+        try:
+            os.makedirs(os.path.dirname(self.grids_path), exist_ok=True)
+            tmp = self.grids_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.grids, fh, sort_keys=True)
+            os.replace(tmp, self.grids_path)
+        except OSError as e:
+            log("can't save grids to %s: %s" % (self.grids_path, e))
+
+    def snapshot(self, hours=24.0):
+        cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock() - hours * 3600))
+        out, nogrid = {}, set()
+
+        def add(mode, call, grid, t, snr, freq=None, dbm=None):
+            if not t or t < cutoff:
+                return
+            src, region = "heard", None
+            if not grid:
+                # never heard with a grid: the callsign database, if it knows
+                found = self.book.lookup(call) if self.book else None
+                if not found:
+                    nogrid.add((mode, call))
+                    return
+                grid, src, region = found["grid"], found["prec"], found.get("region")
+            k = (mode, call)
+            s = out.get(k)
+            if s is None:
+                ll = grid_latlon(grid)
+                s = out[k] = {"call": call, "mode": mode, "grid": grid, "lat": round(ll[0], 4),
+                              "lon": round(ll[1], 4),
+                              "km": grid_km(self.me[1], grid) if src != "country" else None,
+                              "snr": snr, "last": t, "last_snr": snr, "freq": freq, "dbm": dbm,
+                              "src": src, "region": region}
+            if snr is not None and (s["snr"] is None or snr > s["snr"]):
+                s["snr"] = snr
+            if t >= s["last"]:
+                s["last"], s["last_snr"] = t, snr
+                if freq is not None:
+                    s["freq"] = freq
+                if dbm is not None:
+                    s["dbm"] = dbm
+                if grid != s["grid"] and src == "heard" == s["src"]:  # moved: plot it where it is now
+                    ll = grid_latlon(grid)
+                    s.update(grid=grid, lat=round(ll[0], 4), lon=round(ll[1], 4),
+                             km=grid_km(self.me[1], grid))
+
+        with self.lock:
+            self.read_all()
+            js8 = self.lines(self.js8)
+            for ln in js8:
+                cg = js8_grid(ln.get("text"))
+                if cg:
+                    self.learn(cg[0], cg[1], iso_utc(ln.get("time")))
+            wspr = self.wspr() if self.wspr else None
+            spots = self.lines(wspr)
+            for sp in spots:
+                if sp.get("grid") and sp.get("call"):
+                    self.learn(sp["call"], sp["grid"], sp.get("time"))
+            self.save()
+            grids = self.grids
+            for call, frames in self.heard.items():
+                for f in frames:
+                    add("js8", call, grids[call]["grid"], f["time"], f["snr"])
+            for ln in js8:
+                call = ln.get("from")
+                t = iso_utc(ln.get("time"))
+                if not call or not CALLSIGN.match(call):
+                    continue
+                g = grids.get(call)
+                add("js8", call, g and g["grid"], t, ln.get("snr"), ln.get("freq"))
+            for sp in spots:
+                call = sp.get("call")
+                g = sp.get("grid") or (grids.get(call) or {}).get("grid")
+                add("wspr", call, g, sp.get("time"), sp.get("snr"), sp.get("freq"), sp.get("dbm"))
+        stations = sorted(out.values(), key=lambda s: s["last"], reverse=True)
+        call, grid = self.me
+        ll = grid_latlon(grid)
+        me = {"call": call, "grid": grid, "lat": ll[0], "lon": ll[1]} if ll else None
+        return {"me": me, "hours": hours, "stations": stations,
+                "no_grid": {m: sum(1 for x in nogrid if x[0] == m and x not in out)
+                            for m in ("js8", "wspr")}}
+
+
+def serve_stations(h):
+    srv = h.server
+    if getattr(srv, "stations", None) is None:
+        srv.stations = StationMap(js8=getattr(srv, "js8", None), wspr=lambda: srv.rx.wspr)
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(h.path).query)
+    try:
+        hours = float(q.get("hours", ["24"])[0])
+        if not 0 < hours <= 24 * 30:
+            raise ValueError
+    except ValueError:
+        return h.send(400, {"error": "hours must be a number from 0 to 720"})
+    doc = srv.stations.snapshot(hours)
+    doc["decoder"] = srv.rx.s.decoder
+    return h.send(200, doc)
+
+
 # The browser UI: $RXD_WEB, where setup.sh installs it, or beside this file in
 # a checkout. Read on every request so a reinstall needs no restart.
 WEB_PATHS = (os.environ.get("RXD_WEB", ""), "/usr/local/share/rxd/index.html",
@@ -5176,6 +5538,10 @@ class Api(BaseHTTPRequestHandler):
             return self.audio()
         if path == "/api/bands":
             return self.bands_get()
+        if path.startswith("/tiles/"):
+            return serve_tile(self, path)
+        if path == "/api/stations":
+            return serve_stations(self)
         if path in ("/", "/index.html"):
             page = web_page()
             if page is None:
@@ -8590,6 +8956,30 @@ body[data-view=listen] #gWhy{display:none}
 .bpstep .val{text-align:center;font-size:20px;font-weight:700}
 .bpcred{font-size:14px;color:var(--dim);margin:6px 0 0}
 .bpcred a{color:var(--accent)}
+/* ---------------------------------------------------------------- station map (map helper) */
+.mapc .btn.wide{margin-top:0}
+.mapv{position:relative;height:min(62vh,520px);margin-top:8px;border:1px solid var(--line);border-radius:10px;overflow:hidden;
+  background:var(--plot);touch-action:none;user-select:none;-webkit-user-select:none;cursor:grab}
+@media (min-width:900px){.mapv{height:min(70vh,640px)}}
+.mtiles{position:absolute;inset:0;overflow:hidden;isolation:isolate}
+.mtiles img{position:absolute;left:0;top:0;pointer-events:none;-webkit-user-drag:none;max-width:none}
+:root[data-theme=dark] .mtiles img{filter:invert(1) hue-rotate(180deg) brightness(.8) contrast(.9)}
+@media (prefers-color-scheme:dark){:root[data-theme=auto] .mtiles img{filter:invert(1) hue-rotate(180deg) brightness(.8) contrast(.9)}}
+/* Night: grey, inverted (dark land), then multiplied by pure red, so no tile pixel can be anything but red or black */
+:root[data-theme=night] .mtiles img{filter:grayscale(1) invert(1) brightness(.85) contrast(1.15)}
+:root[data-theme=night] .mtiles::after{content:"";position:absolute;inset:0;background:#f00;mix-blend-mode:multiply;z-index:1}
+.mapv canvas{position:absolute;inset:0;width:100%;height:100%;background:transparent;border-radius:0;touch-action:none;cursor:inherit}
+.mattr{position:absolute;right:0;bottom:0;font-size:13px;font-weight:600;padding:1px 6px;background:var(--panel);color:var(--dim);border-top-left-radius:6px;opacity:.9}
+.mctl{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}
+.mctl .btn{font-size:19px;padding:2px;min-width:0}
+.mleg{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:8px;font-size:17px;font-weight:650}
+.mleg .s{font-size:20px;margin-right:4px}
+.mk-js8{color:var(--accent)}.mk-wspr{color:var(--mark)}.mk-me{color:var(--fg)}.mk-hollow{color:var(--dim)}.mleg .s.big{font-size:28px;line-height:20px}
+.minfo{margin-top:8px;border-top:1px solid var(--line);padding-top:6px;font-size:17px}
+.minfo .mi+.mi{border-top:1px solid var(--line);margin-top:6px;padding-top:6px}
+.minfo .mc{font-size:22px;font-weight:750;margin-right:8px}
+.minfo .mm{font-size:15px;font-weight:800;border:2px solid currentColor;border-radius:6px;padding:0 5px}
+.minfo .md{display:block;font-size:17px;color:var(--dim);font-weight:600}
 </style>
 </head>
 <body>
@@ -8679,6 +9069,25 @@ body[data-view=listen] #gWhy{display:none}
   <div id="wRepSl" class="wrep" hidden><div class="lbl"><span>Report spots to WSPRnet</span><span id="wRepS" class="val">—</span></div>
     <div class="row2" role="group" aria-label="Report spots to WSPRnet"><button type="button" class="btn" id="wRepOff">Off</button><button type="button" class="btn" id="wRepOn">On</button></div>
     <p id="wMsg" class="msg" role="status" hidden></p></div>
+</section>
+<section class="card mapc" id="mapCard" data-v="digital" data-live>
+  <button type="button" class="btn wide" id="mapTog" aria-expanded="false" aria-controls="mapBody">▸ Show map of stations</button>
+  <div id="mapBody" hidden>
+    <div class="mapv" id="mapV" role="application" aria-label="Map of stations heard. Drag to pan, pinch or use the buttons to zoom, tap a station for its details.">
+      <div class="mtiles" id="mTiles"></div>
+      <canvas id="mCan"></canvas>
+      <div class="mattr" id="mAttr" hidden></div>
+    </div>
+    <div class="mctl" role="group" aria-label="Map controls">
+      <button type="button" class="btn" id="mOut" aria-label="Zoom out">−</button>
+      <button type="button" class="btn" id="mIn" aria-label="Zoom in">+</button>
+      <button type="button" class="btn" id="mFit">Fit all</button>
+      <button type="button" class="btn" id="mPath" aria-pressed="false">Paths</button>
+    </div>
+    <div class="mleg" id="mLeg"></div>
+    <div class="minfo" id="mInfo" role="status" aria-live="polite"></div>
+    <p class="jmsg" id="mMsg"></p>
+  </div>
 </section>
 <section class="card" id="js8" data-v="digital manual" data-live hidden>
   <div class="lbl"><span>JS8 decodes, newest first</span><span id="jCount"></span></div>
@@ -10277,6 +10686,440 @@ $("bpDwDn").onclick = () => stepDwell(-1);
 $("bpDwUp").onclick = () => stepDwell(1);
 $("bpScan").onclick = () => postBands({scan: true});
 
+// ---------------------------------------------------------------- station map (map helper)
+// A small pan/zoom map of the stations heard, in the Digital view. Stations
+// sit at the centre of their Maidenhead grid square (from /api/stations),
+// never anywhere more precise. Tiles are rxd's own offline tiles
+// (/tiles/Z/X/Y.png); with none, or past their zoom, Maidenhead grid lines
+// still draw. Tiles load only while the map is open.
+// map:projection begin
+const MTILE = 256;
+// Web Mercator, in pixels of a world 256 * 2^z wide.
+function mercX(lon, z) { return (lon + 180) / 360 * MTILE * Math.pow(2, z); }
+function mercY(lat, z) {
+  const s = Math.sin(Math.max(-85.05112878, Math.min(85.05112878, lat)) * Math.PI / 180);
+  return (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * MTILE * Math.pow(2, z);
+}
+function unmercY(y, z) {
+  const n = Math.PI - 2 * Math.PI * y / (MTILE * Math.pow(2, z));
+  return Math.atan(Math.sinh(n)) * 180 / Math.PI;
+}
+// n+1 points along the great circle from a to b, [[lat, lon], ...]
+function greatCircle(lat1, lon1, lat2, lon2, n) {
+  const r = Math.PI / 180, p1 = lat1 * r, l1 = lon1 * r, p2 = lat2 * r, l2 = lon2 * r;
+  const d = 2 * Math.asin(Math.sqrt(Math.pow(Math.sin((p2 - p1) / 2), 2) +
+    Math.cos(p1) * Math.cos(p2) * Math.pow(Math.sin((l2 - l1) / 2), 2)));
+  const out = [];
+  for (let i = 0; i <= n; i++) {
+    const f = i / n;
+    if (d < 1e-9) { out.push([lat1, lon1]); continue; }
+    const A = Math.sin((1 - f) * d) / Math.sin(d), B = Math.sin(f * d) / Math.sin(d);
+    const x = A * Math.cos(p1) * Math.cos(l1) + B * Math.cos(p2) * Math.cos(l2);
+    const y = A * Math.cos(p1) * Math.sin(l1) + B * Math.cos(p2) * Math.sin(l2);
+    const zz = A * Math.sin(p1) + B * Math.sin(p2);
+    out.push([Math.atan2(zz, Math.sqrt(x * x + y * y)) / r, Math.atan2(y, x) / r]);
+  }
+  return out;
+}
+// map:projection end
+
+const M = {
+  open: load("map") === "1", paths: load("mapPaths") === "1",
+  doc: null, tiles: null, z: 4, cx: 0.5, cy: 0.5, fitted: false,
+  imgs: new Map(), sel: null, timer: 0, raf: 0, col: {}, busy: false
+};
+const mapV = $("mapV"), mCan = $("mCan"), mTiles = $("mTiles");
+const MZMIN = 0, MZMAX = 10;
+const MODE = {js8: ["JS8", "●", "js8"], wspr: ["WSPR", "▲", "wspr"]};
+
+function mapShown() { return M.open && !$("mapCard").hidden && !document.hidden; }
+function mapColors() {
+  const cs = getComputedStyle(document.documentElement);
+  for (const k of ["accent", "mark", "fg", "bg", "panel", "dim", "line", "grid", "plot"]) M.col[k] = cs.getPropertyValue("--" + k).trim();
+}
+function worldW(z) { return MTILE * Math.pow(2, z); }
+// a point to screen pixels (CSS px), the copy of it nearest the centre
+function toScreen(lat, lon, w, h) {
+  const W = worldW(M.z);
+  let dx = mercX(lon, M.z) / W - M.cx;
+  dx -= Math.round(dx);
+  return [w / 2 + dx * W, h / 2 + (mercY(lat, M.z) / W - M.cy) * W];
+}
+function clampView() {
+  M.z = Math.max(MZMIN, Math.min(MZMAX, M.z));
+  M.cx -= Math.floor(M.cx);
+  const h = mapV.clientHeight / worldW(M.z) / 2;
+  M.cy = h >= 0.5 ? 0.5 : Math.max(h, Math.min(1 - h, M.cy));
+}
+function zoomAt(f, sx, sy) {
+  const w = mapV.clientWidth, h = mapV.clientHeight, W0 = worldW(M.z);
+  const wx = M.cx + (sx - w / 2) / W0, wy = M.cy + (sy - h / 2) / W0;
+  M.z = Math.max(MZMIN, Math.min(MZMAX, M.z + Math.log2(f)));
+  const W1 = worldW(M.z);
+  M.cx = wx - (sx - w / 2) / W1; M.cy = wy - (sy - h / 2) / W1;
+  clampView(); mapDraw();
+}
+function mapFit() {
+  const pts = [];
+  const d = M.doc;
+  if (d && d.me) pts.push([d.me.lat, d.me.lon]);
+  if (d) for (const s of d.stations) if (s.src !== "country") pts.push([s.lat, s.lon]);
+  const w = mapV.clientWidth || 360, h = mapV.clientHeight || 400;
+  if (pts.length < 2) {
+    M.z = pts.length ? 4 : MZMIN;
+    M.cx = pts.length ? mercX(pts[0][1], 0) / MTILE : 0.5;
+    M.cy = pts.length ? mercY(pts[0][0], 0) / MTILE : 0.5;
+  } else {
+    // longitudes around the station, so a path across the date line fits
+    const ref = pts[0][1];
+    const xs = pts.map(p => mercX(ref + ((p[1] - ref + 540) % 360 - 180), 0) / MTILE), ys = pts.map(p => mercY(p[0], 0) / MTILE);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    const pad = 56;
+    const zx = Math.log2((w - 2 * pad) / MTILE / Math.max(x1 - x0, 1e-6));
+    const zy = Math.log2((h - 2 * pad) / MTILE / Math.max(y1 - y0, 1e-6));
+    M.z = Math.min(zx, zy, 7);
+    M.cx = (x0 + x1) / 2; M.cy = (y0 + y1) / 2;
+  }
+  clampView(); mapDraw();
+}
+
+function mapDraw() {
+  if (M.raf) return;
+  M.raf = requestAnimationFrame(() => { M.raf = 0; drawTiles(); drawOverlay(); });
+}
+function drawTiles() {
+  const t = M.tiles, want = new Set();
+  const w = mapV.clientWidth, h = mapV.clientHeight;
+  if (t && t.available && w && h) {
+    const tz = Math.max(t.min, Math.min(t.max, Math.round(M.z)));
+    const n = Math.pow(2, tz), ts = MTILE * Math.pow(2, M.z - tz), W = worldW(M.z);
+    const ox = w / 2 - M.cx * W, oy = h / 2 - M.cy * W;  // screen position of the world's corner
+    const i0 = Math.floor(-ox / ts), i1 = Math.floor((w - ox) / ts);
+    const j0 = Math.max(0, Math.floor(-oy / ts)), j1 = Math.min(n - 1, Math.floor((h - oy) / ts));
+    for (let i = i0; i <= i1; i++) {
+      for (let j = j0; j <= j1; j++) {
+        const x = ((i % n) + n) % n, key = tz + "/" + i + "/" + j;
+        want.add(key);
+        let img = M.imgs.get(key);
+        if (!img) {
+          img = new Image();
+          img.alt = ""; img.decoding = "async";
+          img.onerror = () => { img.style.visibility = "hidden"; };
+          img.src = "/tiles/" + tz + "/" + x + "/" + j + ".png";
+          M.imgs.set(key, img); mTiles.appendChild(img);
+        }
+        const l = Math.floor(ox + i * ts), tp = Math.floor(oy + j * ts);
+        img.style.left = l + "px"; img.style.top = tp + "px";
+        img.style.width = (Math.ceil(ox + (i + 1) * ts) - l) + "px";
+        img.style.height = (Math.ceil(oy + (j + 1) * ts) - tp) + "px";
+      }
+    }
+  }
+  for (const [k, img] of M.imgs) if (!want.has(k)) { img.remove(); M.imgs.delete(k); }
+  const a = $("mAttr");
+  a.hidden = !(t && t.available && t.attribution);
+  if (!a.hidden) setText(a, t.attribution);
+}
+function fieldName(lon, lat) {
+  return String.fromCharCode(65 + Math.floor((lon + 180) / 20)) + String.fromCharCode(65 + Math.floor((lat + 90) / 10));
+}
+function drawGrid(g, w, h) {
+  const tiles = M.tiles && M.tiles.available;
+  const W = worldW(M.z);
+  const latTop = unmercY((M.cy - h / 2 / W) * W, M.z), latBot = unmercY((M.cy + h / 2 / W) * W, M.z);
+  const lonL = (M.cx - w / 2 / W) * 360 - 180, lonR = (M.cx + w / 2 / W) * 360 - 180;
+  const squares = M.z >= 5.5;
+  g.lineWidth = 1;
+  g.strokeStyle = tiles ? M.col.dim : M.col.line;
+  g.globalAlpha = tiles ? 0.35 : 1;
+  g.beginPath();
+  const dLon = squares ? 2 : 20, dLat = squares ? 1 : 10;
+  for (let lon = Math.floor(lonL / dLon) * dLon; lon <= lonR; lon += dLon) {
+    const x = Math.round(w / 2 + ((lon + 180) / 360 - M.cx) * W) + 0.5;
+    g.moveTo(x, 0); g.lineTo(x, h);
+  }
+  for (let lat = Math.max(-80, Math.floor(latBot / dLat) * dLat); lat <= Math.min(80, latTop); lat += dLat) {
+    const y = Math.round(h / 2 + (mercY(lat, M.z) / W - M.cy) * W) + 0.5;
+    g.moveTo(0, y); g.lineTo(w, y);
+  }
+  g.stroke();
+  if (squares) {  // field lines heavier over the squares
+    g.lineWidth = 2; g.beginPath();
+    for (let lon = Math.floor(lonL / 20) * 20; lon <= lonR; lon += 20) {
+      const x = Math.round(w / 2 + ((lon + 180) / 360 - M.cx) * W);
+      g.moveTo(x, 0); g.lineTo(x, h);
+    }
+    for (let lat = Math.max(-80, Math.floor(latBot / 10) * 10); lat <= Math.min(80, latTop); lat += 10) {
+      const y = Math.round(h / 2 + (mercY(lat, M.z) / W - M.cy) * W);
+      g.moveTo(0, y); g.lineTo(w, y);
+    }
+    g.stroke();
+  }
+  // labels: fields, or squares when zoomed in far enough to read them
+  g.globalAlpha = tiles ? 0.75 : 1;
+  g.fillStyle = M.col.dim;
+  g.font = "600 15px system-ui,sans-serif";
+  g.textBaseline = "top";
+  // only where a cell is wide enough for its name
+  if (dLon / 360 * W >= (squares ? 48 : 34)) {
+    for (let lon = Math.floor(lonL / dLon) * dLon; lon <= lonR; lon += dLon) {
+      for (let lat = Math.max(-90, Math.floor(latBot / dLat) * dLat); lat < Math.min(90, latTop); lat += dLat) {
+        const lo = ((lon + 180) % 360 + 360) % 360 - 180;
+        const x = w / 2 + ((lon + 180) / 360 - M.cx) * W + 4;
+        const y = h / 2 + (mercY(lat + dLat, M.z) / W - M.cy) * W + 3;
+        const name = fieldName(lo, lat) + (squares ? Math.floor(((lo + 180) % 20) / 2) + "" + Math.floor((lat + 90) % 10) : "");
+        g.fillText(name, x, Math.max(y, 3));
+      }
+    }
+  }
+  g.globalAlpha = 1;
+}
+// where a position came from: the station's own grid, or the callsign database
+const SRC = {addr: "Approx. location: licence address, to the grid square", zip: "Approx. location: licence ZIP code",
+  country: "Country only, from the callsign prefix"};
+function marker(g, mode, x, y, r, src) {
+  g.beginPath();
+  if (mode === "wspr") { g.moveTo(x, y - r * 1.25); g.lineTo(x + r * 1.15, y + r * 0.8); g.lineTo(x - r * 1.15, y + r * 0.8); g.closePath(); }
+  else if (mode === "me") g.rect(x - r, y - r, 2 * r, 2 * r);
+  else g.arc(x, y, r, 0, 2 * Math.PI);
+  const c = mode === "wspr" ? M.col.mark : mode === "me" ? M.col.fg : M.col.accent;
+  if (src && src !== "heard") {  // hollow: not the station's own grid
+    g.fillStyle = M.col.panel; g.fill();
+    g.lineWidth = 3; g.strokeStyle = c;
+    if (src === "country") g.setLineDash([3, 3]);
+    g.stroke(); g.setLineDash([]);
+    return;
+  }
+  g.fillStyle = c;
+  g.fill();
+  g.lineWidth = 2.5; g.strokeStyle = M.col.panel; g.stroke();
+}
+function drawOverlay() {
+  fit(mCan);
+  const g = mCan.getContext("2d"), d = dpr(), w = mCan.width / d, h = mCan.height / d;
+  g.setTransform(d, 0, 0, d, 0, 0);
+  g.clearRect(0, 0, w, h);
+  drawGrid(g, w, h);
+  const doc = M.doc;
+  if (!doc) return;
+  const me = doc.me, pts = [];
+  if (M.paths && me) {
+    g.lineWidth = 2; g.globalAlpha = 0.7;
+    for (const s of doc.stations) {
+      if (s.src === "country") continue;  // a country's centre isn't a path
+      g.strokeStyle = s.mode === "wspr" ? M.col.mark : M.col.accent;
+      g.setLineDash(s.mode === "wspr" ? [6, 4] : []);
+      g.beginPath();
+      let prev = null;
+      const gc = greatCircle(me.lat, me.lon, s.lat, s.lon, 48);
+      const [mx] = toScreen(me.lat, me.lon, w, h), W = worldW(M.z);
+      let base = mx - mercX(me.lon, M.z), lonPrev = me.lon;
+      for (const [la, lo] of gc) {
+        // keep the line continuous across the date line
+        let dl = lo - lonPrev; if (dl > 180) base -= W; else if (dl < -180) base += W;
+        lonPrev = lo;
+        const x = base + mercX(lo, M.z), y = h / 2 + (mercY(la, M.z) / W - M.cy) * W;
+        if (prev) g.lineTo(x, y); else g.moveTo(x, y);
+        prev = [x, y];
+      }
+      g.stroke();
+    }
+    g.setLineDash([]); g.globalAlpha = 1;
+  }
+  // oldest first, so the newest draw on top
+  const list = doc.stations.slice().reverse();
+  for (const s of list) {
+    const [x, y] = toScreen(s.lat, s.lon, w, h);
+    if (x < -20 || y < -20 || x > w + 20 || y > h + 20) continue;
+    marker(g, s.mode, x, y, 8, s.src);
+    pts.push([x, y, s]);
+  }
+  if (me) {
+    const [x, y] = toScreen(me.lat, me.lon, w, h);
+    marker(g, "me", x, y, 8);
+    pts.push([x, y, null]);
+  }
+  // call labels, newest first, skipping any that would overlap
+  g.font = "700 15px system-ui,sans-serif"; g.textBaseline = "middle";
+  const boxes = [];
+  for (const [x, y, s] of pts.slice().reverse()) {
+    const t = s ? s.call : (me.call || "You") + " (you)", tw = g.measureText(t).width;
+    const b = [x + 12, y - 9, x + 16 + tw, y + 9];
+    if (boxes.some(o => b[0] < o[2] && b[2] > o[0] && b[1] < o[3] && b[3] > o[1])) continue;
+    boxes.push(b);
+    g.lineWidth = 4; g.strokeStyle = M.col.panel; g.lineJoin = "round"; g.strokeText(t, x + 13, y);
+    g.fillStyle = M.col.fg; g.fillText(t, x + 13, y);
+  }
+  if (M.sel) {
+    g.lineWidth = 3; g.strokeStyle = M.col.fg;
+    const shown = M.sel.slice(0, 6);  // the ones the details list
+    for (const [x, y, s] of pts) if (shown.indexOf(s) >= 0) { g.beginPath(); g.arc(x, y, 15, 0, 2 * Math.PI); g.stroke(); }
+  }
+  M.pts = pts;
+}
+
+function fmtDist(km) { return typeof km === "number" ? Math.round(km * 0.621371).toLocaleString() + " mi · " + km.toLocaleString() + " km" : null; }
+function renderInfo() {
+  const box = $("mInfo");
+  box.textContent = "";
+  if (!M.sel || !M.sel.length) { box.textContent = M.doc && M.doc.stations.length ? "Tap a station for its details." : ""; return; }
+  for (const s of M.sel.slice(0, 6)) {
+    const div = document.createElement("div"); div.className = "mi";
+    const add = (cls, t, parent) => { const e = document.createElement("span"); e.className = cls; e.textContent = t; (parent || div).appendChild(e); return e; };
+    if (s === null) {
+      const me = M.doc.me;
+      add("mc", me.call || "This station");
+      add("mm mk-me", "■ You");
+      add("md", "Grid " + me.grid);
+    } else {
+      const m = MODE[s.mode] || [s.mode, "●", ""];
+      add("mc", s.call);
+      add("mm mk-" + m[2], m[1] + " " + m[0]);
+      const dist = fmtDist(s.km), approx = s.src && s.src !== "heard";
+      if (s.src === "country") add("md", (s.region || "Country") + " · " + SRC.country);
+      else add("md", "Grid " + s.grid + (dist ? " · " + (approx ? "about " : "") + dist : ""));
+      if (s.src === "addr" || s.src === "zip") add("md", SRC[s.src] + (s.region ? " (" + s.region + ")" : ""));
+      add("md", "Last heard " + lineTime(s.last) + (typeof s.last_snr === "number" ? " at " + signed(s.last_snr) + " dB" : ""));
+      const extra = [];
+      if (typeof s.snr === "number") extra.push("Best SNR " + signed(s.snr) + " dB");
+      if (typeof s.dbm === "number") extra.push(fmtPower(s.dbm));
+      if (extra.length) add("md", extra.join(" · "));
+    }
+    box.appendChild(div);
+  }
+  if (M.sel.length > 6) { const p = document.createElement("div"); p.className = "md"; p.textContent = "and " + (M.sel.length - 6) + " more here: zoom in."; box.appendChild(p); }
+}
+function mapTap(sx, sy) {
+  const hits = (M.pts || []).filter(([x, y]) => Math.hypot(x - sx, y - sy) <= 28);
+  M.sel = hits.length ? hits.sort((a, b) => Math.hypot(a[0] - sx, a[1] - sy) - Math.hypot(b[0] - sx, b[1] - sy)).map(p => p[2]) : null;
+  renderInfo(); mapDraw();
+}
+function renderLegend() {
+  const doc = M.doc, leg = $("mLeg");
+  leg.textContent = "";
+  const add = (cls, sym, text) => {
+    const e = document.createElement("span");
+    const s = document.createElement("span"); s.className = "s " + cls; s.textContent = sym;
+    e.append(s, text); leg.appendChild(e);
+  };
+  if (doc && doc.me) add("mk-me", "■", (doc.me.call || "You") + " · " + doc.me.grid);
+  const dec = doc ? doc.decoder : null;
+  for (const k of ["js8", "wspr"]) {
+    const n = doc ? doc.stations.filter(s => s.mode === k).length : 0;
+    if (n || k === dec) add("mk-" + k, MODE[k][1], MODE[k][0] + " · " + n + (n === 1 ? " station" : " stations"));
+  }
+  const nLook = doc ? doc.stations.filter(s => s.src === "addr" || s.src === "zip").length : 0;
+  const nCty = doc ? doc.stations.filter(s => s.src === "country").length : 0;
+  if (nLook) add("mk-hollow", "○", "Approx., from licence · " + nLook);
+  if (nCty) add("mk-hollow big", "◌", "Country only · " + nCty);
+  const msgs = [];
+  if (doc) {
+    for (const k of ["js8", "wspr"]) {
+      const n = doc.no_grid && doc.no_grid[k];
+      if (n) msgs.push(n + " " + MODE[k][0] + (n === 1 ? " station" : " stations") + " heard without a grid, not on the map.");
+    }
+    msgs.unshift("Stations heard in the last " + doc.hours + " hours, at the centre of their grid square." +
+      (nLook || nCty ? " Hollow markers are stations that never sent a grid, placed from the offline callsign database; country-only ones aren't counted by Fit all." : ""));
+  }
+  const t = M.tiles;
+  if (t) msgs.push(t.available ? "Map tiles: offline, zoom " + t.min + "–" + t.max + "." : "No map tiles on this rxd: grid lines only.");
+  setText($("mMsg"), msgs.join(" "));
+}
+async function mapPoll() {
+  clearTimeout(M.timer);
+  if (!M.open) return;
+  if (mapShown() && !M.busy) {
+    M.busy = true;
+    try {
+      if (!M.tiles) { const r = await api("/tiles/info.json"); if (r.ok && r.doc) M.tiles = r.doc; else if (r.status === 404) M.tiles = {available: false}; }
+      const r = await api("/api/stations");
+      if (r.ok && r.doc && Array.isArray(r.doc.stations)) {
+        M.doc = r.doc;
+        if (M.sel) {  // keep the selection on the same stations
+          const keys = new Set(M.sel.map(s => s ? s.mode + s.call : "me"));
+          M.sel = (M.doc.me && keys.has("me") ? [null] : []).concat(M.doc.stations.filter(s => keys.has(s.mode + s.call)));
+          if (!M.sel.length) M.sel = null;
+        }
+        if (!M.fitted) { M.fitted = true; mapFit(); }
+        renderLegend(); renderInfo(); mapDraw();
+      }
+    } catch (e) {}
+    M.busy = false;
+  }
+  M.timer = setTimeout(mapPoll, 15000);
+}
+function renderMapOpen() {
+  const b = $("mapTog");
+  b.setAttribute("aria-expanded", String(M.open));
+  b.textContent = M.open ? "▾ Hide map" : "▸ Show map of stations";
+  $("mapBody").hidden = !M.open;
+  $("mPath").setAttribute("aria-pressed", String(M.paths));
+  $("mPath").textContent = M.paths ? "✓ Paths" : "Paths";
+  if (!M.open) { clearTimeout(M.timer); for (const img of M.imgs.values()) img.remove(); M.imgs.clear(); }
+}
+$("mapTog").onclick = () => {
+  M.open = !M.open; store("map", M.open ? "1" : "0");
+  renderMapOpen();
+  if (M.open) { mapColors(); mapDraw(); mapPoll(); }
+};
+$("mIn").onclick = () => zoomAt(2, mapV.clientWidth / 2, mapV.clientHeight / 2);
+$("mOut").onclick = () => zoomAt(0.5, mapV.clientWidth / 2, mapV.clientHeight / 2);
+$("mFit").onclick = mapFit;
+$("mPath").onclick = () => { M.paths = !M.paths; store("mapPaths", M.paths ? "1" : "0"); renderMapOpen(); mapDraw(); };
+
+// drag to pan, pinch to zoom, tap to pick; the wheel zooms on a desktop
+const mp = new Map();
+let mTapAt = null, mPinch = null;
+function mRel(e) { const r = mapV.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }
+mapV.addEventListener("pointerdown", e => {
+  try { mapV.setPointerCapture(e.pointerId); } catch (err) {}
+  mp.set(e.pointerId, mRel(e));
+  mTapAt = mp.size === 1 ? mRel(e) : null;
+  mPinch = null;
+});
+mapV.addEventListener("pointermove", e => {
+  if (!mp.has(e.pointerId)) return;
+  const prev = mp.get(e.pointerId), cur = mRel(e);
+  if (mTapAt && Math.hypot(cur[0] - mTapAt[0], cur[1] - mTapAt[1]) > 8) mTapAt = null;
+  if (mp.size === 1) {
+    const W = worldW(M.z);
+    M.cx -= (cur[0] - prev[0]) / W; M.cy -= (cur[1] - prev[1]) / W;
+    mp.set(e.pointerId, cur); clampView(); mapDraw();
+  } else if (mp.size === 2) {
+    mp.set(e.pointerId, cur);
+    const [a, b] = [...mp.values()];
+    const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], dist = Math.max(1, Math.hypot(a[0] - b[0], a[1] - b[1]));
+    if (mPinch) {
+      const W = worldW(M.z);
+      M.cx -= (mid[0] - mPinch.mid[0]) / W; M.cy -= (mid[1] - mPinch.mid[1]) / W;
+      zoomAt(dist / mPinch.dist, mid[0], mid[1]);
+    }
+    mPinch = {mid, dist};
+  }
+});
+function mUp(e) {
+  if (!mp.has(e.pointerId)) return;
+  mp.delete(e.pointerId);
+  if (mTapAt && e.type === "pointerup") mapTap(mTapAt[0], mTapAt[1]);
+  mTapAt = null; mPinch = null;
+}
+mapV.addEventListener("pointerup", mUp);
+mapV.addEventListener("pointercancel", mUp);
+mapV.addEventListener("wheel", e => {
+  e.preventDefault();
+  const [x, y] = mRel(e);
+  zoomAt(Math.pow(2, -e.deltaY / (e.deltaMode ? 3 : 300)), x, y);
+}, {passive: false});
+mapV.addEventListener("dblclick", e => { const [x, y] = mRel(e); zoomAt(2, x, y); });
+
+// redraw for a new size (the card shown again, a rotation) or appearance
+if (window.ResizeObserver) new ResizeObserver(() => { if (M.open && mapV.clientWidth) { clampView(); mapDraw(); mapPoll(); } }).observe(mapV);
+new MutationObserver(() => { mapColors(); if (M.open) mapDraw(); }).observe(document.documentElement, {attributes: true, attributeFilter: ["data-theme"]});
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => { mapColors(); if (M.open) mapDraw(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && M.open) mapPoll(); });
+mapColors(); renderMapOpen(); renderInfo();
+if (M.open) mapPoll();
+
 // ---------------------------------------------------------------- start
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
@@ -10297,8 +11140,765 @@ pollStatus();
 RXDWEB
     log "installed the rxd browser UI"
 
-    # rxd's own JS8 decoder, which a JS8 profile with "js8_engine": "rxd"
-    # uses instead of the JS8Call desktop app. rxd loads it from here.
+    # The offline callsign database behind the station map: callsign -> grid
+    # for stations that never send one (FCC licences geocoded to 6-character
+    # grids, ZIP centroids, cty.dat prefixes for everyone else). It is built
+    # weekly on GitHub (.github/workflows/callsigns.yml); here callsign_db.py
+    # only downloads the published build, checks it and swaps it in, as the
+    # desktop user, into ~/.local/share/rxd/callsigns.sqlite. A failure keeps
+    # the database already there; the map works without one.
+    write_file /usr/local/share/rxd/callsign_db.py 0644 <<'RXDCALLDB'
+#!/usr/bin/env python3
+"""callsign_db: an offline callsign -> Maidenhead grid database for rxd's map.
+
+  callsign_db.py update [--db PATH] [--work DIR] [--force] [--summary FILE]
+                                       build it (the weekly GitHub workflow,
+                                       .github/workflows/callsigns.yml)
+  callsign_db.py validate DB [--previous DB]   the gate before publishing
+  callsign_db.py install [--db PATH]   fetch the published build (the Pi:
+                                       setup.sh runs this; nothing else does)
+  callsign_db.py lookup CALL [...]     what the database says (via rxd's own lookup)
+  callsign_db.py info                  sources, counts and build time
+
+The build runs on GitHub, not the Pi: the workflow publishes the database as
+the release asset data-callsigns/callsigns.sqlite.gz with a .sha256 beside it,
+and the Pi only downloads that.
+
+JS8 stations often never send a grid. This builds a local database so rxd can
+still place them, with nothing looked up online while rxd runs:
+
+  US calls  FCC ULS amateur licences (public domain), the weekly l_amat.zip:
+            HD.dat for active licences, EN.dat for the licence address. Each
+            address is geocoded once, at build time, by the US Census Bureau's
+            batch geocoder, and only the 6-character grid is kept ("addr").
+            Addresses it can't place (PO boxes, rural routes) fall back to the
+            grid of the ZIP code's centroid from the Census Gazetteer ZCTA file
+            (public domain), flagged "zip".
+  Others    callsign prefix -> DXCC entity centre from AD1C's Big CTY cty.dat
+            (country-files.com, MIT licence), flagged "country".
+
+Privacy: the database keeps only call, grid, precision and state or entity.
+No names, street addresses or FRNs. The geocode cache keeps a hash of each
+address (to notice when one changes) and its grid, never the address. The
+raw downloads are deleted once a build has used them completely.
+
+update is idempotent and polite: each source is fetched only when its ETag or
+Last-Modified changed, geocoding is resumable (results are cached per batch),
+and the new database is written to a temporary file and renamed over the old
+one, so a failure anywhere keeps the old database.
+
+Standard library only. Python 3.9+.
+"""
+import argparse
+import csv
+import fcntl
+import hashlib
+import hmac
+import io
+import os
+import re
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+import zipfile
+
+FCC_URL = "https://data.fcc.gov/download/pub/uls/complete/l_amat.zip"
+ZCTA_URL = ("https://www2.census.gov/geo/docs/maps-data/data/gazetteer/"
+            "2025_Gazetteer/2025_Gaz_zcta_national.zip")
+CTY_URL = "https://www.country-files.com/bigcty/cty.dat"
+GEOCODER_URL = "https://geocoding.geo.census.gov/geocoder/locations/addressbatch"
+USER_AGENT = "rxd-callsign-db/1 (offline map for an amateur receiver)"
+
+DB_PATH = os.path.expanduser(os.environ.get("RXD_CALLSIGNS", "~/.local/share/rxd/callsigns.sqlite"))
+WORK_DIR = os.path.expanduser(os.environ.get("RXD_CALLSIGNS_WORK", "~/.cache/rxd/callsign-db"))
+BATCH = 10000          # the Census geocoder's limit per batch
+PUBLISH_EVERY = 20     # batches between interim databases while geocoding
+SCHEMA = 1
+
+
+def log(msg):
+    print("callsign_db: " + msg, file=sys.stderr, flush=True)
+
+
+def latlon_grid(lat, lon, n=6):
+    """(lat, lon) -> Maidenhead locator of 4 or 6 characters, e.g. EM13lc."""
+    lon = min(max(lon + 180.0, 0.0), 359.999999)
+    lat = min(max(lat + 90.0, 0.0), 179.999999)
+    g = chr(65 + int(lon // 20)) + chr(65 + int(lat // 10))
+    g += str(int(lon % 20 // 2)) + str(int(lat % 10))
+    if n >= 6:
+        g += chr(97 + int(lon % 2 * 12)) + chr(97 + int(lat % 1 * 24))
+    return g
+
+
+# ------------------------------------------------------------------ parsers
+
+def parse_hd(lines):
+    """HD.dat -> {unique_system_identifier: call} for active amateur licences."""
+    active = {}
+    for line in lines:
+        f = line.split("|")
+        # 1 HD, 2 usid, 5 call sign, 6 licence status, 7 radio service
+        if len(f) < 7 or f[0] != "HD" or f[5] != "A" or f[6] not in ("HA", "HV"):
+            continue
+        call = f[4].strip().upper()
+        if call:
+            active[f[1]] = call
+    return active
+
+
+def parse_en(lines, active):
+    """EN.dat -> {call: (street, city, state, zip5)} for the active licences.
+
+    Only these four address fields are read; the name, FRN, phone, email and
+    the rest of each line are never kept."""
+    out = {}
+    for line in lines:
+        f = line.split("|")
+        # 2 usid, 5 call, 6 entity type, 16 street, 17 city, 18 state, 19 zip
+        if len(f) < 19 or f[0] != "EN":
+            continue
+        call = active.get(f[1])
+        if not call or (call in out and f[5] != "L"):
+            continue
+        z = re.sub(r"[^0-9]", "", f[18])[:5]
+        out[call] = (f[15].strip(), f[16].strip(), f[17].strip().upper(), z if len(z) == 5 else "")
+    return out
+
+
+def parse_zcta(lines):
+    """Census Gazetteer ZCTA file (tab or | separated) -> {zip5: (lat, lon)}."""
+    it = iter(lines)
+    head = next(it, "")
+    sep = "|" if "|" in head else "\t"
+    cols = [c.strip().upper() for c in head.split(sep)]
+    try:
+        gi, la, lo = cols.index("GEOID"), cols.index("INTPTLAT"), cols.index("INTPTLONG")
+    except ValueError:
+        raise ValueError("ZCTA file has no GEOID/INTPTLAT/INTPTLONG columns")
+    out = {}
+    for line in it:
+        f = line.rstrip("\r\n").split(sep)
+        try:
+            out[f[gi].strip()[-5:]] = (float(f[la]), float(f[lo]))
+        except (IndexError, ValueError):
+            continue
+    return out
+
+
+CTY_ALIAS = re.compile(r"^(=?)([A-Z0-9/]+)(.*)$")
+
+
+def parse_cty(text):
+    """cty.dat -> [(key, grid4, entity)]; key is a prefix, or '=CALL' for an exact call.
+
+    Longitudes in cty.dat are + for West. Entries keep the file's order and
+    the first of any duplicate wins, as the format asks."""
+    out, seen = [], set()
+    entity = None
+    buf = ""
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        if not raw[0].isspace() and raw.count(":") >= 8:
+            f = [x.strip() for x in raw.split(":")]
+            entity = (f[0], float(f[4]), -float(f[5]))
+            buf = ""
+            continue
+        if entity is None:
+            continue
+        buf += raw.strip()
+        if not buf.endswith(";"):
+            continue
+        for alias in buf.rstrip(";").split(","):
+            m = CTY_ALIAS.match(alias.strip())
+            if not m:
+                continue
+            exact, key, rest = m[1], m[2], m[3]
+            lat, lon = entity[1], entity[2]
+            ll = re.search(r"<([-0-9.]+)/([-0-9.]+)>", rest)
+            if ll:
+                lat, lon = float(ll[1]), -float(ll[2])
+            k = ("=" if exact else "") + key
+            if k not in seen:
+                seen.add(k)
+                out.append((k, latlon_grid(lat, lon, 4), entity[0]))
+        buf = ""
+    return out
+
+
+def addr_hash(street, city, state, z, key=None):
+    """A short fingerprint of an address, to notice when a licence's address
+    changes. With a key (the workflow's secret) it's an HMAC, so the geocode
+    cache it publishes can't be used to test whether an address is in it."""
+    norm = "|".join(re.sub(r"\s+", " ", x.strip().upper()) for x in (street, city, state, z)).encode()
+    if key:
+        return hmac.new(key.encode(), norm, hashlib.sha256).hexdigest()[:24]
+    return hashlib.sha256(norm).hexdigest()[:20]
+
+
+def zip_lines(path, member):
+    zf = zipfile.ZipFile(path)
+    names = {n.rsplit("/", 1)[-1].upper(): n for n in zf.namelist()}
+    if member.upper() not in names:
+        raise ValueError("%s has no %s" % (path, member))
+    return io.TextIOWrapper(zf.open(names[member.upper()]), encoding="latin-1", newline="")
+
+
+# ------------------------------------------------------------------ geocoder
+
+class CensusGeocoder:
+    """The Census Bureau's batch address geocoder: up to 10,000 rows a request."""
+
+    def __init__(self, url=GEOCODER_URL, timeout=300, tries=4, pause=5.0):
+        self.url, self.timeout, self.tries, self.pause = url, timeout, tries, pause
+
+    def __call__(self, rows):
+        """rows: [(id, street, city, state, zip)] -> {id: (lat, lon) or None}."""
+        buf = io.StringIO()
+        w = csv.writer(buf, lineterminator="\n")
+        for r in rows:
+            w.writerow(r)
+        boundary = uuid.uuid4().hex
+        body = ("--%s\r\nContent-Disposition: form-data; name=\"benchmark\"\r\n\r\nPublic_AR_Current\r\n"
+                "--%s\r\nContent-Disposition: form-data; name=\"addressFile\"; filename=\"a.csv\"\r\n"
+                "Content-Type: text/csv\r\n\r\n" % (boundary, boundary)).encode() + \
+            buf.getvalue().encode("utf-8") + ("\r\n--%s--\r\n" % boundary).encode()
+        req = urllib.request.Request(self.url, data=body, method="POST", headers={
+            "Content-Type": "multipart/form-data; boundary=" + boundary, "User-Agent": USER_AGENT,
+            "Accept": "*/*"})
+        err = None
+        for attempt in range(self.tries):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    return parse_geocoder(r.read().decode("utf-8", "replace"))
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                err = e
+                time.sleep(self.pause * 4 ** attempt)
+        raise RuntimeError("geocoder failed: %s" % err)
+
+
+def parse_geocoder(text):
+    out = {}
+    for row in csv.reader(io.StringIO(text)):
+        if len(row) < 3:
+            continue
+        ll = None
+        if row[2] == "Match" and len(row) >= 6:
+            try:
+                lon, lat = (float(x) for x in row[5].split(","))
+                ll = (lat, lon)
+            except ValueError:
+                pass
+        out[row[0]] = ll
+    return out
+
+
+# ------------------------------------------------------------------ downloads
+
+def fetch(url, dest, meta, key, force=False, reuse=False):
+    """Download url to dest unless unchanged since meta[key]; True if there's new data.
+
+    reuse: a copy kept from a build that didn't finish is used as it is."""
+    if reuse and os.path.exists(dest):
+        return True
+    headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}  # data.fcc.gov refuses a request without Accept
+    old = meta.get(key + "_etag"), meta.get(key + "_modified")
+    if not force and old[0]:
+        headers["If-None-Match"] = old[0]
+    if not force and old[1]:
+        headers["If-Modified-Since"] = old[1]
+    req = urllib.request.Request(url, headers=headers)
+    tmp = dest + ".part"
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as fh:
+            want = int(r.headers.get("Content-Length") or -1)
+            n = 0
+            while True:
+                b = r.read(1 << 20)
+                if not b:
+                    break
+                fh.write(b)
+                n += len(b)
+            if want >= 0 and n != want:
+                raise OSError("%s: got %d of %d bytes" % (url, n, want))
+            etag, mod = r.headers.get("ETag"), r.headers.get("Last-Modified")
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            return False
+        raise
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    os.replace(tmp, dest)
+    meta[key + "_etag_new"], meta[key + "_modified_new"] = etag or "", mod or ""
+    return True
+
+
+def read_meta(path):
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+        try:
+            return dict(con.execute("SELECT key, value FROM meta"))
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return {}
+
+
+# ------------------------------------------------------------------ build
+
+def open_cache(path):
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE IF NOT EXISTS geo (ahash TEXT PRIMARY KEY, grid TEXT NOT NULL) WITHOUT ROWID")
+    return con
+
+
+def write_db(path, calls, prefixes, meta):
+    """Write the database to path + '.tmp', then rename it over path."""
+    tmp = path + ".tmp"
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    con = sqlite3.connect(tmp)
+    try:
+        con.executescript("""
+            PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;
+            CREATE TABLE calls (call TEXT PRIMARY KEY, grid TEXT NOT NULL, prec TEXT NOT NULL,
+                                region TEXT) WITHOUT ROWID;
+            CREATE TABLE prefixes (prefix TEXT PRIMARY KEY, grid TEXT NOT NULL, entity TEXT) WITHOUT ROWID;
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+        """)
+        con.executemany("INSERT INTO calls VALUES (?,?,?,?)", calls)
+        con.executemany("INSERT OR IGNORE INTO prefixes VALUES (?,?,?)", prefixes)
+        con.executemany("INSERT INTO meta VALUES (?,?)", sorted((k, str(v)) for k, v in meta.items()))
+        con.commit()
+        con.execute("VACUUM")
+    finally:
+        con.close()
+    with open(tmp, "rb") as fh:
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def copy_table(path, table):
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+        try:
+            return list(con.execute("SELECT * FROM " + table))
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+
+
+def update(db=DB_PATH, work=WORK_DIR, geocoder=None, geocode_max=None, urls=None,
+           min_calls=100000, min_prefixes=300, min_zips=30000, clock=time.time, force=False):
+    """Bring the database up to date. Returns a summary dict; raises on failure
+    (the old database is untouched then)."""
+    urls = dict({"fcc": FCC_URL, "zcta": ZCTA_URL, "cty": CTY_URL}, **(urls or {}))
+    os.makedirs(work, exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(db)), exist_ok=True)
+    with open(os.path.join(work, "lock"), "w") as lockf:
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise RuntimeError("another update is running")
+        return _update(db, work, geocoder, geocode_max, urls, min_calls, min_prefixes, min_zips, clock,
+                       force)
+
+
+def _update(db, work, geocoder, geocode_max, urls, min_calls, min_prefixes, min_zips, clock, force):
+    t0 = clock()
+    old = read_meta(db) if os.path.exists(db) else {}
+    meta = dict(old)
+    pending = old.get("geocode_pending", "0") != "0"
+    raw = {k: os.path.join(work, n) for k, n in
+           (("fcc", "l_amat.zip"), ("zcta", "zcta.zip"), ("cty", "cty.dat"))}
+    have_db = bool(old) and old.get("schema") == str(SCHEMA) and not force
+    # only the FCC file is kept between runs, and only while geocoding is unfinished
+    for k, p in raw.items():
+        if os.path.exists(p) and not (k == "fcc" and pending and have_db):
+            os.remove(p)
+    got = {}
+    got["cty"] = fetch(urls["cty"], raw["cty"], meta, "cty", force=not have_db)
+    got["zcta"] = fetch(urls["zcta"], raw["zcta"], meta, "zcta", force=not have_db)
+    # the calls table needs EN.dat whenever the FCC file, the ZIP table or
+    # unfinished geocoding asks for a rebuild
+    need_fcc = not have_db or pending or got["zcta"]
+    got["fcc"] = fetch(urls["fcc"], raw["fcc"], meta, "fcc", force=need_fcc, reuse=pending and have_db)
+    if got["fcc"] and not got["zcta"]:  # rebuilding the calls needs the ZIP table too
+        got["zcta"] = fetch(urls["zcta"], raw["zcta"], meta, "zcta", force=True)
+    if not any(got.values()):
+        log("up to date (built %s)" % old.get("built", "?"))
+        return {"changed": False, "calls": int(old.get("calls", 0))}
+
+    # prefixes
+    if got["cty"]:
+        with open(raw["cty"], encoding="latin-1") as fh:
+            prefixes = parse_cty(fh.read())
+        if len(prefixes) < min_prefixes:
+            raise ValueError("cty.dat has only %d prefixes" % len(prefixes))
+    else:
+        prefixes = copy_table(db, "prefixes")
+    meta["prefixes"] = len(prefixes)
+
+    if not got["fcc"]:
+        calls = copy_table(db, "calls")
+        stats = {}
+    else:
+        zcta = parse_zcta(zip_lines(raw["zcta"], next(
+            n for n in zipfile.ZipFile(raw["zcta"]).namelist() if n.lower().endswith(".txt"))))
+        if len(zcta) < min_zips:
+            raise ValueError("ZCTA file has only %d ZIP codes" % len(zcta))
+        t = clock()
+        active = parse_hd(zip_lines(raw["fcc"], "HD.dat"))
+        addrs = parse_en(zip_lines(raw["fcc"], "EN.dat"), active)
+        del active
+        if len(addrs) < min_calls:
+            raise ValueError("only %d active licences with an address" % len(addrs))
+        log("%d active licences read in %.0f s" % (len(addrs), clock() - t))
+        cache = open_cache(os.path.join(work, "geocache.sqlite"))
+        key = os.environ.get("RXD_CALLSIGN_KEY") or None
+        hashes = {c: addr_hash(*a, key=key) for c, a in addrs.items() if a[0]}
+        known = set(h for (h,) in cache.execute("SELECT ahash FROM geo"))
+        todo = sorted({h: c for c, h in hashes.items() if h not in known}.items())
+        if geocoder is None and geocode_max != 0:
+            geocoder = CensusGeocoder()
+        if geocode_max is not None:
+            todo_now = todo[:geocode_max]
+        else:
+            todo_now = todo
+        log("%d addresses cached, %d to geocode%s" % (
+            len(known), len(todo), "" if len(todo_now) == len(todo) else
+            " (%d this run)" % len(todo_now)))
+
+        def assemble():
+            geo = dict(cache.execute("SELECT ahash, grid FROM geo"))
+            rows, n = [], {"addr": 0, "zip": 0, "none": 0}
+            for c, (street, city, state, z) in addrs.items():
+                if not CALL_RE.match(c):
+                    n["none"] += 1
+                    continue
+                state = state if STATE_RE.match(state) else None
+                g = geo.get(hashes.get(c)) if street else None
+                if g:
+                    rows.append((c, g, "addr", state or None))
+                    n["addr"] += 1
+                elif z in zcta:
+                    rows.append((c, latlon_grid(*zcta[z]), "zip", state or None))
+                    n["zip"] += 1
+                else:
+                    n["none"] += 1
+            return sorted(rows), n
+
+        def publish(left):
+            rows, n = assemble()
+            m = dict(meta, schema=SCHEMA, calls=len(rows), built=time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock())), geocode_pending=left,
+                calls_addr=n["addr"], calls_zip=n["zip"], calls_unplaced=n["none"])
+            write_db(db, rows, prefixes, finish_meta(m, got))
+            return n
+
+        publish(len(todo))
+        tg = clock()
+        done = 0
+        for i in range(0, len(todo_now), BATCH):
+            chunk = todo_now[i:i + BATCH]
+            try:
+                res = geocoder([(h, *addrs[c]) for h, c in chunk])
+            except Exception as e:  # noqa: BLE001 - keep what's done; the next run carries on
+                log("geocoding stopped: %s" % e)
+                break
+            cache.executemany("INSERT OR REPLACE INTO geo VALUES (?,?)",
+                              [(h, latlon_grid(*res[h]) if res.get(h) else "") for h, _ in chunk])
+            cache.commit()
+            done += len(chunk)
+            log("geocoded %d of %d (%.0f s)" % (done, len(todo_now), clock() - tg))
+            if (i // BATCH + 1) % PUBLISH_EVERY == 0:
+                publish(len(todo) - done)
+        left = len(todo) - done
+        stats = publish(left)
+        stats["geocoded"], stats["geocode_s"] = done, round(clock() - tg)
+        # forget cached addresses nobody has any more
+        live = set(hashes.values())
+        stale = [(h,) for (h,) in cache.execute("SELECT ahash FROM geo") if h not in live]
+        cache.executemany("DELETE FROM geo WHERE ahash=?", stale)
+        cache.commit()
+        cache.close()
+        if left:
+            meta["geocode_pending"] = left
+            log("%d addresses still to geocode: the next update carries on" % left)
+            stats["pending"] = left
+        calls = None
+    if calls is not None:  # only the prefixes changed
+        write_db(db, calls, prefixes, finish_meta(dict(meta, schema=SCHEMA, built=time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock()))), got))
+    # the raw downloads go once a build has used them completely
+    for k, p in raw.items():
+        if os.path.exists(p) and not (k == "fcc" and stats.get("pending")):
+            os.remove(p)
+    stats.update(changed=True, seconds=round(clock() - t0), size=os.path.getsize(db))
+    log("built %s: %s" % (db, stats))
+    return stats
+
+
+def finish_meta(m, got):
+    for k in ("fcc", "zcta", "cty"):
+        if got.get(k) and (k + "_etag_new") in m:
+            m[k + "_etag"], m[k + "_modified"] = m[k + "_etag_new"], m[k + "_modified_new"]
+    return {k: v for k, v in m.items() if not k.endswith("_new")}
+
+
+# ------------------------------------------------------------------ validation
+
+CALL_RE = re.compile(r"^[A-Z0-9]{3,10}$")
+GRID6_RE = re.compile(r"^[A-R]{2}[0-9]{2}[a-x]{2}$")
+GRID4_RE = re.compile(r"^[A-R]{2}[0-9]{2}$")
+STATE_RE = re.compile(r"^[A-Z]{2}$")
+PREFIX_RE = re.compile(r"^=?[A-Z0-9/]{1,20}$")
+META_KEYS = re.compile(r"^(schema|calls|calls_addr|calls_zip|calls_unplaced|prefixes|built|"
+                       r"geocode_pending|(fcc|zcta|cty)_(etag|modified))$")
+SPOTS = {"KA1PID": "EM13", "W1AW": "FN31"}
+
+
+def validate(path, previous=None, min_calls=500000, max_calls=3000000, min_prefixes=300,
+             spots=SPOTS, min_addr_share=0.6):
+    """Problems with a built database, as a list of strings (empty when it's good).
+
+    This is the gate before publishing: the schema is exactly what rxd reads,
+    every value has the shape it should (so nothing else, such as a name or
+    an address, can have slipped in), the counts are sane and close to the
+    previous build's, and some known calls are where they should be."""
+    bad = []
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+        con.execute("PRAGMA quick_check").fetchone()
+    except sqlite3.Error as e:
+        return ["not a readable database: %s" % e]
+    try:
+        tables = {n: [c[1] for c in con.execute("PRAGMA table_info(%s)" % n)]
+                  for (n,) in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        want = {"calls": ["call", "grid", "prec", "region"], "prefixes": ["prefix", "grid", "entity"],
+                "meta": ["key", "value"]}
+        if tables != want:
+            return ["schema is %r, want %r" % (tables, want)]
+        if con.execute("SELECT count(*) FROM sqlite_master WHERE type NOT IN ('table', 'index')").fetchone()[0]:
+            bad.append("unexpected views or triggers")
+        n = {"addr": 0, "zip": 0}
+        for call, grid, prec, region in con.execute("SELECT * FROM calls"):
+            if (not CALL_RE.match(call or "") or prec not in n or not GRID6_RE.match(grid or "")
+                    or not (region is None or STATE_RE.match(region))):
+                bad.append("bad calls row: %r" % (call,))
+                if len(bad) > 20:
+                    break
+                continue
+            n[prec] += 1
+        calls = n["addr"] + n["zip"]
+        entities = set()
+        for prefix, grid, entity in con.execute("SELECT * FROM prefixes"):
+            if not PREFIX_RE.match(prefix or "") or not GRID4_RE.match(grid or "") or not entity:
+                bad.append("bad prefixes row: %r" % (prefix,))
+            entities.add(entity)
+        if any(len(e) > 40 for e in entities):
+            bad.append("an entity name is too long to be a country")
+        meta = dict(con.execute("SELECT key, value FROM meta"))
+        for k in meta:
+            if not META_KEYS.match(k):
+                bad.append("unexpected meta key %r" % k)
+        if not min_calls <= calls <= max_calls:
+            bad.append("%d calls, outside %d-%d" % (calls, min_calls, max_calls))
+        np = con.execute("SELECT count(*) FROM prefixes").fetchone()[0]
+        if np < min_prefixes:
+            bad.append("only %d prefixes" % np)
+        pending = int(meta.get("geocode_pending") or 0)
+        if calls and not pending and n["addr"] / calls < min_addr_share:
+            bad.append("only %.0f%% of calls geocoded" % (100 * n["addr"] / calls))
+        for call, grid4 in (spots or {}).items():
+            r = con.execute("SELECT grid FROM calls WHERE call=?", (call,)).fetchone()
+            if not r or not r[0].startswith(grid4):
+                bad.append("%s is at %s, want %s" % (call, r and r[0], grid4))
+    finally:
+        con.close()
+    if previous and os.path.exists(previous):
+        pm = read_meta(previous)
+        try:
+            pc = int(pm.get("calls", 0))
+        except ValueError:
+            pc = 0
+        if pc and not 0.9 * pc <= calls <= 1.15 * pc:
+            bad.append("%d calls, the previous build had %d" % (calls, pc))
+    return bad
+
+
+# ------------------------------------------------------------------ install (the Pi)
+
+RELEASE_URL = os.environ.get("RXD_CALLSIGNS_URL",
+                             "https://github.com/pid1/rx/releases/download/data-callsigns/")
+
+
+def http_get(url, headers=None, timeout=60):
+    req = urllib.request.Request(url, headers=dict({"User-Agent": USER_AGENT, "Accept": "*/*"},
+                                                   **(headers or {})))
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def install(db=DB_PATH, base=RELEASE_URL, get=http_get):
+    """Fetch the published database if it changed, check it, and swap it in.
+
+    Returns "installed" or "unchanged"; raises on any failure, leaving the
+    installed database as it was."""
+    base = base.rstrip("/") + "/"
+    side = db + ".sha256"
+    state = {}
+    try:
+        with open(side) as fh:
+            state = dict(line.rstrip("\n").split(" ", 1) for line in fh if " " in line)
+    except (OSError, ValueError):
+        pass
+    have = os.path.exists(db)
+    hdr = {"If-None-Match": state["etag"]} if have and state.get("etag") else {}
+    try:
+        with get(base + "callsigns.sqlite.gz.sha256", hdr) as r:
+            text, etag = r.read(4096).decode("ascii", "replace"), r.headers.get("ETag") or ""
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            return "unchanged"
+        raise
+    m = re.match(r"^([0-9a-f]{64})\b", text.strip())
+    if not m:
+        raise ValueError("no sha256 in the checksum file")
+    want = m[1]
+    if have and state.get("sha256") == want:
+        write_state(side, want, etag)
+        return "unchanged"
+    os.makedirs(os.path.dirname(os.path.abspath(db)), exist_ok=True)
+    gz, tmp = db + ".gz.part", db + ".part"
+    try:
+        h = hashlib.sha256()
+        with get(base + "callsigns.sqlite.gz", None, 300) as r, open(gz, "wb") as fh:
+            while True:
+                b = r.read(1 << 20)
+                if not b:
+                    break
+                h.update(b)
+                fh.write(b)
+        if h.hexdigest() != want:
+            raise ValueError("checksum mismatch: got %s, want %s" % (h.hexdigest(), want))
+        import gzip
+        with gzip.open(gz, "rb") as src, open(tmp, "wb") as dst:
+            while True:
+                b = src.read(1 << 20)
+                if not b:
+                    break
+                dst.write(b)
+            dst.flush()
+            os.fsync(dst.fileno())
+        probs = validate(tmp, min_calls=1, max_calls=10 ** 8, min_prefixes=1, spots=None, min_addr_share=0)
+        if probs:
+            raise ValueError("the download isn't a good database: " + "; ".join(probs[:3]))
+        os.replace(tmp, db)
+    finally:
+        for p in (gz, tmp):
+            if os.path.exists(p):
+                os.remove(p)
+    write_state(side, want, etag)
+    return "installed"
+
+
+def write_state(path, sha, etag):
+    tmp = path + ".part"
+    with open(tmp, "w") as fh:
+        fh.write("sha256 %s\netag %s\n" % (sha, etag))
+    os.replace(tmp, path)
+
+
+# ------------------------------------------------------------------ main
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="callsign_db", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    u = sub.add_parser("update", help="download, geocode and build (the GitHub workflow)")
+    u.add_argument("--db", default=DB_PATH)
+    u.add_argument("--work", default=WORK_DIR)
+    u.add_argument("--geocode-max", type=int, default=None,
+                   help="geocode at most N addresses this run (the rest next time)")
+    u.add_argument("--no-geocode", action="store_true", help="ZIP-centroid grids only, this run")
+    u.add_argument("--force", action="store_true", help="rebuild even if no source changed")
+    u.add_argument("--summary", help="write the build's summary here as JSON")
+    v = sub.add_parser("validate", help="check a built database before publishing it")
+    v.add_argument("db")
+    v.add_argument("--previous", help="the last published build, to compare counts with")
+    i = sub.add_parser("install", help="fetch the published database (the Pi; setup.sh runs this)")
+    i.add_argument("--db", default=DB_PATH)
+    i.add_argument("--url", default=RELEASE_URL, help="where the release assets are")
+    lk = sub.add_parser("lookup", help="look calls up")
+    lk.add_argument("calls", nargs="+")
+    lk.add_argument("--db", default=DB_PATH)
+    inf = sub.add_parser("info", help="what the database holds")
+    inf.add_argument("--db", default=DB_PATH)
+    a = ap.parse_args(argv)
+    if a.cmd == "update":
+        try:
+            st = update(a.db, a.work, geocode_max=0 if a.no_geocode else a.geocode_max, force=a.force)
+        except Exception as e:  # noqa: BLE001 - any failure keeps the old database
+            log("update failed, the old database is unchanged: %s" % e)
+            return 1
+        if a.summary:
+            import json
+            with open(a.summary, "w") as fh:
+                json.dump(st, fh)
+        return 0
+    if a.cmd == "validate":
+        probs = validate(a.db, a.previous)
+        for p in probs:
+            log("invalid: " + p)
+        if not probs:
+            log("%s is good: %s" % (a.db, {k: v for k, v in read_meta(a.db).items()
+                                          if k.startswith(("calls", "prefixes", "geocode", "built"))}))
+        return 1 if probs else 0
+    if a.cmd == "install":
+        try:
+            log("callsign database %s: %s" % (install(a.db, a.url), a.db))
+        except Exception as e:  # noqa: BLE001 - any failure keeps the installed database
+            log("couldn't update the callsign database, keeping the one installed: %s" % e)
+            return 1
+        return 0
+    if a.cmd == "info":
+        m = read_meta(a.db)
+        if not m:
+            log("no database at %s" % a.db)
+            return 1
+        for k in sorted(m):
+            if not k.endswith(("_etag", "_modified")):
+                print("%-16s %s" % (k, m[k]))
+        print("%-16s %.1f MB" % ("size", os.path.getsize(a.db) / 1e6))
+        return 0
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import rxd  # the lookup rxd itself uses
+    book = rxd.CallBook(a.db)
+    for c in a.calls:
+        print(c, book.lookup(c))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+RXDCALLDB
+    if $DRY_RUN; then
+      log "[dry-run] fetch the callsign database"
+    elif runuser -u "$DESKTOP_USER" -- env HOME="$USER_HOME" \
+        python3 /usr/local/share/rxd/callsign_db.py install; then
+      log "callsign database up to date ($USER_HOME/.local/share/rxd/callsigns.sqlite)"
+    else
+      warn "could not update the callsign database; keeping the one installed, if any"
+    fi
+
+    # rxd's JS8 decoder; rxd loads it from here.
     write_file /usr/local/lib/rxd/js8.py 0644 <<'RXDJS8'
 #!/usr/bin/env python3
 """js8: rxd's JS8 receiver.

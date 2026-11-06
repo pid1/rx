@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Copy rxd and its two clients into setup.sh, replacing the body of each
+# Copy rxd, its two clients, its JS8 decoder and the callsign database's
+# installer into setup.sh, replacing the body of each
 #   write_file DEST MODE <<'MARKER'
 # heredoc listed below. setup.sh is piped into a root shell as one file, so it
 # carries them inline; this keeps those copies byte-identical to the sources.
@@ -20,6 +21,7 @@ EMBEDS=(
   "rxd/rxd_tui.py"     "    write_file /usr/local/bin/rxd-tui 0755 <<'RXDTUI'"                RXDTUI
   "rxd/web/index.html" "    write_file /usr/local/share/rxd/index.html 0644 <<'RXDWEB'"       RXDWEB
   "rxd/js8.py"         "    write_file /usr/local/lib/rxd/js8.py 0644 <<'RXDJS8'"             RXDJS8
+  "rxd/callsign_db.py" "    write_file /usr/local/share/rxd/callsign_db.py 0644 <<'RXDCALLDB'" RXDCALLDB
 )
 
 check=false
@@ -98,7 +100,7 @@ done
 if $check; then
   (( ${#stale[@]} == 0 )) \
     || fail "the copy in $dst differs from ${stale[*]}; run rxd/embed.sh"
-  echo "setup.sh carries the current ${EMBEDS[0]} ${EMBEDS[3]} ${EMBEDS[6]} ${EMBEDS[9]}"
+  echo "setup.sh carries the current ${EMBEDS[0]} ${EMBEDS[3]} ${EMBEDS[6]} ${EMBEDS[9]} ${EMBEDS[12]}"
 elif cmp -s "$tmp" "$dst"; then
   echo "setup.sh already carries the current rxd and its clients"
 else
