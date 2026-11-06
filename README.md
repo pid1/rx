@@ -1,5 +1,5 @@
 <!-- Hidden until a hero image exists. Add it, restore this line, then delete this note.
-<p align="center"><img src="docs/screenshots/uconsole.jpg" alt="The uConsole running SDR++ and JS8Call" width="880"></p>
+<p align="center"><img src="docs/screenshots/uconsole.jpg" alt="The uConsole running JS8Call (an older screenshot, from when SDR++ was the receiver)" width="880"></p>
 
 Asset to create: docs/screenshots/uconsole.jpg. A photo of the uConsole (or a
 1280x720 screenshot) with JS8Call decoding on workspace 2. Crop out the status
@@ -37,8 +37,8 @@ script that provisions a blank card re-applies the configuration on every
 
 1. **Flash** Rex's image to a microSD card and finish its first-boot wizard.
 2. **Run** `curl -fsSL pid1.space/rx | sudo bash`, then reboot.
-3. **Listen.** `radio ghostnet` brings up SDR++ tuned to 7.107 MHz and JS8Call
-   decoding GhostNet from it. `radio noaa` swaps to weather radio.
+3. **Listen.** `radio ghostnet` brings up the receiver tuned to 7.107 MHz and
+   JS8Call decoding GhostNet from it. `radio noaa` swaps to weather radio.
 4. **Go off-grid.** The clock keeps JS8-grade time from GPS and the RTC with no
    network, and the mesh map works from offline tiles.
 5. **Keep it current** with `sudo maint`: package upgrades, then this script
@@ -48,8 +48,8 @@ script that provisions a blank card re-applies the configuration on every
 
 - **Switches the SDR between setups in one command.** `radio NAME` closes what
   is running and brings NAME up tuned, playing, and resuming where you left it.
-- **Receives JS8** through the SDR: SDR++ feeds JS8Call over a virtual audio
-  cable, with GhostNet's groups set and every transmit and upload path off.
+- **Receives JS8** through the SDR: rxd, a headless receiver, feeds JS8Call
+  over a virtual audio cable, with GhostNet's groups set and every transmit and upload path off.
 - **Keeps time without a network**, from GPS PPS, the AIO's RTC and chrony.
 - **Runs a LoRa mesh node** on the AIO's SX1262, Meshtastic or MeshCore, on
   the North Texas community's settings, with node lists, messaging, a
@@ -76,7 +76,7 @@ Then:
 
 ```bash
 radio                       # list the SDR profiles
-radio ghostnet              # JS8 GhostNet: SDR++ on 7.107 MHz + JS8Call
+radio ghostnet              # JS8 GhostNet: rxd on 7.107 MHz + JS8Call
 chronyc sources             # time: PPS marked '*' once the GPS has a fix
 radio meshtastic            # mesh node on North Texas settings (or: radio meshcore)
 radio mesh nodes            # who the mesh has heard
@@ -92,10 +92,10 @@ The account is assumed to be `jroemer`; pass another with
 | Command | What it does |
 |---|---|
 | `radio` | List profiles; `*` marks the active one |
-| `radio NAME` | Close what's running, bring NAME up. JS8 profiles also start JS8Call on the matching dial |
-| `radio off` | Save the active profile, close SDR++ and JS8Call |
+| `radio NAME` | Close what's running, start rxd on NAME. JS8 profiles also start JS8Call on the matching dial |
+| `radio off` | Save the active profile, stop rxd and close JS8Call |
 | `radio resume` | Bring the active profile back (i3 runs this at login) |
-| `radio save [NAME]` | Keep SDR++'s current tuning in the active profile, or as a new one |
+| `radio save [NAME]` | Keep rxd's current tuning in the active profile, or as a new one |
 | `radio reset NAME` | Back to the shipped default |
 | `radio show NAME` | Print a profile |
 | `radio help` | All of the above |
@@ -113,8 +113,10 @@ The account is assumed to be `jroemer`; pass another with
 | `fm-93.3`, `fm-105.3` | broadcast FM | bypass |
 | `am-820` | 820 kHz AM | upconvert |
 
-`radio` says when the Ham It Up's switch needs flipping. How profiles work, and
-the SDR++ quirks they work around: [docs/radio.md](docs/radio.md).
+`radio` says when the Ham It Up's switch needs flipping. rxd has no screen:
+tune it live over HTTP on `127.0.0.1:8073` or Hamlib rigctl on
+`127.0.0.1:4532`, and `radio save` keeps the result. How profiles and rxd
+work: [docs/radio.md](docs/radio.md#rxd).
 
 ### `radio mesh`: the LoRa mesh
 
@@ -157,7 +159,8 @@ Defaults from [NTX Mesh](https://ntxmesh.com/join/); details in
 | `sudo aiov2_ctl GPS on` | Power a rail now: `GPS`, `LORA`, `SDR` or `USB` |
 | `chronyc sources` | Time sources; PPS `*` means GPS-locked |
 | `cgps -s` | GPS fix and satellites |
-| `rtl_test -t` | Prove the RTL-SDR opens, independent of SDR++ |
+| `rtl_test -t` | Prove the RTL-SDR opens, independent of rxd |
+| `journalctl --user -u 'rxd@*'` | The receiver's log |
 | `chirp` | CHIRP, for programming handhelds |
 | `js8call` | Plain JS8Call, without retuning the SDR |
 | `claude` | Claude Code |
@@ -181,7 +184,6 @@ which ones survive: [docs/desktop.md](docs/desktop.md#why-window-management-sits
 
 | Workspace | What lands there |
 |---|---|
-| `1` | SDR++, started at login by `radio resume` |
 | `2` | JS8Call |
 | `3` | Meshtastic dashboard (`radio mesh`) |
 
@@ -239,8 +241,7 @@ which ones survive: [docs/desktop.md](docs/desktop.md#why-window-management-sits
 - **Never brick a portable device.** Kernels are held, boot files are backed up,
   and a truncated download dies instead of running half a script.
 - **Check the hardware, don't assume it.** Fonts are verified with `fc-match`, the
-  SDR with `rtl_test`, the RTC with `dmesg`, and SDR++ by whether it actually
-  opened the dongle.
+  SDR with `rtl_test` and the RTC with `dmesg`.
 - **One command per job.** `radio` and `maint`, each runnable from dmenu,
   with failures shown on screen when there is no terminal.
 
@@ -249,7 +250,7 @@ which ones survive: [docs/desktop.md](docs/desktop.md#why-window-management-sits
 | Guide | What's in it |
 |---|---|
 | [Install](docs/install.md) | Rex's image, flashing, running the script, sections and flags, after the first run |
-| [Radio](docs/radio.md) | `radio` profiles, JS8 over the SDR, an empty SDR++ waterfall, CHIRP |
+| [Radio](docs/radio.md) | `radio` profiles and rxd, JS8 over the SDR, when rxd is silent, CHIRP |
 | [Hardware](docs/hardware.md) | AIO v2 power rails, time (GPS, RTC, chrony), the LoRa mesh (Meshtastic, MeshCore) and map tiles, Bluetooth |
 | [Desktop](docs/desktop.md) | Why `Alt+Shift`, what starts on which workspace, display and power, fonts |
 | [Maintenance](docs/maintenance.md) | `maint` and held kernels, SSH, the firewall, troubleshooting |
