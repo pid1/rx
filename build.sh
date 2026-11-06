@@ -18,10 +18,12 @@ head -1 "$script" | grep -qx '#!/usr/bin/env bash' \
 tail -1 "$script" | grep -qx 'main "\$@"' \
   || { echo "script does not end with 'main \"\$@\"'" >&2; exit 1; }
 
-# setup.sh carries rxd, rxd-tui and the browser UI inline, generated from
-# rxd/rxd.py, rxd/rxd_tui.py and rxd/web/index.html. Publishing a stale copy
-# would install something other than what is in the repo.
-rxd/embed.sh --check
+# rxd is not in here: setup.sh installs a pinned pid1/rxd release, checked by
+# SHA-256. Refuse to publish a placeholder pin.
+grep -qE '^    local RXD_VERSION=[0-9]+\.[0-9]+\.[0-9]+$' "$script" \
+  || { echo "setup.sh has no RXD_VERSION=X.Y.Z" >&2; exit 1; }
+grep -qE '^    local RXD_SHA256=[0-9a-f]{64}$' "$script" \
+  || { echo "setup.sh has no 64-hex RXD_SHA256" >&2; exit 1; }
 
 rm -rf dist
 mkdir -p dist
