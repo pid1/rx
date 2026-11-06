@@ -2264,6 +2264,9 @@ PipeWire/PulseAudio sink. Two control ports, both on 127.0.0.1 by default:
         read and set the frequency and mode
   8073  HTTP JSON: GET /api/status, POST /api/tune {"freq": 7078000,
         "mode": "USB", "bandwidth": 2800, "gain_db": 3.7, "volume": 0.2}
+        ("gain_db" turns automatic gain off; "gain_auto": true turns it on;
+        "audio_auto", "audio_nr", "audio_filter", "audio_norm", "audio_limit"
+        and "audio_squelch" switch the listening clean-up)
 
 A WSPR profile ("decoder": "wspr") also decodes WSPR with wsprd and reports
 the spots to WSPRnet; GET /api/wspr lists them.
@@ -2318,6 +2321,11 @@ UPCONVERT_BELOW_HZ = 30e6
 SINKS = {"SDR to JS8 (virtual cable)": "SDR_to_JS8", "Built-in Audio": None}
 MODES = ("USB", "LSB", "AM", "FM", "WFM")
 DECODERS = ("js8", "wspr", None)
+# A JS8 profile's sink is JS8Call's input: silence there means no decodes
+# (2026-11-06, a saved volume 0 cost 18 minutes of them). Below this rxd
+# refuses a volume; a profile saved with less loads at JS8_VOLUME.
+DECODER_MIN_VOLUME = 0.05
+JS8_VOLUME = 0.2
 DEFAULT_BW = {"USB": 2800.0, "LSB": 2800.0, "AM": 10000.0, "FM": 12500.0,
               "WFM": 150000.0}
 
@@ -2378,6 +2386,10 @@ class Settings:
             # A saved gain_db wins; otherwise the index (SDR++'s convention)
             # is looked up in the dongle's gain table once it is open.
             self.gain_db = float(rtl["gain_db"]) if rtl.get("gain_db") is not None else None
+            # Automatic RF gain (AutoGain), on unless the profile says false;
+            # gain_db is then only where it starts.
+            self.gain_auto = rtl.get("gain_auto", True) is not False
+            self.audio = audio_settings(p.get("audio"))
             self.ppm = int(rtl.get("ppm", 0))
             self.bias_t = bool(rtl.get("biasT", False))
             self.sink = SINKS.get(p.get("sink"), p.get("sink"))
@@ -2388,6 +2400,9 @@ class Settings:
             if self.decoder not in DECODERS:
                 raise ValueError("decoder must be one of " + ", ".join(d for d in DECODERS if d))
             self.wspr_report = bool(p.get("wspr_report", True))
+            if self.decoder == "js8" and self.volume < DECODER_MIN_VOLUME:
+                log("volume %g would silence JS8Call: using %g" % (self.volume, JS8_VOLUME))
+                self.volume = JS8_VOLUME
             self.version = getattr(self, "version", 0) + 1
 
     def snapshot(self):
@@ -2398,7 +2413,8 @@ class Settings:
                         upconvert_below=self.upconvert_below,
                         agc_attack=self.agc_attack, agc_decay=self.agc_decay,
                         volume=self.volume, gain_db=self.gain_db, squelch=self.squelch,
-                        wspr_report=self.wspr_report, version=self.version)
+                        wspr_report=self.wspr_report, gain_auto=self.gain_auto,
+                        audio=dict(self.audio), version=self.version)
 
     def upconverter(self):
         """The offset in effect for the current dial (call with the lock held)."""
@@ -2409,8 +2425,11 @@ class Settings:
         return 0.0
 
     def update(self, freq=None, mode=None, bandwidth=None, gain_db=None,
-               volume=None, squelch=Ellipsis, wspr_report=None):
+               volume=None, squelch=Ellipsis, wspr_report=None, gain_auto=None, **audio):
         with self.lock:
+            if gain_auto is not None and not isinstance(gain_auto, bool):
+                raise ValueError("gain_auto must be true or false")
+            new_audio = audio_update(self.audio, audio)
             if wspr_report is not None:
                 if not isinstance(wspr_report, bool):
                     raise ValueError("wspr_report must be true or false")
@@ -2431,10 +2450,18 @@ class Settings:
                 self.bandwidth = float(bandwidth)
             if gain_db is not None:
                 self.gain_db = float(gain_db)
+                if gain_auto is None:  # a gain set by hand turns the automatic off
+                    self.gain_auto = False
+            if gain_auto is not None:
+                self.gain_auto = gain_auto
+            self.audio = new_audio
             if volume is not None:
                 volume = float(volume)
                 if not 0 <= volume <= 4:
                     raise ValueError("volume must be between 0 and 4")
+                if self.decoder == "js8" and volume < DECODER_MIN_VOLUME:
+                    raise ValueError("JS8Call decodes this audio: volume can't go below %g"
+                                     % DECODER_MIN_VOLUME)
                 self.volume = volume
             if squelch is not Ellipsis:  # None (JSON null) turns it off
                 if squelch is not None:
@@ -2443,6 +2470,13 @@ class Settings:
                         raise ValueError("squelch must be in dBFS, -150 to 0, or null")
                 self.squelch = squelch
             self.version += 1
+
+    def set_auto_gain(self, db):
+        """AutoGain's choice, kept unless gain_db was set by hand meanwhile."""
+        with self.lock:
+            if self.gain_auto:
+                self.gain_db = float(db)
+            return self.gain_auto
 
 
 # ------------------------------------------------------------------ sources
@@ -2838,6 +2872,453 @@ class Chain:
         return audio.astype(np.float32)
 
 
+# ------------------------------------------------------- automatic RF gain
+
+def db10(p):
+    return float(10 * np.log10(p + 1e-12))
+
+
+class AutoGain:
+    """Picks the dongle's gain step from the raw IQ, a block at a time.
+
+    The aim is the best signal-to-noise without overload. With an 8-bit ADC
+    that means: enough gain that the band's noise floor (from the spectrum
+    rxd already makes) sits well above the ADC's own quantisation noise, so
+    the antenna sets the floor and not the ADC, and no more, since more gain
+    only spends headroom. Overload shows as clipped samples (bytes 0 or 255)
+    or an RMS near full scale; on the uConsole's R820T a crowded band
+    compresses (the RMS stops rising with gain) before much clips.
+
+    Measured 2026-11-06 on the box, 820 kHz AM through the Ham It Up: the
+    carrier's SNR was best (47 dB) at 3.7-7.7 dB of gain, where the floor is
+    7-11 dB over the ADC's, and fell to 34 dB at 30+ dB as the band compressed.
+
+    After a start or a retune it steps once a second until it settles, then
+    at most once every SLOW seconds. Under a WSPR or JS8 profile it then moves
+    only in the gap between slots, so a decode never sees a step, unless the
+    signal overloads or is far too low.
+    """
+
+    ADC_FLOOR_DB = -50.0   # 8-bit quantisation noise on make_spectrum's scale
+    MARGIN_LO, MARGIN_HI, MARGIN_FAR = 6.0, 13.0, 2.0  # floor over the ADC's, dB
+    RMS_HI, RMS_UP, RMS_URGENT = -10.0, -15.0, -5.0    # dBFS
+    CLIP_HI, CLIP_UP, CLIP_URGENT = 1e-4, 1e-6, 1e-3   # fraction of I/Q values
+    URGENT_DROP = 6.0      # dB: an overload steps down at least this far
+    FAST, SLOW = 1.0, 5.0  # seconds between steps while settling / after
+    SETTLE_FOR = 30.0      # seconds of fast steps at most
+    # The floor doesn't always move dB for dB: on WFM at 93.3 MHz the R820T's
+    # floor rose 11 dB for its 0 -> 3.7 dB step, so neither was in the band
+    # and the loop flipped between them every second (2026-11-06). A step
+    # that would undo the last one within REVERSAL_S is refused, the loop
+    # holds the higher gain, and that move waits BAR_S. Overload isn't barred.
+    REVERSAL_S, BAR_S = 120.0, 600.0
+    # Decoder -> (slot period, gap start, gap end), seconds into the period.
+    # WSPR records 114 s from the even minute; a JS8 Normal frame ends 13.1 s
+    # into its 15 s slot.
+    SLOTS = {"wspr": (120.0, 114.5, 119.5), "js8": (15.0, 13.3, 14.8)}
+
+    def __init__(self, gains, decoder=None):
+        self.gains = sorted(set(float(g) for g in gains))
+        self.decoder = decoder
+        self.key = None          # what it settled for: (mode, tuner MHz)
+        self.spec_seq = None     # the last spectrum it took a floor from
+        self.steps = 0
+        self.state = "settling"
+        self.reason = None
+        self.last = {}
+        self.cpu = 0.0
+        self.reset(0.0)
+
+    def reset(self, now):
+        """Start settling again (a start, a retune or auto turned back on)."""
+        self.t_dec = self.t_short = self.t_start = now
+        self.acc = [0, 0, 0.0, []]   # clipped values, samples, sum |x|^2, floors
+        self.short = [0, 0, 0.0]
+        self.skip = 0
+        self.settling = True
+        self.holds = 0
+        self.state = "settling"
+        self.last_step = None    # (from, to, when) of the last non-overload step
+        self.barred = {}         # (index, direction) -> until when
+
+    @staticmethod
+    def measure(x):
+        """(clipped I/Q values, samples, sum of |x|^2) for a block from the dongle."""
+        v = x.view(np.float32)
+        # cu8 bytes 0 and 255 are -1.0 and +1.0; 1 and 254 are 0.992.
+        return int(np.count_nonzero(np.abs(v) > 0.995)), len(x), float(np.dot(v, v))
+
+    @staticmethod
+    def floor_of(bins):
+        """The band's noise floor: the 20th percentile of the spectrum, without
+        the outer tenths (the dongle's filter rolls off) or the DC spike."""
+        b = np.asarray(bins, np.float32)
+        n = len(b)
+        if n < 40:
+            return None
+        e, mid = n // 10, n // 2
+        return float(np.percentile(np.concatenate([b[e:mid - 6], b[mid + 6:n - e]]), 20))
+
+    def index(self, gain):
+        g = self.gains
+        return int(np.argmin([abs(x - (gain or 0.0)) for x in g]))
+
+    def in_gap(self, wall):
+        period, a, b = self.SLOTS[self.decoder]
+        return a <= wall % period < b
+
+    def decide(self, clip, rms, margin, i):
+        """(-1, 0 or +1, why) for one window of measurements at gain step i."""
+        g = self.gains
+        down = None
+        if clip > self.CLIP_HI:
+            down = "clipping"
+        elif rms > self.RMS_HI:
+            down = "near full scale"
+        elif margin is not None and margin > self.MARGIN_HI:
+            down = "more gain than the noise needs"
+        if down:
+            return (-1, down) if i > 0 else (0, down + ", at the lowest gain")
+        if margin is not None and margin < self.MARGIN_LO:
+            if i + 1 >= len(g):
+                return 0, "noise near the ADC's, at the highest gain"
+            if clip > self.CLIP_UP or rms + (g[i + 1] - g[i]) > self.RMS_UP:
+                return 0, "noise near the ADC's, but no headroom for more"
+            return 1, "noise near the ADC's"
+        return 0, "the antenna sets the noise floor, with headroom"
+
+    def target(self, i, d, urgent=False):
+        g = self.gains
+        if d < 0 and urgent:
+            lower = [j for j in range(i) if g[j] <= g[i] - self.URGENT_DROP]
+            return lower[-1] if lower else 0
+        return max(0, min(len(g) - 1, i + d))
+
+    def jump(self, i, d, rms, margin):
+        """While settling: the step nearest the middle of the target, at least
+        one step in direction d."""
+        g = self.gains
+        mid = (self.MARGIN_LO + self.MARGIN_HI) / 2
+        if d < 0:
+            move = max(rms - self.RMS_UP, (margin - mid) if margin is not None else 0.0)
+            want = g[i] - 0.75 * move  # the floor seldom falls dB for dB
+            j = min(range(i), key=lambda k: abs(g[k] - want)) if i else 0
+        else:
+            move = min(mid - margin, self.RMS_UP - rms)
+            want = g[i] + 0.75 * move
+            j = min(range(i + 1, len(g)), key=lambda k: abs(g[k] - want)) \
+                if i + 1 < len(g) else i
+        return j
+
+    def observe(self, x, gain, now, wall, floor=None):
+        """One block of IQ in (with a new noise floor, if there is one); the
+        gain to step to, or None to stay where it is."""
+        if not self.gains:
+            return None
+        if self.skip > 0:      # blocks read before the last step
+            self.skip -= 1
+            return None
+        c, n, pw = self.measure(x)
+        for a in (self.acc, self.short):
+            a[0] += c
+            a[1] += n
+            a[2] += pw
+        if floor is not None:
+            self.acc[3].append(floor)
+        i = self.index(gain)
+        if now - self.t_short >= self.FAST and self.short[1]:
+            sc, sn, sp = self.short
+            self.short = [0, 0, 0.0]
+            self.t_short = now
+            clip, rms = sc / (2.0 * sn), db10(sp / sn)
+            fl = self.acc[3][-3:]
+            margin = float(np.median(fl)) - self.ADC_FLOOR_DB if fl else None
+            if (clip > self.CLIP_URGENT or rms > self.RMS_URGENT) and i > 0:
+                return self.step(i, self.target(i, -1, urgent=True), now, "overload")
+            if not self.settling and margin is not None and margin < self.MARGIN_FAR:
+                d, why = self.decide(clip, rms, margin, i)
+                if d > 0:
+                    return self.step(i, i + 1, now, "noise far too near the ADC's")
+        if now - self.t_dec < (self.FAST if self.settling else self.SLOW):
+            return None
+        cl, n, pw, fl = self.acc
+        if not n:
+            return None
+        clip, rms = cl / (2.0 * n), db10(pw / n)
+        floor_db = float(np.median(fl)) if fl else None
+        margin = floor_db - self.ADC_FLOOR_DB if floor_db is not None else None
+        if not self.settling and self.decoder in self.SLOTS and not self.in_gap(wall):
+            d, why = self.decide(clip, rms, margin, i)
+            if d:  # keep measuring; step in the gap
+                self.state, self.reason = "waiting for the gap between slots", why
+            return None
+        self.last = {"clip": clip, "rms_dbfs": round(rms, 1),
+                     "floor_db": None if floor_db is None else round(floor_db, 1),
+                     "margin_db": None if margin is None else round(margin, 1)}
+        self.acc = [0, 0, 0.0, []]
+        self.t_dec = now
+        d, why = self.decide(clip, rms, margin, i)
+        self.reason = why
+        if d and why not in ("clipping", "near full scale"):
+            if self.barred.get((i, d), -1.0) > now:
+                d, why = 0, why + "; held, as the step flip-flopped"
+                self.reason = why
+            elif self.last_step and now - self.last_step[2] < self.REVERSAL_S and \
+                    (self.last_step[1] - self.last_step[0]) * d < 0:
+                self.barred[(i, d) if d < 0 else (self.last_step[0], -1)] = now + self.BAR_S
+                if d < 0:  # stay up here
+                    d, why = 0, why + "; held, as the step flip-flopped"
+                    self.reason = why
+        if d:
+            self.holds = 0
+            j = self.jump(i, d, rms, margin) if self.settling else i + d
+            if why not in ("clipping", "near full scale"):
+                self.last_step = (i, j, now)
+            return self.step(i, j, now, why)
+        self.holds += 1
+        if self.settling and (self.holds >= 2 or now - self.t_start > self.SETTLE_FOR):
+            self.settling = False
+        self.state = "settling" if self.settling else "holding"
+        return None
+
+    def step(self, i, j, now, why):
+        self.reason = why
+        self.acc = [0, 0, 0.0, []]
+        self.short = [0, 0, 0.0]
+        self.t_dec = self.t_short = now
+        self.holds = 0
+        if j == i:
+            return None
+        self.steps += 1
+        self.state = "settling" if self.settling else "stepped"
+        return self.gains[j]
+
+    def status(self):
+        return dict(self.last, state=self.state, reason=self.reason, steps=self.steps,
+                    cpu=round(self.cpu, 4))
+
+
+# ------------------------------------------------------- listening audio
+
+# audio_* in /api/tune and the profile's "audio": {...}. nr is None for "by
+# mode": on for voice (AM, FM, USB, LSB), off for WFM, whose music the
+# noise estimate would eat into on long notes.
+AUDIO_KEYS = ("auto", "nr", "filter", "norm", "limit", "squelch")
+
+
+def audio_settings(p):
+    a = {k: True for k in AUDIO_KEYS}
+    a["nr"] = None
+    return audio_update(a, {"audio_" + k: v for k, v in (p or {}).items()})
+
+
+def audio_update(cur, fields):
+    out = dict(cur)
+    for name, v in fields.items():
+        k = name[len("audio_"):] if name.startswith("audio_") else None
+        if k not in AUDIO_KEYS:
+            raise ValueError("unknown audio setting %s" % name)
+        if not (isinstance(v, bool) or (k == "nr" and v is None)):
+            raise ValueError("%s must be true or false%s" % (name, " or null" if k == "nr" else ""))
+        out[k] = v
+    return out
+
+
+class NoiseReducer:
+    """Spectral subtraction on 48 kHz audio: 512-point frames, half overlap.
+
+    The noise is each bin's smoothed power at its quietest, let rise
+    RISE_DB_S a second so it follows a changing band; a bin keeps
+    1 - OVER * noise / power of itself, but never less than FLOOR. About
+    11 ms of delay.
+    """
+
+    N, H = 512, 256
+    RISE_DB_S = 3.0        # a held note 40 dB over the noise lasts ~13 s untouched
+    OVER = 4.0             # the quietest of a smoothed power reads low: make up
+    FLOOR = 0.18           # -15 dB
+    SMOOTH = 0.2
+
+    def __init__(self):
+        n = np.arange(self.N)
+        self.win = np.sqrt(0.5 - 0.5 * np.cos(2 * np.pi * n / self.N)).astype(np.float32)
+        self.buf = np.zeros(self.H, np.float32)       # input not yet framed
+        self.fifo = np.zeros(self.H, np.float32)      # output not yet given out
+        self.tail = np.zeros(self.H, np.float32)      # overlap from the last frame
+        self.rise = 10 ** (self.RISE_DB_S * self.H / AUDIO_RATE / 10)
+        self.s = None          # smoothed power per bin
+        self.noise = None
+
+    def __call__(self, a):
+        N, H = self.N, self.H
+        data = np.concatenate([self.buf, a.astype(np.float32)])
+        m = (len(data) - H) // H
+        if m > 0:
+            fr = np.lib.stride_tricks.sliding_window_view(data, N)[::H][:m]
+            X = np.fft.rfft(fr * self.win, axis=1)
+            P = (X.real ** 2 + X.imag ** 2).astype(np.float64)
+            if self.s is None:  # start from the typical bin, so a tone isn't "noise"
+                self.s = P[0].copy()
+                self.noise = np.minimum(P[0], np.median(P[0]))
+            S, _ = sps.lfilter([self.SMOOTH], [1, self.SMOOTH - 1], P, axis=0,
+                               zi=(1 - self.SMOOTH) * self.s[None, :])
+            # noise_k = min(noise_{k-1} * rise, S_k), all frames at once
+            r = self.rise ** np.arange(1, m + 1)[:, None]
+            runs = np.minimum.accumulate(np.vstack([self.noise[None, :], S / r]), axis=0)[1:]
+            Nk = runs * r
+            self.s, self.noise = S[-1], Nk[-1]
+            G = np.maximum(1 - self.OVER * Nk / (S + 1e-20), self.FLOOR)
+            y = np.fft.irfft(X * G, n=N, axis=1).astype(np.float32) * self.win
+            out = (np.vstack([self.tail[None, :], y[:-1, H:]]) + y[:, :H]).ravel()
+            self.tail = y[-1, H:].copy()
+            self.buf = data[m * H:]
+            self.fifo = np.concatenate([self.fifo, out])
+        else:
+            self.buf = data
+        n = len(a)
+        res, self.fifo = self.fifo[:n], self.fifo[n:]
+        if len(res) < n:   # can't happen with the H samples banked first
+            res = np.concatenate([res, np.zeros(n - len(res), np.float32)])
+        return res
+
+
+def soft_limit(a, knee=0.6, ceil=0.97):
+    """Unchanged below knee; above it, a tanh curve up to ceil."""
+    m = np.abs(a) > knee
+    if not m.any():
+        return a
+    y = a.copy()
+    v = np.abs(a[m])
+    y[m] = np.sign(a[m]) * (knee + (ceil - knee) * np.tanh((v - knee) / (ceil - knee)))
+    return y
+
+
+class AudioFx:
+    """Clean-up for listening: never on the audio a decoder gets.
+
+    In order: an automatic noise squelch (NFM), a hum and DC filter (on NFM a
+    300-3500 Hz voice band, so sub-audible tones and the discriminator's hiss
+    go too), the noise reducer, a loudness normaliser so quiet and loud
+    stations come out alike, and a soft limiter.
+    """
+
+    # mode -> (high-pass Hz, its order, low-pass Hz or None)
+    FILTERS = {"USB": (100.0, 2, None), "LSB": (100.0, 2, None), "AM": (100.0, 4, None),
+               "FM": (300.0, 6, 3500.0), "WFM": (30.0, 2, None)}
+    TARGET_DB = -20.0                  # RMS the normaliser aims at, dBFS
+    GAIN_MIN_DB, GAIN_MAX_DB = -20.0, 12.0  # +12: dead air stays quiet
+    NORM_GATE_DB = -60.0               # quieter than this doesn't move it
+    SQ_BAND = (8000.0, 16000.0)        # NFM noise squelch measures here
+    SQ_OPEN_DB, SQ_CLOSE_DB = 6.0, 3.0  # quieter than pure noise by, to open/close
+    SQ_HANG = 3                        # blocks it stays open after the signal goes
+
+    def __init__(self, mode, bandwidth):
+        self.mode, self.bandwidth = mode, bandwidth
+        hp, order, lp = self.FILTERS[mode]
+        sos = sps.butter(order, hp, "highpass", fs=AUDIO_RATE, output="sos")
+        if lp:
+            sos = np.vstack([sos, sps.butter(6, lp, "lowpass", fs=AUDIO_RATE, output="sos")])
+        self.sos = sos
+        self.zi = np.zeros((sos.shape[0], 2))
+        self.nr = NoiseReducer()
+        self.level = None      # the normaliser's loudness estimate, dBFS
+        self.gain = 1.0
+        self.sq_open, self.sq_hang = True, 0
+        self.sq_ref = self.noise_ref(bandwidth) if mode == "FM" else None
+        self.sq_quiet = None   # dB quieter than pure noise, last block
+        self.active = []
+        self.cpu = 0.0
+
+    @classmethod
+    def hf_power(cls, a):
+        if len(a) < 64:
+            return None
+        X = np.fft.rfft(a)
+        f = np.fft.rfftfreq(len(a), 1.0 / AUDIO_RATE)
+        sel = (f >= cls.SQ_BAND[0]) & (f < cls.SQ_BAND[1])
+        return float(np.mean(X.real[sel] ** 2 + X.imag[sel] ** 2)) / len(a)
+
+    @classmethod
+    def noise_ref(cls, bandwidth):
+        """What the NFM discriminator gives for noise alone, in SQ_BAND: it
+        depends only on the channel filter, not on the noise's level."""
+        rng = np.random.default_rng(5)
+        ch = Chain("FM", bandwidth, 0, 0)
+        x = (rng.standard_normal(72000) + 1j * rng.standard_normal(72000)).astype(np.complex64)
+        a = ch(x * 0.01, 50000.0)
+        return cls.hf_power(a[len(a) // 3:])
+
+    def nr_on(self, opt):
+        return opt["nr"] if opt["nr"] is not None else self.mode != "WFM"
+
+    def squelch(self, a):
+        p = self.hf_power(a)
+        if p is None or not self.sq_ref:
+            return
+        self.sq_quiet = db10(self.sq_ref) - db10(p)
+        if self.sq_quiet >= (self.SQ_CLOSE_DB if self.sq_open else self.SQ_OPEN_DB):
+            self.sq_open, self.sq_hang = True, self.SQ_HANG
+        elif self.sq_hang > 0:
+            self.sq_hang -= 1
+        else:
+            self.sq_open = False
+
+    def normalise(self, a, adapt):
+        lv = db10(float(np.mean(a * a))) if len(a) else -120.0
+        if adapt and lv > self.NORM_GATE_DB:
+            if self.level is None:
+                self.level = lv
+            self.level += (lv - self.level) * (0.35 if lv > self.level else 0.03)
+        g_db = 0.0 if self.level is None else \
+            min(max(self.TARGET_DB - self.level, self.GAIN_MIN_DB), self.GAIN_MAX_DB)
+        g = 10 ** (g_db / 20)
+        ramp = np.linspace(self.gain, g, len(a), endpoint=False, dtype=np.float32) \
+            if len(a) else 1.0
+        self.gain = g
+        return a * ramp
+
+    def __call__(self, a, opt, manual_squelch=False):
+        """Audio for the speaker and the phone. opt is Settings.audio."""
+        t0 = time.thread_time()
+        act = []
+        if not opt["auto"]:
+            self.sq_open = True
+            self.active = act
+            return a
+        if self.mode == "FM" and opt["squelch"] and not manual_squelch:
+            self.squelch(a)
+            act.append("squelch")
+        else:
+            self.sq_open = True
+        if opt["filter"]:
+            a, self.zi = sps.sosfilt(self.sos, a, zi=self.zi)
+            a = a.astype(np.float32)
+            act.append("filter")
+        if self.nr_on(opt):
+            a = self.nr(a)
+            act.append("nr")
+        if not self.sq_open:
+            a = np.zeros_like(a)
+        if opt["norm"]:
+            a = self.normalise(a, adapt=self.sq_open)
+            act.append("norm")
+        if opt["limit"]:
+            a = soft_limit(a)
+            act.append("limit")
+        self.active = act
+        dt = time.thread_time() - t0
+        self.cpu += (dt / (len(a) / AUDIO_RATE) - self.cpu) * 0.05 if len(a) else 0
+        return a.astype(np.float32)
+
+    def status(self, opt):
+        return {"auto": opt["auto"], "nr": bool(self.nr_on(opt)), "nr_setting": opt["nr"],
+                "filter": opt["filter"], "norm": opt["norm"], "limit": opt["limit"],
+                "squelch": opt["squelch"], "active": list(self.active),
+                "squelch_open": self.sq_open if "squelch" in self.active else None,
+                "norm_gain_db": round(db10(self.gain ** 2), 1) if "norm" in self.active else None,
+                "cpu": round(self.cpu, 4)}
+
+
 # -------------------------------------------------------------------- engine
 
 class Receiver:
@@ -2865,6 +3346,10 @@ class Receiver:
         self.listen_lock = threading.Lock()
         self.resamplers = {}         # rate -> FirDecimator from 48 kHz
         self.wspr = None             # a WsprDecoder, for a WSPR profile
+        self.autogain = None         # an AutoGain, once the dongle's gains are known
+        self.fx = None               # AudioFx for what's listened to
+        self.clock, self.wallclock = time.monotonic, time.time  # tests run on their own
+        self.bands = None            # the BandPlanner, on a live rxd
 
     def gain_db_for(self, index):
         g = self.src.gains()
@@ -2880,7 +3365,13 @@ class Receiver:
             if self.s.gain_db is None:
                 self.s.gain_db = self.gain_db_for(self.s.gain_index)
         self.src.set_gain(self.s.gain_db)
+        gains = self.src.gains()
+        self.autogain = AutoGain(gains, self.s.decoder) if gains else None
         self.retune(self.s.snapshot(), force=True)
+        # Again after tuning: the R820T can lose a gain set before its first
+        # tune (measured 2026-11-06: the band's floor 22 dB high at 3.7 dB
+        # until the gain was set once more).
+        self.src.set_gain(self.s.gain_db)
         self.version = self.s.snapshot()["version"]
         threading.Thread(target=self.reader, name="reader", daemon=True).start()
         threading.Thread(target=self.dsp, name="dsp", daemon=True).start()
@@ -2946,27 +3437,63 @@ class Receiver:
                     with self.s.lock:
                         self.s.gain_db = self.gain_db_for(self.s.gain_index)
                     snap = self.s.snapshot()
-                self.src.set_gain(snap["gain_db"])
                 self.retune(snap, force=rebuild)
+                self.src.set_gain(snap["gain_db"])  # after a retune, as in start()
                 self.version = snap["version"]
                 if rebuild:
                     continue  # the block in hand was at the old rate
             t0 = time.thread_time()
             audio = self.chain(x, self.offset)
+            self.auto_gain(x, snap)
             if self.wspr is not None:  # before squelch and volume
                 self.wspr.push(audio, snap["dial"])
-            audio = self.gate(audio, snap["squelch"])
+            # Listening clean-up; a decoder's sink (JS8Call's cable) stays clean.
+            heard = self.listening(audio, snap)
+            audio = self.gate(audio if self.s.decoder else heard, snap["squelch"])
             pcm = np.clip(audio * snap["volume"] * 32767, -32768, 32767).astype("<i2")
             self.sink.write(pcm)
             if self.listeners:
-                self.stream(audio)
+                self.stream(heard if self.s.decoder else audio)
             dt = time.thread_time() - t0
             self.cpu += (dt / (len(x) / self.chain.rate) - self.cpu) * 0.05
             self.blocks += 1
-            now = time.monotonic()
+            now = self.clock()
             if now - self.spectrum_at >= self.SPECTRUM_EVERY:
                 self.spectrum_at = now
                 self.spectrum = self.make_spectrum(x, snap)
+
+    def auto_gain(self, x, snap):
+        """Feed AutoGain a block and make the step it asks for."""
+        ag = self.autogain
+        if ag is None:
+            return
+        if not snap["gain_auto"]:
+            ag.key, ag.state = None, "off"
+            return
+        t0 = time.thread_time()
+        now = self.clock()
+        key = (self.chain.mode, round((self.src.center or 0.0) / 1e6))
+        if key != ag.key:  # started, retuned by a MHz or more, or turned back on
+            ag.key = key
+            ag.reset(now)
+        ag.decoder = self.s.decoder
+        floor, sp = None, self.spectrum
+        if sp is not None and sp.get("seq") != ag.spec_seq:
+            ag.spec_seq = sp.get("seq")
+            floor = ag.floor_of(sp["bins"])
+        new = ag.observe(x, snap["gain_db"], now, self.wallclock(), floor)
+        if new is not None and self.s.set_auto_gain(new):
+            self.src.set_gain(new)
+            ag.skip = self.q.qsize() + 2   # blocks already read at the old gain
+            log("auto gain %.1f dB (%s)" % (new, ag.reason))
+        ag.cpu += ((time.thread_time() - t0) / (len(x) / self.chain.rate) - ag.cpu) * 0.05
+
+    def listening(self, audio, snap):
+        """The audio for the speaker and the phone, cleaned up by AudioFx."""
+        if self.fx is None or (self.fx.mode, self.fx.bandwidth) != (self.chain.mode,
+                                                                   self.chain.bandwidth):
+            self.fx = AudioFx(self.chain.mode, self.chain.bandwidth)
+        return self.fx(audio, snap["audio"], manual_squelch=snap["squelch"] is not None)
 
     SPECTRUM_EVERY = 0.2   # seconds: about 5 a second for the clients
     SPECTRUM_BINS = 512
@@ -3053,7 +3580,14 @@ class Receiver:
                 "vfo_hz": snap["dial"] - snap["cal"], "cal_hz": snap["cal"],
                 "mode": snap["mode"], "bandwidth": snap["bandwidth"],
                 "gain_db": snap["gain_db"], "volume": snap["volume"],
-                "squelch": snap["squelch"], "squelch_open": self.squelch_open,
+                "squelch": snap["squelch"],
+                "volume_min": DECODER_MIN_VOLUME if self.s.decoder == "js8" else 0.0,
+                "squelch_open": self.squelch_open and (self.fx is None or self.fx.sq_open),
+                "gain_auto": snap["gain_auto"],
+                "gain_loop": self.autogain.status() if self.autogain is not None else
+                {"state": "unavailable", "reason": "this source has no gain control"},
+                "audio": self.fx.status(snap["audio"]) if self.fx is not None else
+                dict(snap["audio"], active=[]),
                 "offset_mode": snap["offset_mode"], "upconverter_hz": snap["upconverter"],
                 "upconvert_below_hz": snap["upconvert_below"],
                 "level_dbfs": round(self.chain.level_db, 1) if self.chain else None,
@@ -3066,6 +3600,7 @@ class Receiver:
                 "decoder": self.s.decoder,
                 "wspr": self.wspr.status() if self.wspr is not None else None,
                 "clock": clock_status(),
+                "band_plan": self.bands.status() if self.bands is not None else None,
                 "listeners": len(self.listeners)}
 
 
@@ -3717,6 +4252,964 @@ class WsprDecoder:
                 "last": self.last, "error": self.error, "report": report}
 
 
+# ---------------------------------------------------------------- band plan
+
+# With the band plan on Auto, rxd picks the JS8 or WSPR band itself: from the
+# day's band conditions (N0NBH's, from hamqsl.com, or NOAA SWPC's indices
+# when hamqsl can't be had), the sun at the station, and what rxd has heard
+# on each band at this hour. With no conditions (no internet) it scans the
+# bands it has not yet heard at this hour, a couple of WSPR slots or a few
+# minutes of JS8 each, and learns. Band changes go through `radio NAME`, which
+# restarts rxd, so the planner keeps everything on disk and picks up where it
+# was in the next rxd:
+#   ~/.config/rx/bands.json             its settings, as the UI sets them
+#   ~/.local/share/rxd/bands.json       what was heard, per profile and UTC hour
+#   ~/.local/share/rxd/bandplan.json    where it is: scanning or holding, and why
+#   ~/.local/share/rxd/conditions.json  the last band conditions fetched
+BANDS_CONF = os.path.expanduser(os.environ.get("RXD_BANDS_CONF", "~/.config/rx/bands.json"))
+BANDS_DIR = os.path.expanduser(os.environ.get("RXD_BANDS_DIR", "~/.local/share/rxd"))
+HAMQSL_URL = os.environ.get("RXD_HAMQSL", "https://www.hamqsl.com/solarxml.php")
+SWPC_FLUX_URL = os.environ.get("RXD_SWPC_FLUX",
+                               "https://services.swpc.noaa.gov/json/f107_cm_flux.json")
+SWPC_KP_URL = os.environ.get("RXD_SWPC_KP",
+                             "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json")
+HF_BANDS = ("160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m")
+BAND_ORDER = ("2190m", "630m") + HF_BANDS + ("6m", "2m")
+PLAN_MODES = ("wspr", "js8")
+# N0NBH's calculated conditions come in four groups of HF bands.
+HAMQSL_GROUP = {"160m": "80m-40m", "80m": "80m-40m", "60m": "80m-40m", "40m": "80m-40m",
+                "30m": "30m-20m", "20m": "30m-20m", "17m": "17m-15m", "15m": "17m-15m",
+                "12m": "12m-10m", "10m": "12m-10m"}
+COND_VALUE = {"good": 1.0, "fair": 0.6, "poor": 0.2}
+# What a mid-latitude station usually hears, by the sun: low bands at night,
+# high bands by day, the middle ones around the gray line. 0 to 1.
+BAND_PRIOR = {
+    "day": {"2190m": .05, "630m": .1, "160m": .05, "80m": .25, "60m": .45, "40m": .6,
+            "30m": .8, "20m": 1.0, "17m": .9, "15m": .8, "12m": .6, "10m": .5,
+            "6m": .15, "2m": .05},
+    "gray": {"2190m": .3, "630m": .4, "160m": .5, "80m": .75, "60m": .75, "40m": .9,
+             "30m": .85, "20m": .85, "17m": .6, "15m": .45, "12m": .3, "10m": .25,
+             "6m": .1, "2m": .05},
+    "night": {"2190m": .5, "630m": .7, "160m": .7, "80m": .9, "60m": .8, "40m": 1.0,
+              "30m": .8, "20m": .45, "17m": .25, "15m": .15, "12m": .1, "10m": .08,
+              "6m": .05, "2m": .05},
+}
+PART_WORDS = {"day": "day", "night": "night", "gray": "gray line"}
+# What counts as a lot heard: WSPR spots per two-minute slot, JS8 decodes a minute.
+HEARD_SCALE = {"wspr": 10.0, "js8": 2.0}
+# How much listening makes one good look at a band: two WSPR slots, six minutes of JS8.
+HEARD_PER = {"wspr": 2.0, "js8": 6.0}
+PLAN_DEFAULTS = {"plan": "auto", "mode": "wspr", "bands": None, "dwell_min": 6,
+                 "every_min": 30, "cross_side": False}
+CREDITS = {"hamqsl": "Band conditions courtesy of N0NBH, www.hamqsl.com",
+           "swpc": "Solar indices from NOAA SWPC; band conditions estimated by rxd"}
+
+
+def band_label(band):
+    """"20m" -> "20 m"."""
+    return band[:-1] + " m" if band and band.endswith("m") and not band.endswith("cm") else \
+        (band or "?")
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, doc):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=1)
+    os.replace(tmp, path)
+
+
+def http_get(url, timeout=10.0, limit=262144):
+    import urllib.request  # here, not at the top: only the band plan fetches
+    req = urllib.request.Request(url, headers={"User-Agent": RXD_VERSION + " (band plan)"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(limit)
+
+
+# ------------------------------------------------------- band conditions
+
+def _num(text):
+    m = re.search(r"-?\d+(?:\.\d+)?", text or "")
+    return float(m.group(0)) if m else None
+
+
+def parse_hamqsl(xml):
+    """N0NBH's solarxml.php -> {"source", "updated", "sfi", "a", "k", "bands", "vhf", ...}.
+
+    "bands" is {"80m-40m": {"day": "Fair", "night": "Good"}, ...}, as they
+    calculate it; "vhf" is their E-skip and aurora words by location."""
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml)
+    sd = root.find("solardata") if root.tag == "solar" else root
+    if sd is None:
+        raise ValueError("no solardata in the hamqsl XML")
+
+    def text(tag):
+        el = sd.find(tag)
+        return el.text.strip() if el is not None and el.text else ""
+    bands = {}
+    for b in sd.iter("band"):
+        name, when = b.get("name"), (b.get("time") or "").lower()
+        if name and when in ("day", "night") and b.text:
+            bands.setdefault(name, {})[when] = b.text.strip()
+    vhf = {}
+    for ph in sd.iter("phenomenon"):
+        if ph.text:
+            vhf["%s %s" % (ph.get("name"), ph.get("location"))] = ph.text.strip()
+    sfi = _num(text("solarflux"))
+    if sfi is None or not bands:
+        raise ValueError("the hamqsl XML has no solar flux or band conditions")
+    k = _num(text("kindex"))
+    a = _num(text("aindex"))
+    return {"source": "hamqsl", "updated": text("updated"), "sfi": int(sfi),
+            "a": int(a) if a is not None else None, "k": int(k) if k is not None else None,
+            "bands": bands, "vhf": vhf, "geomag": text("geomagfield") or None,
+            "noise": text("signalnoise") or None}
+
+
+def model_conditions(sfi, k):
+    """Day and night words for hamqsl's four HF groups from SFI and K alone: a
+    rough stand-in for N0NBH's calculation, used when only NOAA answers."""
+    hi = min(max((sfi - 65) / 100.0, 0.0), 1.0)      # SFI 65 -> 0, 165 -> 1
+    storm = min(max(((k or 0) - 3) / 4.0, 0.0), 1.0)  # K 3 -> 0, K 7 -> 1
+
+    def word(v):
+        v *= 1 - 0.7 * storm
+        return "Good" if v >= 0.7 else "Fair" if v >= 0.4 else "Poor"
+    day = {"80m-40m": .55, "30m-20m": .6 + .4 * hi, "17m-15m": .25 + .7 * hi,
+           "12m-10m": .1 + .8 * hi}
+    night = {"80m-40m": .85, "30m-20m": .4 + .4 * hi, "17m-15m": .1 + .5 * hi,
+             "12m-10m": .05 + .3 * hi}
+    return {g: {"day": word(day[g]), "night": word(night[g])} for g in day}
+
+
+def parse_swpc(flux_json, kp_json):
+    """NOAA SWPC's 10.7 cm flux and planetary K JSON -> the same shape as parse_hamqsl."""
+    flux = json.loads(flux_json)
+    rows = [r for r in flux if isinstance(r, dict) and r.get("flux") is not None]
+    if not rows:
+        raise ValueError("no solar flux in SWPC's JSON")
+    latest = max(rows, key=lambda r: r.get("time_tag") or "")
+    sfi = float(latest["flux"])
+    kp = json.loads(kp_json)
+    k = a = None
+    if kp and isinstance(kp[0], list):  # the older shape: a header row, then rows
+        head = kp[0]
+        last = kp[-1]
+        k = float(last[head.index("Kp")]) if "Kp" in head else None
+        a = float(last[head.index("a_running")]) if "a_running" in head else None
+    elif kp:
+        last = max((r for r in kp if isinstance(r, dict)), key=lambda r: r.get("time_tag") or "")
+        k, a = last.get("Kp"), last.get("a_running")
+    k = int(round(float(k))) if k is not None else None
+    return {"source": "swpc", "updated": latest.get("time_tag"), "sfi": int(round(sfi)),
+            "a": int(a) if a is not None else None, "k": k,
+            "bands": model_conditions(sfi, k), "vhf": {}, "geomag": None, "noise": None}
+
+
+class Conditions:
+    """Band conditions, fetched at most every 45 minutes and kept on disk, so
+    the rxd that starts after each band switch doesn't fetch them again."""
+
+    MAX_AGE = 45 * 60    # fetch again after this
+    RETRY = 15 * 60      # after a failure, wait this long
+    STALE = 3 * 3600     # older than this, they're no guide
+
+    def __init__(self, path, fetch=None, clock=time.time):
+        self.path = path
+        self.fetch = fetch or http_get
+        self.clock = clock
+        self.doc = read_json(path, {}) or {}
+
+    def due(self, now=None):
+        now = self.clock() if now is None else now
+        d = self.doc
+        return now - (d.get("fetched") or 0) >= self.MAX_AGE and \
+            now - (d.get("tried") or 0) >= self.RETRY
+
+    def refresh(self, now=None):
+        """Fetch them (blocking, up to about 20 s); True if they came."""
+        now = self.clock() if now is None else now
+        errors = []
+        cond = None
+        try:
+            cond = parse_hamqsl(self.fetch(HAMQSL_URL))
+        except Exception as e:  # noqa: BLE001 - any failure falls back to NOAA
+            errors.append("hamqsl: %s" % (getattr(e, "reason", None) or e))
+        if cond is None:
+            try:
+                cond = parse_swpc(self.fetch(SWPC_FLUX_URL), self.fetch(SWPC_KP_URL))
+            except Exception as e:  # noqa: BLE001
+                errors.append("NOAA: %s" % (getattr(e, "reason", None) or e))
+        d = dict(self.doc, tried=now)
+        if cond is not None:
+            d.update(fetched=now, cond=cond, error=None)
+        else:
+            d["error"] = "; ".join(str(x) for x in errors)[:200]
+            log("band conditions: %s" % d["error"])
+        self.doc = d
+        try:
+            write_json(self.path, d)
+        except OSError as e:
+            log("can't keep band conditions in %s: %s" % (self.path, e))
+        return cond is not None
+
+    def current(self, now=None):
+        """The conditions if they're fresh enough to steer by, else None."""
+        now = self.clock() if now is None else now
+        if self.doc.get("cond") and now - (self.doc.get("fetched") or 0) < self.STALE:
+            return self.doc["cond"]
+        return None
+
+    def error(self):
+        return self.doc.get("error")
+
+
+# ------------------------------------------------------------- the sun
+
+def sun_elevation(lat, lon, t):
+    """The sun's elevation in degrees at (lat, lon) at Unix time t; good to a
+    fraction of a degree, which is plenty for day, night and gray line."""
+    import math
+    d = t / 86400.0 + 2440587.5 - 2451545.0  # days since J2000
+    g = math.radians((357.529 + 0.98560028 * d) % 360)
+    q = (280.459 + 0.98564736 * d) % 360
+    lam = math.radians((q + 1.915 * math.sin(g) + 0.020 * math.sin(2 * g)) % 360)
+    eps = math.radians(23.439 - 0.00000036 * d)
+    ra = math.atan2(math.cos(eps) * math.sin(lam), math.cos(lam))
+    dec = math.asin(math.sin(eps) * math.sin(lam))
+    gmst = (18.697374558 + 24.06570982441908 * d) % 24
+    ha = math.radians(gmst * 15 + lon) - ra
+    la = math.radians(lat)
+    return math.degrees(math.asin(math.sin(la) * math.sin(dec) +
+                                  math.cos(la) * math.cos(dec) * math.cos(ha)))
+
+
+def day_part(t, latlon=None):
+    """"day", "gray" (the sun within 6 degrees of the horizon) or "night".
+    With no location, this machine's local clock stands in for the sun."""
+    if latlon:
+        e = sun_elevation(latlon[0], latlon[1], t)
+        return "day" if e > 6 else "night" if e < -6 else "gray"
+    h = time.localtime(t).tm_hour
+    return "day" if 8 <= h < 17 else "gray" if h in (6, 7, 17, 18) else "night"
+
+
+def sun_times(t, latlon):
+    """(sunrise, sunset) Unix times on t's local day, either None if it doesn't
+    happen (or no location)."""
+    if not latlon:
+        return None, None
+    lt = time.localtime(t)
+    start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    rise = sset = None
+    prev = sun_elevation(latlon[0], latlon[1], start)
+    for m in range(5, 24 * 60 + 1, 5):
+        e = sun_elevation(latlon[0], latlon[1], start + m * 60)
+        if prev < -0.833 <= e and rise is None:
+            rise = start + m * 60
+        if prev >= -0.833 > e and sset is None:
+            sset = start + m * 60
+        prev = e
+    return rise, sset
+
+
+# ----------------------------------------------------- scoring a band
+
+def cond_value(band, cond, part):
+    """0 to 1: how good the conditions say band is now, or None if they don't say."""
+    if not cond:
+        return None
+    if band in HAMQSL_GROUP:
+        g = (cond.get("bands") or {}).get(HAMQSL_GROUP[band]) or {}
+        vals = [COND_VALUE.get((g.get(w) or "").lower()) for w in
+                (("day", "night") if part == "gray" else (part,))]
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            return None
+        v = sum(vals) / len(vals)
+        if band == "160m" and part == "day":
+            v *= 0.3  # the 80-40 group says little about 160 m by day
+        return v
+    vhf = " ".join((cond.get("vhf") or {}).values()).lower()
+    if band == "6m":
+        if "50mhz" in vhf or "6m es" in vhf:
+            return 1.0
+        sfi = cond.get("sfi") or 0
+        return 0.6 if part == "day" and sfi >= 180 else 0.1
+    if band == "2m":
+        return 1.0 if "144mhz" in vhf else 0.05
+    return None  # 2190 m and 630 m: the sun and what's heard are the guide
+
+
+def band_score(band, part, cond, heard):
+    """(score 0..1, what it rests on: "conditions", "heard" or "usual").
+
+    heard is (how much was heard 0..1, how many good looks that rests on).
+    The conditions and the usual pattern for the time of day make the base;
+    what rxd has actually heard here at this hour soon outweighs them, since
+    hearing the most is the point: 72 % after one good look, up to 90 %."""
+    prior = BAND_PRIOR[part].get(band, 0.1)
+    c = cond_value(band, cond, part)
+    base = prior if c is None else 0.4 * prior + 0.6 * c
+    h, n = heard or (0.0, 0.0)
+    w = 0.9 * n / (n + 0.25) if n > 0 else 0.0
+    return round((1 - w) * base + w * h, 4), ("conditions" if c is not None else "usual"), w
+
+
+class BandHistory:
+    """What rxd heard on each profile, by UTC hour, kept on disk.
+
+    A sample is one visit's worth in one hour: units (WSPR slots decoded, or
+    minutes of JS8), count (spots or decodes), calls (distinct stations) and
+    the median signal level. Old samples count for less: half every 14 days."""
+
+    KEEP_DAYS = 60
+    PER_HOUR = 40
+    HALF_LIFE = 14 * 86400.0
+
+    def __init__(self, path, clock=time.time):
+        self.path = path
+        self.clock = clock
+        doc = read_json(path, {}) or {}
+        self.bands = doc.get("bands") if isinstance(doc.get("bands"), dict) else {}
+
+    def save(self):
+        try:
+            write_json(self.path, {"version": 1, "bands": self.bands})
+        except OSError as e:
+            log("can't keep the band history in %s: %s" % (self.path, e))
+
+    def add(self, name, t, units, count, calls, visit, level=None):
+        """Add to the sample for this visit and hour (made if it's new)."""
+        hour = "%02d" % time.gmtime(t).tm_hour
+        rows = self.bands.setdefault(name, {}).setdefault(hour, [])
+        s = rows[-1] if rows and rows[-1].get("v") == visit else None
+        if s is None:
+            s = {"t": round(t), "v": visit, "units": 0, "count": 0, "calls": 0}
+            rows.append(s)
+        s["units"] += units
+        s["count"] += count
+        s["calls"] += calls
+        s["t"] = round(t)
+        if level is not None:
+            s["level"] = round(level, 1)
+        cut = self.clock() - self.KEEP_DAYS * 86400
+        rows[:] = [x for x in rows if x.get("t", 0) >= cut][-self.PER_HOUR:]
+        self.save()
+
+    def heard(self, name, t, scale, per=1.0):
+        """(0..1, good looks it rests on, rate) for name around t's UTC hour;
+        per is how many units make one good look."""
+        hour = time.gmtime(t).tm_hour
+        now = self.clock()
+        wsum = rsum = 0.0
+        for dh, wh in ((0, 1.0), (-1, 0.5), (1, 0.5)):
+            for s in (self.bands.get(name) or {}).get("%02d" % ((hour + dh) % 24), []):
+                if not s.get("units"):
+                    continue
+                w = wh * 0.5 ** (max(0.0, now - s.get("t", now)) / self.HALF_LIFE) * \
+                    min(s["units"] / per, 3.0)
+                rate = (s.get("count", 0) + s.get("calls", 0)) / 2.0 / s["units"]
+                wsum += w
+                rsum += w * rate
+        if wsum <= 0:
+            return 0.0, 0.0, None
+        import math
+        rate = rsum / wsum
+        return 1 - math.exp(-rate / scale), wsum, rate
+
+
+def js8_decoding(rx):
+    """Whether something is decoding JS8 for rxd: rxd's own decoder when it has
+    one (rx.js8_decoder with a status() saying "running"), else JS8Call."""
+    dec = getattr(rx, "js8_decoder", None)
+    if dec is not None and hasattr(dec, "status"):
+        try:
+            return bool(dec.status().get("running", True))
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        return subprocess.run(["pgrep", "-x", "js8call"], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=5).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+class BandPlanner:
+    """Auto: choose and hop bands; Manual: stay put. Runs in rxd, one tick
+    every few seconds, and keeps its state on disk across rxd's restarts."""
+
+    TICK = 5.0
+    SCAN_SLOTS = 2          # WSPR slots a band needs, scanning
+    SETTLE = 90.0           # a switch asked for this recently is still under way
+    STAY = 0.85             # stay unless another band scores this much better
+    RESCAN = 20 * 3600.0    # a band scanned at this hour this recently counts as heard
+    ROWS_EVERY = 60.0       # how often radio's profile list is re-read
+
+    def __init__(self, rx, js8=None, conf_path=None, data_dir=None, profiles=None,
+                 switch=None, conditions=None, clock=time.time, latlon=Ellipsis,
+                 synced=None, js8_alive=None):
+        self.rx = rx
+        self.js8 = js8
+        self.conf_path = conf_path or BANDS_CONF
+        d = data_dir or BANDS_DIR
+        self.state_path = os.path.join(d, "bandplan.json")
+        self.profiles = profiles or list_profiles
+        self.switch_fn = switch or spawn_switch
+        self.clock = clock
+        self.cond = conditions or Conditions(os.path.join(d, "conditions.json"), clock=clock)
+        self.history = BandHistory(os.path.join(d, "bands.json"), clock=clock)
+        if latlon is Ellipsis:
+            latlon = grid_latlon(station_id()[1])
+        self.latlon = latlon
+        self.synced = synced or (lambda: clock_status().get("synced") is not False)
+        self.js8_alive = js8_alive or (lambda: js8_decoding(rx))
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.conf = self.load_conf()
+        self.state = read_json(self.state_path, None)
+        self.fresh = self.state is None
+        self.state = self.state if isinstance(self.state, dict) else {}
+        self.rows, self.rows_at, self.rows_error = None, -1e18, None
+        self.tried_at = -1e18
+        self.scores = {}
+        self.doc = None
+        now = clock()
+        w = rx.wspr
+        self.visit = {"name": rx.s.name, "t": now, "id": int(now), "slots": 0, "units": 0.0,
+                      "count": 0, "levels": [], "wspr_last": w.last if w else None,
+                      "wspr_seq": w.seq if w else 0, "js8_seq": None, "js8_at": now}
+        self.arrive(now)
+
+    # ----------------------------------------------------- settings, state
+
+    def load_conf(self):
+        c = dict(PLAN_DEFAULTS)
+        doc = read_json(self.conf_path, {})
+        if isinstance(doc, dict):
+            try:
+                c.update(self.check(doc))
+            except ValueError as e:
+                log("ignoring %s: %s" % (self.conf_path, e))
+        return c
+
+    @staticmethod
+    def check(doc):
+        """The valid settings in doc; ValueError for one that isn't."""
+        out = {}
+        for k, v in doc.items():
+            if k == "plan":
+                if v not in ("auto", "manual"):
+                    raise ValueError("plan must be auto or manual")
+            elif k == "mode":
+                if v not in PLAN_MODES:
+                    raise ValueError("mode must be wspr or js8")
+            elif k == "bands":
+                if v is not None and (not isinstance(v, list) or
+                                      any(b not in BAND_ORDER for b in v)):
+                    raise ValueError("bands must be null (the default) or a list of: " +
+                                     ", ".join(BAND_ORDER))
+                v = None if v is None else [b for b in BAND_ORDER if b in v]
+            elif k == "dwell_min":
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not 2 <= v <= 60:
+                    raise ValueError("dwell_min must be 2 to 60 minutes")
+            elif k == "every_min":
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not 10 <= v <= 240:
+                    raise ValueError("every_min must be 10 to 240 minutes")
+            elif k == "cross_side":
+                if not isinstance(v, bool):
+                    raise ValueError("cross_side must be true or false")
+            else:
+                continue  # scan and anything unknown are not settings
+            out[k] = v
+        return out
+
+    def save_conf(self):
+        try:
+            write_json(self.conf_path, self.conf)
+        except OSError as e:
+            log("can't save the band plan's settings in %s: %s" % (self.conf_path, e))
+
+    def save_state(self):
+        try:
+            write_json(self.state_path, self.state)
+        except OSError as e:
+            log("can't keep the band plan's state in %s: %s" % (self.state_path, e))
+
+    def arrive(self, now):
+        """A new rxd on rx.s.name: carry on if the plan sent it here, or go
+        Manual if someone switched to it by hand (radio NAME, a picker)."""
+        name = self.rx.s.name
+        st = self.state
+        if not self.fresh and self.conf["plan"] == "auto" and \
+                name not in (st.get("on"), st.get("requested")):
+            self.conf["plan"] = "manual"
+            self.save_conf()
+            st["reason"] = "Manual: %s was chosen outside the band plan" % name
+            log("band plan: Manual, since %s was switched to by hand" % name)
+        st["on"], st["requested"], st["requested_at"] = name, None, None
+        if self.fresh:
+            st["after_scan"] = True  # the very first choice: the best band, no margin
+        self.save_state()
+
+    # ------------------------------------------------------------- inputs
+
+    def profile_rows(self, now, force=False):
+        if force or self.rows is None or now - self.rows_at >= self.ROWS_EVERY:
+            try:
+                self.rows = self.profiles()["profiles"]
+                self.rows_error = None
+            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as e:
+                self.rows_error = str(e)
+            self.rows_at = now
+        return self.rows or []
+
+    def side_up(self):
+        """True if the Ham It Up is (as far as rxd knows) on UPCONVERT: the side
+        the running profile needs, which is how Win last set the switch."""
+        with self.rx.s.lock:
+            return self.rx.s.upconverter() > 0
+
+    def enabled(self, up):
+        b = self.conf.get("bands")
+        if b is None:  # the default: every band (Win's call, 2026-11-06); the side
+            return list(BAND_ORDER)  # rule still keeps Auto to the switch's side
+        return list(b)
+
+    def plan_rows(self, now, mode=None):
+        mode = mode or self.conf["mode"]
+        return [r for r in self.profile_rows(now)
+                if r.get("plan") and r.get("decoder") == mode and r.get("band")]
+
+    def candidates(self, now):
+        """(the profiles Auto may pick from, {band: why not} for the others)."""
+        up = self.side_up()
+        en = self.enabled(up)
+        out, why = [], {}
+        for r in self.plan_rows(now):
+            if r["band"] not in en:
+                why[r["band"]] = "not enabled"
+            elif bool(r.get("upconvert")) != up and not self.conf["cross_side"]:
+                why[r["band"]] = "needs the Ham It Up on %s" % (
+                    "UPCONVERT" if r.get("upconvert") else "BYPASS")
+            else:
+                out.append(r)
+        return out, why
+
+    def current_row(self, now):
+        name = self.rx.s.name
+        return next((r for r in self.profile_rows(now) if r.get("name") == name), None)
+
+    # ------------------------------------------------------------ learning
+
+    def sample(self, now):
+        """Count what was heard on this band since the last tick."""
+        v = self.visit
+        row = self.current_row(now)
+        if not row or not row.get("band") or not row.get("plan"):
+            return
+        snap = self.rx.s.snapshot()
+        if abs(snap["dial"] - float(row.get("freq") or 0)) > 5000:
+            return  # retuned by hand within the profile: not this band's dial
+        chain = self.rx.chain
+        if chain is not None and snap.get("gain_db") is not None:
+            v["levels"].append(chain.level_db)
+            del v["levels"][:-240]
+        if not self.synced():
+            return  # with the clock off nothing decodes; that says nothing of the band
+        w = self.rx.wspr
+        if row.get("decoder") == "wspr" and w is not None:
+            last = w.last
+            if last and last != v["wspr_last"]:
+                v["wspr_last"] = last
+                got = w.since(v["wspr_seq"])
+                v["wspr_seq"] = got["seq"]
+                calls = {x.get("call") for x in got["lines"] if x.get("call")}
+                try:
+                    import calendar
+                    t = calendar.timegm(time.strptime(last["slot"], "%Y-%m-%dT%H:%M:00Z"))
+                except (ValueError, KeyError, TypeError):
+                    t = now
+                v["slots"] += 1
+                v["units"] += 1
+                v["count"] += int(last.get("spots") or 0)
+                self.history.add(row["name"], t, 1, int(last.get("spots") or 0), len(calls),
+                                 v["id"], self.level())
+        elif row.get("decoder") == "js8" and self.js8 is not None:
+            if v["js8_seq"] is None:
+                v["js8_seq"] = self.js8.since(0)["seq"]
+                v["js8_at"] = now
+                return
+            if now - v["js8_at"] < 60:
+                return
+            minutes = (now - v["js8_at"]) / 60.0
+            got = self.js8.since(v["js8_seq"])
+            v["js8_seq"], v["js8_at"] = got["seq"], now
+            if not self.js8_alive():
+                return
+            dial = snap["dial"]
+            lines = [x for x in got["lines"]
+                     if abs(float(x.get("freq") or 0) - dial) < 3000]
+            calls = {x.get("from") for x in lines if x.get("from")}
+            v["units"] += minutes
+            v["count"] += len(lines)
+            self.history.add(row["name"], now, round(minutes, 2), len(lines), len(calls),
+                             v["id"], self.level())
+
+    def level(self):
+        lv = sorted(self.visit["levels"])
+        return lv[len(lv) // 2] if lv else None
+
+    def heard(self, name, mode, now):
+        return self.history.heard(name, now, HEARD_SCALE.get(mode, 3.0),
+                                  HEARD_PER.get(mode, 1.0))
+
+    def visit_done(self, now):
+        v = self.visit
+        dwell = max(float(self.conf["dwell_min"]), 2.0) * 60
+        if now - v["t"] < dwell:
+            return False
+        if self.conf["mode"] == "wspr" and v["slots"] < self.SCAN_SLOTS:
+            # no slots at all for long past the dwell: wsprd or the audio is
+            # broken here; move on rather than wait forever
+            return now - v["t"] > dwell + 6 * 60
+        return True
+
+    def quiet(self, now):
+        """Not in the middle of decoding a WSPR slot, whose spots a switch would lose."""
+        w = self.rx.wspr
+        if w is None:
+            return True
+        if w.decoding is not None or not w.jobs.empty():
+            return False
+        return w.slot is None or now - w.slot < 60 or self.visit["slots"] == 0
+
+    # ------------------------------------------------------------ deciding
+
+    def part(self, now):
+        return day_part(now, self.latlon)
+
+    def score_all(self, rows, now, cond):
+        part = self.part(now)
+        out = {}
+        for r in rows:
+            h, n, rate = self.heard(r["name"], r["decoder"], now)
+            s, basis, w = band_score(r["band"], part, cond, (h, n))
+            out[r["name"]] = {"score": s, "basis": basis, "heard_w": w, "visits": round(n, 2),
+                              "rate": round(rate, 2) if rate is not None else None}
+        return out
+
+    def because(self, row, sc, cond, now, stay=False, rival=None):
+        """Why row is the one, in words. rival: the better-scoring band stayed off."""
+        b = band_label(row["band"])
+        if rival is not None:
+            return "%s: staying; about as good as %s %s" % (
+                b, band_label(rival["band"]),
+                ("by conditions (SFI %s, K %s, %s)" % (cond.get("sfi"), cond.get("k"),
+                                                       PART_WORDS[self.part(now)]))
+                if cond else "by what rxd has heard at this hour")
+        part = PART_WORDS[self.part(now)]
+        unit = "spots a slot" if row["decoder"] == "wspr" else "decodes a minute"
+        heard = sc.get("heard_w", 0) > 0 and sc.get("rate") is not None
+        if cond:
+            idx = "SFI %s, K %s, %s" % (cond.get("sfi"), cond.get("k"), part)
+            what = "conditions and what rxd has heard here" if heard else "conditions"
+            return "%s: %s by %s (%s)" % (b, "still best" if stay else "best", what, idx)
+        if heard:
+            return "%s: %s heard at this hour (%.1f %s); no band conditions" % (
+                b, "still best" if stay else "best", sc["rate"], unit)
+        return "%s: usually best by %s; no band conditions and nothing heard yet" % (b, part)
+
+    def switch(self, row, reason, now):
+        st = self.state
+        st["reason"] = reason
+        if row["name"] == self.rx.s.name:
+            self.save_state()
+            return
+        if st.get("requested") == row["name"] and now - (st.get("requested_at") or 0) < self.SETTLE:
+            return  # asked already; radio is on its way
+        if now - self.tried_at < 60:
+            return
+        self.tried_at = now
+        st["requested"], st["requested_at"] = row["name"], now
+        self.save_state()
+        log("band plan: switching to %s: %s" % (row["name"], reason))
+        try:
+            self.switch_fn(row["name"])
+        except OSError as e:
+            st["reason"] = "Can't switch to %s: %s" % (row["name"], e)
+            self.save_state()
+
+    def start_scan(self, rows, now, why):
+        cur = self.rx.s.name
+        part = self.part(now)
+        order = sorted(rows, key=lambda r: (r["name"] != cur, -BAND_PRIOR[part].get(r["band"], 0)))
+        st = self.state
+        st.update(phase="scan", scan=[r["name"] for r in order], scan_i=0, scan_why=why,
+                  next_eval=None)
+        self.scan_step(order[0], now)
+
+    def scan_step(self, row, now):
+        st = self.state
+        n, i = len(st["scan"]), st["scan_i"]
+        self.switch(row, "Scanning: %s, %d of %d (%s)" % (band_label(row["band"]), i + 1, n,
+                                                          st.get("scan_why") or "learning"),
+                    now)
+
+    def evaluate(self, now, cands, fresh=False):
+        """Choose among cands. Staying put wins a near tie (a switch costs a slot),
+        except straight after a scan, whose point was to compare them."""
+        st = self.state
+        cond = self.cond.current(now)
+        sc = self.score_all(cands, now, cond)
+        self.scores = sc
+        if cond is None and self.synced():
+            scanned = st.setdefault("scanned", {})
+            hour = time.gmtime(now).tm_hour
+            unknown = [r for r in cands if sc[r["name"]]["visits"] < 0.5 and
+                       now - scanned.get("%s@%02d" % (r["name"], hour), 0) > self.RESCAN]
+            if unknown:
+                self.start_scan(unknown, now, "no band conditions; learning this hour")
+                return
+        best = max(cands, key=lambda r: sc[r["name"]]["score"])
+        cur = next((r for r in cands if r["name"] == self.rx.s.name), None)
+        st.update(phase="hold", scan=None, scan_i=None,
+                  next_eval=now + float(self.conf["every_min"]) * 60)
+        stay = sc[best["name"]]["score"] * (1.0 if fresh else self.STAY)
+        if cur is not None and sc[cur["name"]]["score"] >= stay:
+            rival = None if sc[cur["name"]]["score"] >= sc[best["name"]]["score"] else best
+            self.switch(cur, self.because(cur, sc[cur["name"]], cond, now, stay=True,
+                                          rival=rival), now)
+        else:
+            self.switch(best, self.because(best, sc[best["name"]], cond, now), now)
+
+    def decide(self, now):
+        st = self.state
+        cur = self.rx.s.name
+        if self.conf["plan"] != "auto":
+            st["phase"] = "manual"
+            if not (st.get("reason") or "").startswith("Manual"):
+                st["reason"] = "Manual: staying on %s" % cur
+            return
+        if st.get("phase") == "manual":
+            st["phase"] = None
+            st["reason"] = None
+        cands, _ = self.candidates(now)
+        if not cands:
+            st.update(phase="idle", reason="Auto: no %s bands enabled on the Ham It Up's %s side" % (
+                "WSPR" if self.conf["mode"] == "wspr" else "JS8",
+                "UPCONVERT" if self.side_up() else "BYPASS") if not self.rows_error else
+                "Auto: can't list profiles (%s)" % self.rows_error)
+            return
+        names = [r["name"] for r in cands]
+        if st.get("phase") == "scan" and (st.get("scan_why") or "").startswith("no band") and \
+                self.cond.current(now) and self.quiet(now):
+            st["phase"] = None  # scanning for want of conditions, and now there are some
+        if st.get("phase") == "scan" and st.get("scan"):
+            scan = [n for n in st["scan"] if n in names]
+            if not scan:
+                st["phase"] = None
+            else:
+                if scan != st["scan"]:
+                    i = st.get("scan_i") or 0
+                    keep = st["scan"][i] if i < len(st["scan"]) else None
+                    st["scan"] = scan
+                    st["scan_i"] = scan.index(keep) if keep in scan else min(i, len(scan) - 1)
+                i = st["scan_i"]
+                target = next(r for r in cands if r["name"] == st["scan"][i])
+                if cur != target["name"]:
+                    self.scan_step(target, now)
+                    return
+                if not self.visit_done(now) or not self.quiet(now):
+                    v = self.visit
+                    extra = " · slot %d of %d" % (min(v["slots"] + 1, self.SCAN_SLOTS),
+                                                   self.SCAN_SLOTS) \
+                        if self.conf["mode"] == "wspr" else ""
+                    st["reason"] = "Scanning: %s, %d of %d (%s)%s" % (
+                        band_label(target["band"]), i + 1, len(st["scan"]),
+                        st.get("scan_why") or "learning", extra)
+                    return
+                scanned = st.setdefault("scanned", {})
+                scanned["%s@%02d" % (cur, time.gmtime(now).tm_hour)] = now
+                for k in [k for k, t in scanned.items() if now - t > self.RESCAN]:
+                    del scanned[k]
+                if i + 1 < len(st["scan"]):
+                    st["scan_i"] = i + 1
+                    nxt = next(r for r in cands if r["name"] == st["scan"][i + 1])
+                    self.scan_step(nxt, now)
+                    return
+                st["phase"], st["after_scan"] = None, True  # the scan is done: choose
+        due = st.get("phase") != "hold" or cur not in names or \
+            now >= (st.get("next_eval") or 0)
+        if due and self.quiet(now):
+            self.evaluate(now, cands, fresh=bool(st.pop("after_scan", False)))
+
+    # ---------------------------------------------------------- the loop
+
+    def tick(self, now=None):
+        now = self.clock() if now is None else now
+        if self.cond.due(now):
+            self.cond.refresh(now)  # outside the lock: it can take seconds
+        with self.lock:
+            self.sample(now)
+            self.decide(now)
+            self.save_state()
+            self.doc = self.build_status(now)
+
+    def run(self):
+        while not self.rx.stop.is_set():
+            try:
+                self.tick()
+            except Exception as e:  # noqa: BLE001 - the plan must never take rxd down
+                log("band plan: %s: %s" % (type(e).__name__, e))
+            self.wake.wait(self.TICK)
+            self.wake.clear()
+
+    def start(self):
+        threading.Thread(target=self.run, name="bands", daemon=True).start()
+
+    # --------------------------------------------------------------- API
+
+    def configure(self, doc):
+        """POST /api/bands: settings, and {"scan": true} to scan now."""
+        if not isinstance(doc, dict):
+            raise ValueError("body must be a JSON object")
+        unknown = set(doc) - set(PLAN_DEFAULTS) - {"scan"}
+        if unknown:
+            raise ValueError("unknown field(s): " + ", ".join(sorted(unknown)))
+        new = self.check(doc)
+        if "scan" in doc and not isinstance(doc["scan"], bool):
+            raise ValueError("scan must be true or false")
+        now = self.clock()
+        with self.lock:
+            old = dict(self.conf)
+            self.conf.update(new)
+            if doc.get("scan"):
+                self.conf["plan"] = "auto"
+            self.save_conf()
+            st = self.state
+            changed = any(old.get(k) != self.conf.get(k) for k in
+                          ("plan", "mode", "bands", "cross_side"))
+            if doc.get("scan"):
+                cands, _ = self.candidates(now)
+                if cands:
+                    self.start_scan(cands, now, "asked for")
+            elif changed and self.conf["plan"] == "auto":
+                st.update(phase=None, scan=None, scan_i=None, next_eval=None)
+            elif self.conf["plan"] == "auto" and old.get("every_min") != self.conf["every_min"] \
+                    and st.get("phase") == "hold":
+                st["next_eval"] = now + float(self.conf["every_min"]) * 60
+            if self.conf["plan"] == "manual":
+                st["reason"] = "Manual: staying on %s" % self.rx.s.name
+            self.save_state()
+            self.doc = self.build_status(now)
+        self.wake.set()
+        return self.describe()
+
+    def manual_pick(self, name):
+        """A profile picked by hand (POST /api/profile): the plan goes Manual."""
+        with self.lock:
+            if self.conf["plan"] == "auto":
+                self.conf["plan"] = "manual"
+                self.save_conf()
+            self.state["reason"] = "Manual: %s picked by hand" % name
+            self.state["on"] = name  # so the next rxd doesn't take it for a surprise
+            self.save_state()
+            self.doc = self.build_status(self.clock())
+
+    def build_status(self, now):
+        st = self.state
+        cond = self.cond.current(now)
+        up = self.side_up()
+        row = self.current_row(now)
+        scan = None
+        if st.get("phase") == "scan" and st.get("scan"):
+            i = st.get("scan_i") or 0
+            nm = st["scan"][min(i, len(st["scan"]) - 1)]
+            r = next((x for x in self.profile_rows(now) if x.get("name") == nm), None)
+            scan = {"i": i + 1, "n": len(st["scan"]), "profile": nm,
+                    "band": r.get("band") if r else None}
+        rise, sset = sun_times(now, self.latlon)
+        part = self.part(now)
+        return {"plan": self.conf["plan"], "mode": self.conf["mode"],
+                "phase": st.get("phase") or ("manual" if self.conf["plan"] != "auto" else "idle"),
+                "profile": self.rx.s.name, "band": row.get("band") if row else None,
+                "reason": st.get("reason") or ("Auto: choosing a band" if
+                                               self.conf["plan"] == "auto" else
+                                               "Manual: staying on %s" % self.rx.s.name),
+                "scan": scan, "next_at": st.get("next_eval") if st.get("phase") == "hold" else None,
+                "switching_to": st.get("requested"),
+                "bands": self.enabled(up), "default_bands": self.conf.get("bands") is None,
+                "dwell_min": self.conf["dwell_min"], "every_min": self.conf["every_min"],
+                "cross_side": self.conf["cross_side"], "side": "UPCONVERT" if up else "BYPASS",
+                "sun": {"part": part, "words": PART_WORDS[part], "sunrise": rise, "sunset": sset,
+                        "located": bool(self.latlon)},
+                "conditions": None if not cond else {
+                    "source": cond.get("source"), "sfi": cond.get("sfi"), "a": cond.get("a"),
+                    "k": cond.get("k"), "updated": cond.get("updated"),
+                    "fetched": self.cond.doc.get("fetched"), "bands": cond.get("bands"),
+                    "credit": CREDITS.get(cond.get("source"), "")},
+                "conditions_error": None if cond else self.cond.error()}
+
+    def status(self):
+        doc = self.doc
+        if doc is None:
+            with self.lock:
+                doc = self.doc = self.build_status(self.clock())
+        return doc
+
+    def describe(self):
+        """GET /api/bands: settings, status, and every band profile with how it scores."""
+        now = self.clock()
+        with self.lock:
+            cond = self.cond.current(now)
+            up = self.side_up()
+            en = self.enabled(up)
+            rows = []
+            for mode in PLAN_MODES:
+                prs = self.plan_rows(now, mode)
+                sc = self.score_all(prs, now, cond)
+                for r in sorted(prs, key=lambda r: BAND_ORDER.index(r["band"])
+                                if r["band"] in BAND_ORDER else 99):
+                    why = None
+                    if r["band"] not in en:
+                        why = "not enabled"
+                    elif bool(r.get("upconvert")) != up and not self.conf["cross_side"]:
+                        why = "needs the Ham It Up on %s" % (
+                            "UPCONVERT" if r.get("upconvert") else "BYPASS")
+                    s = sc[r["name"]]
+                    rows.append({"name": r["name"], "mode": mode, "band": r["band"],
+                                 "freq": r.get("freq"), "upconvert": bool(r.get("upconvert")),
+                                 "enabled": r["band"] in en, "eligible": why is None,
+                                 "why_not": why, "score": s["score"], "basis": s["basis"],
+                                 "heard": {"rate": s["rate"], "visits": s["visits"]}})
+            return {"config": dict(self.conf), "status": self.build_status(now),
+                    "all_bands": list(BAND_ORDER), "profiles": rows}
+
+
+def make_bands(rx, js8):
+    """The band plan for a live rxd, or None (RXD_BANDS=off, or not the dongle)."""
+    env = os.environ.get("RXD_BANDS", "")
+    if env == "off" or (env != "on" and not isinstance(rx.src, RtlSource)):
+        return None
+    try:
+        bp = BandPlanner(rx, js8)
+    except Exception as e:  # noqa: BLE001 - never stop rxd for the plan
+        log("band plan off: %s" % e)
+        return None
+    bp.start()
+    return bp
+
+
 # The browser UI: $RXD_WEB, where setup.sh installs it, or beside this file in
 # a checkout. Read on every request so a reinstall needs no restart.
 WEB_PATHS = (os.environ.get("RXD_WEB", ""), "/usr/local/share/rxd/index.html",
@@ -3776,6 +5269,8 @@ class Api(BaseHTTPRequestHandler):
             return self.send(200, wspr.since(after))
         if path == "/api/audio":
             return self.audio()
+        if path == "/api/bands":
+            return self.bands_get()
         if path in ("/", "/index.html"):
             page = web_page()
             if page is None:
@@ -3828,6 +5323,8 @@ class Api(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/api/profile":
             return self.switch()
+        if self.path == "/api/bands":
+            return self.bands_post()
         if self.path != "/api/tune":
             return self.send(404, {"error": "not found"})
         try:
@@ -3836,7 +5333,7 @@ class Api(BaseHTTPRequestHandler):
             if not isinstance(doc, dict):
                 raise ValueError("body must be a JSON object")
             unknown = set(doc) - {"freq", "mode", "bandwidth", "gain_db", "volume", "squelch",
-                                  "wspr_report"}
+                                  "wspr_report", "gain_auto"} - {"audio_" + k for k in AUDIO_KEYS}
             if unknown:
                 raise ValueError("unknown field(s): " + ", ".join(sorted(unknown)))
             self.server.rx.s.update(**doc)
@@ -3863,7 +5360,29 @@ class Api(BaseHTTPRequestHandler):
         except OSError as e:
             return self.send(503, {"error": "can't run radio: %s" % e})
         log("switching to %s for an HTTP client" % name)
+        if self.server.rx.bands is not None:
+            self.server.rx.bands.manual_pick(name)
         self.send(202, {"switching": name})
+
+    # the band plan (BandPlanner)
+    def bands_get(self):
+        bp = self.server.rx.bands
+        if bp is None:
+            return self.send(503, {"error": "no band plan: this rxd isn't on the radio "
+                                            "(or RXD_BANDS=off)"})
+        return self.send(200, bp.describe())
+
+    def bands_post(self):
+        bp = self.server.rx.bands
+        if bp is None:
+            return self.send(503, {"error": "no band plan: this rxd isn't on the radio "
+                                            "(or RXD_BANDS=off)"})
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            doc = json.loads(self.rfile.read(n) or b"{}")
+            return self.send(200, bp.configure(doc))
+        except (ValueError, TypeError) as e:
+            return self.send(400, {"error": str(e)})
 
 
 # ---------------------------------------------------------------------- main
@@ -3939,6 +5458,7 @@ def main(argv=None):
         hs.rx = rx
         hs.js8 = Js8Feed()
         servers.append(hs)
+        rx.bands = make_bands(rx, hs.js8)
     for srv in servers:
         threading.Thread(target=srv.serve_forever, daemon=True).start()
 
@@ -4306,12 +5826,96 @@ def squelch_key(key, squelch, level):
 def squelch_words(st, g):
     """(text, role) for the squelch: Off, or the level and whether it's open."""
     sq = st.get("squelch")
+    a = audio_of(st)
+    if sq is None and a and a["auto"] and a.get("squelch"):
+        if st.get("squelch_open") is False:
+            return "Auto  %s Closed (quiet)" % g.stop, "label"
+        return "Auto  %s Open (signal)" % g.rx, "ok"
     if sq is None:
         return "Off, always open", "value"
     lvl = "%d dBFS" % round(sq)
     if st.get("squelch_open") is False:
         return "%s  %s Closed (quiet)" % (lvl, g.stop), "label"
     return "%s  %s Open (signal)" % (lvl, g.rx), "ok"
+
+
+# ---- gain: auto RF gain and audio clean-up
+
+# Manual's keys for each stage of rxd's audio clean-up: (key, field, words)
+AUDIO_STAGES = (("n", "nr", "noise reduction"), ("h", "filter", "hum filter"),
+                ("e", "norm", "even loudness"), ("c", "limit", "limiter"),
+                ("S", "squelch", "NFM squelch"))
+AUDIO_SHORT = {"nr": "NR", "filter": "hum", "norm": "loudness", "limit": "limiter",
+               "squelch": "squelch"}
+
+
+def audio_of(st):
+    """rxd's audio settings with anything sent but not yet confirmed, or None
+    for an rxd without them. nr is the effective state; nr_setting None is
+    "by mode" (on except for WFM)."""
+    a = st.get("audio") if st else None
+    if not isinstance(a, dict) or not isinstance(a.get("auto"), bool):
+        return None
+    a = dict(a)
+    for k in ("auto",) + tuple(f for _, f, _ in AUDIO_STAGES):
+        if "audio_" + k in st:
+            a[k] = st["audio_" + k]
+    if "audio_nr" in st:
+        a["nr_setting"] = st["audio_nr"]
+        a["nr"] = st["mode"] != "WFM" if st["audio_nr"] is None else st["audio_nr"]
+    return a
+
+
+def gain_words(st):
+    """The gain in use, and whether rxd picks it: "Auto 7.7 dB" or "7.7 dB"."""
+    gain = st.get("gain_db") if st else None
+    if gain is None:
+        return "---"
+    return ("Auto %.1f dB" if st.get("gain_auto") else "%.1f dB") % gain
+
+
+def audio_words(st, short=False):
+    """What the clean-up is doing: "Auto: NR, hum, loudness, limiter" or "Off"."""
+    a = audio_of(st)
+    if a is None:
+        return "---"
+    if not a["auto"]:
+        return "Off, untouched"
+    names = AUDIO_SHORT if short else {f: w for _, f, w in AUDIO_STAGES}
+    on = [names[f] for _, f, _ in AUDIO_STAGES
+          if a.get(f) and (f != "squelch" or st.get("mode") == "FM")]
+    return "Auto: " + (", ".join(on) if on else "nothing on")
+
+
+def audio_toggle(st, key):
+    """(fields to send, message) for A (all of it) or a stage's key in Manual."""
+    a = audio_of(st)
+    if a is None:
+        return None, "This rxd has no audio clean-up"
+    if key == "A":
+        on = not a["auto"]
+        return {"audio_auto": on}, "Audio clean-up %s" % ("on" if on else "off, untouched")
+    _, field, words = next(x for x in AUDIO_STAGES if x[0] == key)
+    if not a["auto"]:
+        return None, "Audio clean-up is off; A turns it on"
+    if field == "squelch" and st.get("mode") != "FM":
+        return None, "The noise squelch is for NFM only"
+    on = not a.get(field)
+    v = on
+    if field == "nr" and on == (st.get("mode") != "WFM"):
+        v = None   # what the mode does anyway: back to "by mode"
+    return {"audio_" + field: v}, "%s %s" % (words[0].upper() + words[1:], "on" if on else "off")
+
+
+def squelch_cycle(st, level):
+    """Listen's s on an rxd with the noise squelch: Off, Auto, Level, Off..."""
+    a = audio_of(st)
+    auto = bool(a and a["auto"] and a.get("squelch"))
+    if st.get("squelch") is not None:
+        return {"squelch": None, "audio_squelch": False}, "Squelch off"
+    if auto:
+        return {"squelch": level}, "Squelch opens above %d dBFS" % round(level)
+    return {"audio_squelch": True, "audio_auto": True}, "Squelch auto: opens for a signal"
 
 
 def clock_words(clock, g, mode="JS8"):
@@ -4506,6 +6110,43 @@ def wspr_report_words(w, g):
     if pending:
         text += ", %d waiting" % pending
     return text, "ok"
+
+
+# ---- the band plan (rxd's status band_plan; POST /api/bands)
+
+def band_plan_words(bp, g):
+    """(text, role) for the band plan line: Auto or Manual, and why this band."""
+    if not isinstance(bp, dict):
+        return None
+    auto = bp.get("plan") == "auto"
+    mode = "WSPR" if bp.get("mode") == "wspr" else "JS8"
+    head = "Band plan Auto %s %s" % (g.dot, mode) if auto else "Band plan Manual"
+    phase = bp.get("phase")
+    sym = g.stop if not auto else g.wait if phase == "scan" else g.drop if phase == "idle" else g.rx
+    reason = bp.get("reason") or ""
+    if reason.startswith("Manual: "):
+        reason = reason[len("Manual: "):]
+    role = "warn" if auto and phase == "idle" else "ok" if auto else "label"
+    return "%s %s: %s" % (sym, head, reason), role
+
+
+def band_plan_extra(bp, g):
+    """The second band plan line: conditions (credited) and the sun, or why there are none."""
+    if not isinstance(bp, dict):
+        return None
+    sun = bp.get("sun") or {}
+    words = (sun.get("words") or "").capitalize()
+    c = bp.get("conditions")
+    if c:
+        who = "N0NBH, hamqsl.com" if c.get("source") == "hamqsl" else "NOAA SWPC"
+        text = "SFI %s %s K %s (%s)" % (c.get("sfi"), g.dot, c.get("k"), who)
+    else:
+        text = "No band conditions (offline?)"
+    if words:
+        text += "   %s" % words
+    if bp.get("plan") == "auto" and bp.get("phase") == "hold" and bp.get("next_at"):
+        text += "   next look %s" % time.strftime("%H:%M", time.localtime(bp["next_at"]))
+    return text
 
 
 # ---- audio here
@@ -4825,18 +6466,20 @@ def badge(reachable, status, dropping, g, switching=None):
 
 SHORT_LABELS = {"bandwidth": "bw", "volume": "vol", "speaker": "spkr", "station": "pick",
                 "switch": "pick", "squelch": "sq", "listen": "listen", "filter": "filter",
-                "reporting": "report"}
+                "reporting": "report", "auto gain": "auto g", "auto audio": "auto a",
+                "clean-up": "clean"}
 
 
-def help_items(g, view="manual", mode=None, listening=False, decoder=None, report=False):
+def help_items(g, view="manual", mode=None, listening=False, decoder=None, report=False,
+               plan=False):
     """[(keys, label)] for a view's bottom line; ? and q always come last.
     In Digital, decoder is the receiver's ("js8", "wspr" or None) and report
-    whether r can switch WSPR reporting."""
+    whether r can switch WSPR reporting, plan whether rxd has a band plan."""
     k = g.keys
     ud = k["updown"]
     if view == "digital":
         # When they don't all fit, the ones just before the view keys go first.
-        items = [(ud + " Enter", "switch")]
+        items = [(ud + " Enter", "switch")] + ([("a", "auto")] if plan else [])
         if decoder == "wspr" and report:
             items.append(("r", "reporting"))
         if decoder != "js8":
@@ -4846,7 +6489,8 @@ def help_items(g, view="manual", mode=None, listening=False, decoder=None, repor
             items.append(("l", "stop audio"))
         items.append(("1 2 3", "view"))
     elif view == "listen":
-        items = [(ud + " Enter", "station"), ("g G", "gain"), ("b", "bandwidth")]
+        items = [(ud + " Enter", "station"), ("g G", "gain"), ("a", "auto gain"),
+                 ("A", "auto audio"), ("b", "bandwidth")]
         if mode == "FM":
             items.append(("s , .", "squelch"))
         items += [("l", "listen")] + ([("[ ]", "volume")] if listening else []) + \
@@ -4854,7 +6498,8 @@ def help_items(g, view="manual", mode=None, listening=False, decoder=None, repor
     else:
         items = [(k["left"] + k["sep"] + k["right"], "tune"), (k["up"] + k["sep"] + k["down"], "step"),
                  ("f", "freq"), ("m", "mode"), ("l", "listen"), ("[ ]", "bandwidth"),
-                 ("g G", "gain"), ("- +", "volume"), ("1 2 3", "view")]
+                 ("g G", "gain"), ("a", "auto gain"), ("A n h e c", "clean-up")] + \
+            ([] if decoder == "js8" else [("- +", "volume")]) + [("1 2 3", "view")]
     return items + [("?", "help"), ("q", "quit")]
 
 
@@ -4973,6 +6618,8 @@ class Poller:
         self.profiles_retry_at = 0.0
         self.switch_req = None
         self.switch_acks = []      # (name, error or None)
+        self.bands_req = None      # a POST /api/bands body, for the side thread
+        self.bands_acks = []       # (body, error or None)
         # The decoder's feed: one of these fills at a time, the other is empty.
         self.js8_lines = collections.deque(maxlen=JS8_KEEP)
         self.wspr_lines = collections.deque(maxlen=JS8_KEEP)
@@ -5006,6 +6653,17 @@ class Poller:
     def take_switch_acks(self):
         with self.lock:
             acks, self.switch_acks = self.switch_acks, []
+        return acks
+
+    def bands(self, body):
+        """The band plan's settings (Auto/Manual, mode, scan now), sent by the side thread."""
+        with self.lock:
+            self.bands_req = dict(self.bands_req or {}, **body)
+        self.side_wake.set()
+
+    def take_bands_acks(self):
+        with self.lock:
+            acks, self.bands_acks = self.bands_acks, []
         return acks
 
     def reload_profiles(self):
@@ -5122,7 +6780,11 @@ class Poller:
             self.side_wake.clear()
             with self.lock:
                 name, self.switch_req = self.switch_req, None
+                breq, self.bands_req = self.bands_req, None
                 st, reachable = dict(self.status), self.reachable
+            if breq:
+                self._bands(breq)
+                continue
             if name:
                 self._switch(name)
                 continue
@@ -5185,6 +6847,20 @@ class Poller:
             err = "Not switched: can't reach rxd (%s)" % reason(e)
         with self.lock:
             self.switch_acks.append((name, err))
+        self.changed.set()
+
+    def _bands(self, body):
+        try:
+            code, doc = self.link.post("/api/bands", body, timeout=SLOW_TIMEOUT)
+            err = None if code == 200 else \
+                "rxd refused: %s" % (doc.get("error") or "HTTP %d" % code)
+        except OSError as e:
+            err = "Not sent: can't reach rxd (%s)" % reason(e)
+            doc = {}
+        with self.lock:
+            self.bands_acks.append((body, err))
+            if err is None and isinstance(doc.get("status"), dict):
+                self.status = dict(self.status, band_plan=doc["status"])
         self.changed.set()
 
     def _feed_reset(self, key):
@@ -5636,6 +7312,9 @@ class App:
             if err and self.switching and self.switching["name"] == name:
                 self.switching = None
                 self.say(err, "err")
+        for body, err in (self.p.take_bands_acks() if hasattr(self.p, "take_bands_acks") else ()):
+            if err:
+                self.say(err, "err")
 
     def update(self):
         """Everything that follows from rxd's state: views, switches, the audio rate."""
@@ -5684,7 +7363,7 @@ class App:
                      % (self.g.drop, hiu_word(up), sw["desc"]), "warn")
         else:
             self.say("%s Now on %s" % (self.g.rx, sw["desc"]), "ok")
-        if sw.get("muted") is not None and st.get("volume"):
+        if sw.get("muted") is not None and st.get("volume") and decoder_of(st) != "js8":
             self.mute_prev = st["volume"]
             self.send(volume=0.0)
         self.js8_scroll = 0
@@ -5835,7 +7514,7 @@ class App:
 
     def mute_key(self, s):
         st = s["status"]
-        if self.view == "digital" and self.decoder(s) == "js8":
+        if self.decoder(s) == "js8":
             self.say("Not on JS8: the receiver's audio feeds JS8Call")
         elif st.get("volume") is None:
             self.not_yet()
@@ -5849,6 +7528,8 @@ class App:
             self.send(volume=0.0)
 
     def speaker_key(self, ch, st):
+        if decoder_of(st) == "js8":
+            return self.say("Not on JS8: the receiver's audio feeds JS8Call")
         if st.get("volume") is None:
             return self.not_yet()
         d = 1 if ch in (ord("+"), ord("=")) else -1
@@ -5870,6 +7551,25 @@ class App:
         else:
             self.send(gain_db=g)
 
+    def gain_auto_key(self, st):
+        """a: automatic RF gain on / off (off keeps the gain in use)."""
+        if not st or "gain_auto" not in st:
+            return self.say("This rxd has no automatic gain", "err") if st else self.not_yet()
+        if st.get("gain_auto"):
+            self.send(gain_db=st.get("gain_db"), gain_auto=False)
+            self.say("Gain by hand, %.1f dB: g G change it" % st.get("gain_db"))
+        else:
+            self.send(gain_auto=True)
+            self.say("Auto gain: rxd picks the best signal-to-noise")
+
+    def audio_key(self, ch, st):
+        if not st:
+            return self.not_yet()
+        fields, msg = audio_toggle(st, chr(ch))
+        if fields:
+            self.send(**fields)
+        self.say(msg, "msg" if fields else "err")
+
     def digital_key(self, ch, s):
         if self.picker_key(ch, s):
             return
@@ -5885,10 +7585,34 @@ class App:
             self.mute_key(s)
         elif ch == ord("r"):
             self.report_key(s)
+        elif ch in (ord("a"), ord("m"), ord("s")):
+            self.band_plan_key(ch, s)
         elif ch in (ord("["), ord("]")) and self.decoder(s) != "js8":
             self.local_volume_key(ch)
         else:
             self.other_key(ch)
+
+    def band_plan_key(self, ch, s):
+        """a: Auto / Manual; m: Auto listens for WSPR / JS8; s: scan the bands now."""
+        bp = s["status"].get("band_plan")
+        if not isinstance(bp, dict):
+            self.say("This rxd has no band plan (it isn't on the radio)", "err")
+        elif not s["reachable"]:
+            self.say("Not sent: can't reach rxd", "err")
+        elif ch == ord("a"):
+            auto = bp.get("plan") != "auto"
+            self.p.bands({"plan": "auto" if auto else "manual"})
+            self.say("%s Band plan %s" % ((self.g.rx, "Auto: rxd picks the band") if auto
+                                          else (self.g.stop, "Manual: staying on this band")))
+        elif ch == ord("m"):
+            mode = "js8" if bp.get("mode") == "wspr" else "wspr"
+            self.p.bands({"mode": mode})
+            self.say("Auto listens for %s%s" % ("JS8" if mode == "js8" else "WSPR",
+                                                "" if bp.get("plan") == "auto"
+                                                else " (once a turns Auto on)"))
+        else:
+            self.p.bands({"scan": True})
+            self.say("%s Scanning the bands; Auto" % self.g.wait)
 
     def report_key(self, s):
         """r: WSPR reporting to WSPRnet on / off."""
@@ -5910,12 +7634,20 @@ class App:
         st = s["status"]
         if self.picker_key(ch, s):
             return
-        controls = (ord("g"), ord("G"), ord("b"), ord("s"), ord(","), ord("."))
+        controls = (ord("g"), ord("G"), ord("b"), ord("s"), ord(","), ord("."), ord("a"), ord("A"))
         if ch in controls and self.mismatch(s):
             self.say("Receiver is on %s; pick a station first (%s Enter)" % (
                 st.get("profile"), self.g.keys["updown"]))
         elif ch in (ord("g"), ord("G")):
             self.gain_key(ch, st)
+        elif ch == ord("a"):
+            self.gain_auto_key(st)
+        elif ch == ord("A"):
+            self.audio_key(ch, st)
+        elif ch == ord("s") and audio_of(st) is not None and st.get("mode") == "FM":
+            fields, msg = squelch_cycle(st, self.sq_level)
+            self.send(**fields)
+            self.say(msg)
         elif ch == ord("b"):
             if st.get("mode") is None:
                 return self.not_yet()
@@ -5978,6 +7710,10 @@ class App:
             self.local_volume_key(ch)
         elif ch in (ord("g"), ord("G")):
             self.gain_key(ch, st)
+        elif ch == ord("a"):
+            self.gain_auto_key(st)
+        elif ch in [ord(c) for c in "AnhecS"]:
+            self.audio_key(ch, st)
         elif ch in (ord("-"), ord("_"), ord("+"), ord("=")):
             self.speaker_key(ch, st)
         elif ch == ord("M"):
@@ -6039,7 +7775,8 @@ class App:
         listening = bool(self.audio and self.audio.on)
         items = help_items(g, self.view or "manual", st.get("mode"), listening,
                            None if self.mismatch(s) else self.decoder(s),
-                           wspr_can_report(st.get("wspr")))
+                           wspr_can_report(st.get("wspr")),
+                           isinstance(st.get("band_plan"), dict))
         for text, r in help_line(w - 2, g, items):
             scr.put(h - 1, x, text, r)
             x += len(text)
@@ -6231,6 +7968,13 @@ class App:
         else:
             put(y, 1, clip(ctext, w - 2, g), crole)
         y += 1
+        bpw = band_plan_words(st.get("band_plan"), g)
+        if bpw:
+            put(y, 1, clip(g.text(bpw[0]), w - 2, g), bpw[1])
+            y += 1
+            if bottom - y > 10:
+                put(y, 3, clip(g.text(band_plan_extra(st["band_plan"], g)), w - 4, g), "label")
+                y += 1
         if wspr:
             y = self.draw_wspr_status(scr, st.get("wspr"), y, bottom)
         if self.audio and self.audio.on and y < bottom:
@@ -6371,7 +8115,7 @@ class App:
                 spk = "Muted (M restores %s)" % percent(self.mute_prev)
             else:
                 spk = percent(vol) if vol is not None else "---"
-            fields = [("Gain", "%.1f dB" % gain if gain is not None else "---"),
+            fields = [("Gain", gain_words(st)),
                       ("Bandwidth", "%s %s" % (bandwidth_name(st.get("mode"), bw), format_hz(bw))
                        if bw else "---"),
                       ("Speaker", spk)]
@@ -6388,6 +8132,10 @@ class App:
                 text, role = squelch_words(st, g)
                 scr.put(y, 1, "Squelch", "label")
                 scr.put(y, 9, text, role)
+                y += 1
+            if audio_of(st) is not None:
+                scr.put(y, 1, "Audio", "label")
+                scr.put(y, 7, clip(audio_words(st), w - 8, g), "value")
                 y += 1
             y = self.draw_audio_row(scr, y)
             y += 1
@@ -6471,8 +8219,10 @@ class App:
             spk = "Muted"
         else:
             spk = percent(st["volume"]) if st.get("volume") is not None else "---"
-        for label, val in (("Gain", "%.1f dB" % gain if gain is not None else "---"),
-                           ("Speaker", spk)):
+        for label, val in (("Gain", gain_words(st)), ("Speaker", spk),
+                           ("Audio", audio_words(st, short=True))):
+            if label == "Audio" and x + len(label) + len(val) + 2 > w:
+                val = val.split(":")[0]   # just Auto or Off when the list won't fit
             if x + len(label) + len(val) + 2 > w:
                 break
             scr.put(y, x, label, "label")
@@ -6551,6 +8301,9 @@ class App:
                 "/         show only lines with a callsign; Esc",
                 "          shows them all again",
                 "r         WSPR: report spots to WSPRnet / stop",
+                "a         band plan Auto (rxd picks the band) / Manual",
+                "m         Auto listens for WSPR / JS8",
+                "s         scan the bands now (and Auto)",
                 "l         play the audio on this machine / stop",
                 "          (not on JS8: its audio goes to JS8Call)",
                 "[ ]       volume of the audio here",
@@ -6567,8 +8320,11 @@ class App:
                 "",
                 "%-9s pick a station; Enter switches" % ud,
                 "g G       gain down / up through the dongle's steps",
+                "          (sets it by hand: auto gain goes off)",
+                "a         auto gain on / off",
+                "A         auto audio (the clean-up) on / off",
                 "b         bandwidth: Narrow, Normal, Wide",
-                "s         squelch off / on (NFM only)",
+                "s         squelch: off, auto, at a level (NFM only)",
                 ", .       squelch level down / up, 2 dB a press",
                 "- +       uConsole speaker volume down / up",
                 "M         mute the uConsole speaker / restore it",
@@ -6587,6 +8343,10 @@ class App:
                 "m         next mode: USB LSB AM FM WFM",
                 "[ ]       narrower / wider bandwidth",
                 "g G       gain down / up through the dongle's steps",
+                "a         auto gain on / off",
+                "A         audio clean-up on / off",
+                "n h e c S its parts on / off: noise reduction, hum",
+                "          filter, even loudness, limiter, NFM squelch",
                 "- +       uConsole speaker volume down / up (0-400 %)",
                 "M         mute the uConsole speaker / restore it",
                 "l         play the audio on this machine / stop",
@@ -6620,7 +8380,9 @@ class App:
         bw = min(max(len(x) for x in lines) + 4, scr.w)
         bh = len(lines) + 2
         if bh > scr.h:
-            lines = [x for x in lines if x][:scr.h - 2]
+            lines = [x for x in lines if x]
+            if len(lines) + 2 > scr.h:  # keep the last line: how to close it
+                lines = lines[:max(scr.h - 3, 0)] + lines[-1:]
             bh = len(lines) + 2
         y0 = max(0, (scr.h - bh) // 2)
         x0 = max(0, (scr.w - bw) // 2)
@@ -6943,6 +8705,31 @@ dialog .row2{margin-top:6px}
 .wl .wg{font-size:18px;font-weight:650}
 .wl .wd{font-size:18px}
 .wl .wx{flex-basis:100%;font-size:16px;font-weight:600;color:var(--dim)}
+/* gain: auto RF gain and audio clean-up */
+#gAuto{margin:6px 0 0}
+#gAuto .btn small,#auSl .btn small,.augrid .btn small{display:block;font-size:14px;font-weight:600}
+#gWhy{margin:4px 0 0}
+body[data-view=listen] #gWhy{display:none}
+.augrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:6px;margin-top:6px}
+.augrid .btn{font-size:18px;line-height:1.1;text-align:left;padding:4px 10px}
+@media (min-width:700px){#jStat{grid-template-columns:repeat(6,auto)}}
+/* band plan and the band picker */
+.seg{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:6px;margin-top:6px}
+.bgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:6px;margin-top:8px}
+.bbtn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0;min-height:64px;padding:4px;line-height:1.1;text-align:center;width:100%}
+.bbtn .bb{font-size:21px;font-weight:750}
+.bbtn .bf{font-size:14px;font-weight:600;color:var(--dim)}
+.bbtn .ba{font-size:14px;font-weight:800;color:var(--accent)}
+.bbtn .bw{font-size:14px;font-weight:700;color:var(--warn)}
+.bbtn.cur{border:3px solid var(--accent);background:var(--panel);border-radius:10px;min-height:64px}
+.bbtn[aria-pressed=true] .bf,.bbtn[aria-pressed=true] .bw{color:inherit}
+.bpwhy{margin:4px 0 2px;font-size:21px;font-weight:750;overflow-wrap:anywhere}
+.bpsub{margin:0 0 4px;font-size:16px;font-weight:600;color:var(--dim)}
+.bpk{margin:12px 0 0;font-size:15px;color:var(--dim);font-weight:700}
+.bpstep{display:grid;grid-template-columns:72px 1fr 72px;gap:6px;align-items:center;margin-top:6px}
+.bpstep .val{text-align:center;font-size:20px;font-weight:700}
+.bpcred{font-size:14px;color:var(--dim);margin:6px 0 0}
+.bpcred a{color:var(--accent)}
 </style>
 </head>
 <body>
@@ -6985,6 +8772,32 @@ dialog .row2{margin-top:6px}
   <button type="button" class="btn wide" id="mute" aria-pressed="false" disabled>Mute uConsole speaker</button>
   <p class="note">Audio may stop when the phone locks or the browser goes to the background.</p>
 </section>
+<section class="card" id="bPlan" data-v="digital" data-live hidden>
+  <div class="lbl"><span>Band plan</span><span id="bpState"></span></div>
+  <p id="bpWhy" class="bpwhy" role="status" aria-live="polite">—</p>
+  <p id="bpSub" class="bpsub"></p>
+  <div class="row2" role="group" aria-label="Band plan"><button type="button" class="btn" id="bpAuto">Auto</button><button type="button" class="btn" id="bpMan">Manual</button></div>
+  <div id="bpAutoBox">
+    <p class="bpk">Auto listens for</p>
+    <div class="row2" role="group" aria-label="Auto listens for"><button type="button" class="btn" id="bpWspr">WSPR</button><button type="button" class="btn" id="bpJs8">JS8</button></div>
+  </div>
+  <p id="bpCond" class="bpsub"></p>
+  <p id="bpCred" class="bpcred" hidden></p>
+  <p id="bpMsg" class="msg" role="status" hidden></p>
+  <button type="button" class="btn wide" id="bpMore" aria-expanded="false" aria-controls="bpSet">Bands and timing ▾</button>
+  <div id="bpSet" hidden>
+    <p class="bpk">Bands Auto may use</p>
+    <div id="bpBands" class="bgrid" role="group" aria-label="Bands Auto may use"></div>
+    <button type="button" class="btn wide" id="bpDef">Use the default bands</button>
+    <p class="bpk">Other side of the Ham It Up</p>
+    <div class="row2" role="group" aria-label="Other side of the Ham It Up"><button type="button" class="btn" id="bpSideOff">Stay on this side</button><button type="button" class="btn" id="bpSideOn">Allow, I'll flip it</button></div>
+    <p class="bpk">Time on each band when scanning</p>
+    <div class="bpstep"><button type="button" class="btn" id="bpDwDn" aria-label="Less time on each band">−</button><span id="bpDw" class="val">—</span><button type="button" class="btn" id="bpDwUp" aria-label="More time on each band">+</button></div>
+    <p class="bpk">Check for a better band every</p>
+    <div id="bpEvery" class="seg" role="group" aria-label="Check for a better band every"></div>
+    <button type="button" class="btn wide" id="bpScan">Scan the bands now</button>
+  </div>
+</section>
 <section class="card" id="jPick" data-v="digital">
   <div class="lbl"><span>Mode and frequency</span></div>
   <div id="jPickL"></div>
@@ -6995,6 +8808,7 @@ dialog .row2{margin-top:6px}
   <div><span class="k">Signal</span><span id="jLvl" class="v">— dBFS</span></div>
   <div><span class="k">Heard</span><span id="jHeard" class="v">—</span></div>
   <div><span class="k">Clock</span><span id="jClock" class="v">—</span></div>
+  <div id="jGainC" hidden><span class="k">RF gain</span><span id="jGain" class="v">—</span></div>
   <p id="jClockBad" class="banner jclock" role="alert" hidden></p>
 </section>
 <section class="card wst" id="wStat" data-v="digital" data-live hidden>
@@ -7063,11 +8877,18 @@ dialog .row2{margin-top:6px}
     <div class="sl"><div class="lbl"><label for="bw">Bandwidth</label><span id="bwV" class="val">—</span></div>
       <input type="range" id="bw" min="300" max="4000" step="100"></div>
     <div class="sl" id="gainSl"><div class="lbl"><label for="gain">RF gain</label><span id="gainV" class="val">—</span></div>
-      <input type="range" id="gain" min="0" max="50" step="0.1"></div>
+      <div class="row2" id="gAuto" role="group" aria-label="RF gain: automatic or set by hand" hidden><button type="button" class="btn" id="gAutoOff">By hand</button><button type="button" class="btn" id="gAutoOn">Auto</button></div>
+      <input type="range" id="gain" min="0" max="50" step="0.1">
+      <p id="gWhy" class="note" hidden></p></div>
     <div class="sl" id="volSl"><div class="lbl"><label for="vol">uConsole speaker</label><span id="volV" class="val">—</span></div>
       <input type="range" id="vol" min="0" max="1000" step="1"></div>
   </section>
 </div>
+</fieldset>
+<fieldset class="card" id="audioCard" data-v="manual" data-live disabled hidden>
+  <div class="lbl"><span>Audio clean-up</span><span id="auState" class="val"></span></div>
+  <div class="augrid" role="group" aria-label="Audio clean-up" id="auGrid"></div>
+  <p class="note">For the uConsole speaker and the audio on this device. JS8Call and the WSPR decoder always get the audio untouched.</p>
 </fieldset>
 <section class="card" id="aPick" data-v="manual">
   <div class="lbl"><span>Profiles</span></div>
@@ -7247,7 +9068,7 @@ function renderConn() {
   else if (conn === "ok") setText(el, "● Connected", "pill ok");
   else if (conn === "down") setText(el, "✕ Disconnected", "pill bad");
   $("down").hidden = conn !== "down" || !!switching;
-  $("ctl").disabled = $("qual").disabled = conn !== "ok" || !!switching;
+  $("ctl").disabled = $("qual").disabled = $("audioCard").disabled = conn !== "ok" || !!switching;
   $("sw").hidden = !switching;
   if (switching) $("note").hidden = true;
   renderProfiles(); renderMute();
@@ -7318,6 +9139,8 @@ function applyStatus(s) {
   renderProfiles(); renderQual();
   renderJs8Stat(s, $("sRx").textContent, $("sRx").className);
   renderWsprStat(s);
+  renderGainAudio(s);
+  renderBandPlan(s);
   if (profAvail && profiles && !switching && !profLoading && s.profile !== profiles.active && s.profile !== profAskedFor) loadProfiles();
   if (A.on && rateFor(s.mode) !== A.want) connectAudio();
   js8Sync(); wsprSync();
@@ -7769,7 +9592,7 @@ function renderView() {
   // RF gain and the speaker slider live in whichever view shows them
   const home = v === "listen" ? $("qual") : $("sliders");
   if ($("gainSl").parentElement !== home) { home.appendChild($("gainSl")); home.appendChild($("volSl")); }
-  if (v === "listen") home.appendChild($("sqSl"));
+  if (v === "listen") { home.appendChild($("sqSl")); home.appendChild($("auSl")); }
   renderProfiles(); renderQual();
   if (v === "manual") requestAnimationFrame(() => { onResize(); pollSpecSoon(); });
 }
@@ -7792,7 +9615,7 @@ function profBtn(p, top, sub) {
   return el;
 }
 function renderProfiles() {
-  const key = JSON.stringify([profiles, activeName(), curUp(), conn === "ok", switching && switching.name, view]);
+  const key = JSON.stringify([profiles, activeName(), curUp(), conn === "ok", switching && switching.name, view, bandPickKey()]);
   if (key === pickKey) return;
   pickKey = key;
   const all = profiles ? profiles.profiles : [];
@@ -7813,8 +9636,7 @@ function renderProfiles() {
       for (const p of g) l.appendChild(f(p));
     }
   };
-  if (view === "digital") grouped("jPickL", all.filter(p => pdec(p)), DECODERS.map(([d, t]) => [d, t, p => pdec(p) === d]),
-    p => profBtn(p, p.name, (p.description ? p.description + " · " : "") + fmtMHz(p.freq)));
+  if (view === "digital") renderBandPicker(all, mk);
   if (view === "manual") mk("aPickL", all, p => profBtn(p, pdesc(p), p.name + " · " + fmtMHz(p.freq) + " · " + p.mode + (pdec(p) ? " · " + decName(pdec(p)) : "")));
   if (view === "listen") grouped("lPickL", all.filter(p => pkind(p) === "listen"), GROUPS.map(([m, t]) => [m, t, p => p.mode === m]),
     p => profBtn(p, pdesc(p), fmtMHz(p.freq) + " · " + (p.mode === "FM" ? "NFM" : p.mode)));
@@ -7860,7 +9682,8 @@ function finishSwitch() {
     setText($("flipT"), "▲ Flip the Ham It Up to " + hiuWord(curUp()) + ". " + sw.desc + " needs it; without it you hear nothing.");
     $("flip").hidden = false;
   }
-  if (muted() && st.volume > 0) { store("spkprev", String(st.volume)); tune({volume: 0}, 0); }
+  // a mute carries over to the next station, never to JS8: its audio is JS8Call's input
+  if (muted() && st.volume > 0 && !feedsDecoder(st)) { store("spkprev", String(st.volume)); tune({volume: 0}, 0); }
   jKey = null; wKey = null;
   renderConn(); renderView();
   loadProfiles();
@@ -7882,7 +9705,7 @@ const BWP = {WFM: [100e3, 150e3, 200e3], FM: [8e3, 12.5e3, 16e3], AM: [6e3, 10e3
 const sqSl = document.createElement("div");
 sqSl.className = "sl"; sqSl.id = "sqSl"; sqSl.dataset.v = "listen";
 sqSl.innerHTML = '<div class="lbl"><span>Squelch</span><span id="sqS" class="val">—</span></div>' +
-  '<div class="row2"><button type="button" class="btn" id="sqOff">Off</button><button type="button" class="btn" id="sqOn">On</button></div>' +
+  '<div class="row2" id="sqBtns"><button type="button" class="btn" id="sqOff">Off</button><button type="button" class="btn" id="sqOn">On</button></div>' +
   '<div id="sqLv"><div class="lbl"><label for="sq">Opens above</label><span id="sqV" class="val">—</span></div>' +
   '<input type="range" id="sq" min="-120" max="0" step="1"></div>';
 $("qual").appendChild(sqSl);
@@ -7895,7 +9718,7 @@ for (const [i, name] of ["Narrow", "Normal", "Wide"].entries()) {
 }
 const sqEl = $("sq");
 function sqLevel() { const v = +load("squelch"); return v <= 0 && v >= -150 && load("squelch") !== null ? v : -60; }
-$("sqOff").onclick = () => { tune({squelch: null}, 0); if (st) st.squelch = null; renderQual(); };
+$("sqOff").onclick = () => { tune(sqAutoAvail() ? {squelch: null, audio_squelch: false} : {squelch: null}, 0); if (st) { st.squelch = null; if (sqAutoAvail()) st.audio.squelch = false; } renderQual(); };
 $("sqOn").onclick = () => { const v = sqLevel(); tune({squelch: v}, 0); if (st) st.squelch = v; renderQual(); };
 sqEl.oninput = () => { const v = +sqEl.value; store("squelch", String(v)); setText($("sqV"), "−" + Math.abs(v) + " dBFS"); fill(sqEl); tune({squelch: v}, 200); };
 track(sqEl, "squelch");
@@ -7924,7 +9747,9 @@ function renderQual() {
     $("sqOff").setAttribute("aria-pressed", String(!on)); $("sqOn").setAttribute("aria-pressed", String(on));
     $("sqLv").hidden = !on;
     if (on && !held("squelch")) { sqEl.value = st.squelch; fill(sqEl); setText($("sqV"), (st.squelch < 0 ? "−" : "") + Math.abs(st.squelch) + " dBFS"); }
-    if (!on) setText($("sqS"), "Off, always open", "val");
+    sqRenderAuto(on);
+    if (on) {} else if (sqAuto()) setText($("sqS"), st.squelch_open ? "● Auto: open (signal)" : "■ Auto: closed (quiet)", st.squelch_open ? "val ok" : "val dimc");
+    else if (!on) setText($("sqS"), "Off, always open", "val");
     else if (st.squelch_open) setText($("sqS"), "● Open (signal)", "val ok");
     else setText($("sqS"), "■ Closed (quiet)", "val dimc");
   }
@@ -7933,11 +9758,12 @@ function renderQual() {
 // ---------------------------------------------------------------- uConsole speaker mute
 function muted() { return load("spkprev") !== null; }
 function syncMute() {
-  if (muted() && st && st.volume > 0 && !held("volume")) forget("spkprev");
+  if (muted() && st && st.volume > 0 && !held("volume") && !feedsDecoder(st)) forget("spkprev");
   renderMute();
 }
 function renderMute() {
   const b = $("mute"), m = muted();
+  b.hidden = feedsDecoder(st);
   b.disabled = conn !== "ok" || !!switching || !st || (!m && st.volume === 0);
   b.setAttribute("aria-pressed", String(m));
   if (m) setText(b, "Unmute uConsole speaker (back to " + Math.round(+load("spkprev") * 100) + " %)");
@@ -8199,6 +10025,112 @@ function renderJs8Stat(s, rxText, rxCls) {
   }
 }
 
+// ---------------------------------------------------------------- gain: auto RF gain and audio clean-up
+// Auto gain sits in the RF gain block, which moves between Listen and Manual;
+// moving the slider sets the gain by hand, which turns auto off in rxd.
+// Listen gets one Auto audio switch; Manual a switch per stage.
+const AU = [["auto", "Auto audio"], ["nr", "Noise reduction"], ["filter", "Hum filter"],
+  ["norm", "Even loudness"], ["limit", "Limiter"], ["squelch", "NFM squelch"]];
+const auSl = document.createElement("div");
+auSl.className = "sl"; auSl.id = "auSl"; auSl.dataset.v = "listen"; auSl.hidden = true;
+auSl.innerHTML = '<div class="lbl"><span>Auto audio</span><span id="auS" class="val">—</span></div>' +
+  '<div class="row2" role="group" aria-label="Auto audio"><button type="button" class="btn" id="auOff">Off</button><button type="button" class="btn" id="auOn">On</button></div>' +
+  '<p id="auNote" class="note"></p>';
+$("qual").appendChild(auSl);
+for (const [k, name] of AU) {
+  const b = document.createElement("button");
+  b.type = "button"; b.className = "btn"; b.dataset.k = k; b.dataset.name = name;
+  b.onclick = () => auToggle(k);
+  $("auGrid").appendChild(b);
+}
+function gAuto(s) { return held("gain_auto") && "gain_auto" in pend ? pend.gain_auto : s.gain_auto; }
+function setGainAuto(on) { if (!st) return; tune({gain_auto: on}, 0); st.gain_auto = on; renderGainAudio(st); }
+$("gAutoOn").onclick = () => setGainAuto(true);
+$("gAutoOff").onclick = () => { if (st) { tune({gain_db: st.gain_db}, 0); st.gain_auto = false; renderGainAudio(st); } };
+$("auOn").onclick = () => auSet("auto", true);
+$("auOff").onclick = () => auSet("auto", false);
+function auSet(k, v) {
+  if (!st || !st.audio) return;
+  const f = {}; f["audio_" + k] = v; tune(f, 0);
+  st.audio[k] = v;
+  if (k === "nr") { st.audio.nr_setting = v; st.audio.nr = v === null ? st.mode !== "WFM" : v; }
+  renderGainAudio(st);
+}
+function auToggle(k) {
+  if (!st || !st.audio) return;
+  if (k !== "nr") return auSet(k, !st.audio[k]);
+  // noise reduction is on by mode (off for WFM); back to "by mode" when that's what's asked
+  const want = !st.audio.nr, byMode = st.mode !== "WFM";
+  auSet("nr", want === byMode ? null : want);
+}
+const AU_WORDS = {nr: "noise reduction", filter: "hum filter", norm: "even loudness", limit: "limiter", squelch: "squelch"};
+function gainWhy(s) {
+  const g = s.gain_loop || {};
+  if (!s.gain_auto) return "Set by hand. Auto picks the gain with the best signal-to-noise without overload.";
+  if (g.state === "unavailable") return "✕ " + (g.reason || "No gain control on this source.");
+  const state = {settling: "■ Settling", holding: "● Holding", stepped: "● Stepped", "waiting for the gap between slots": "■ Stepping in the next gap between slots"}[g.state] || g.state;
+  const m = typeof g.margin_db === "number" ? "; band noise " + Math.round(g.margin_db) + " dB over the ADC's" : "";
+  return state + (g.reason ? ": " + g.reason : "") + m + ".";
+}
+// NFM's squelch row in Listen: Off, Auto (rxd's noise squelch) or a level
+const sqAutoB = document.createElement("button");
+sqAutoB.type = "button"; sqAutoB.className = "btn"; sqAutoB.id = "sqAuto"; sqAutoB.textContent = "Auto";
+$("sqBtns").insertBefore(sqAutoB, $("sqOn"));
+sqAutoB.onclick = () => { tune({squelch: null, audio_squelch: true, audio_auto: true}, 0); if (st) { st.squelch = null; Object.assign(st.audio, {squelch: true, auto: true}); } renderQual(); renderGainAudio(st); };
+function sqAutoAvail() { return !!(st && st.audio && typeof st.audio.squelch === "boolean"); }
+function sqAuto() { return sqAutoAvail() && st.audio.auto && st.audio.squelch && (st.squelch === null || st.squelch === undefined); }
+function sqRenderAuto(level) {
+  const av = sqAutoAvail(), au = sqAuto() && !level;
+  sqAutoB.hidden = !av;
+  $("sqBtns").className = av ? "row3" : "row2";
+  sqAutoB.setAttribute("aria-pressed", String(au));
+  $("sqOff").setAttribute("aria-pressed", String(!level && !au));
+  $("sqOn").textContent = av ? "Level" : "On";
+}
+// A JS8 profile's speaker audio is JS8Call's input (rxd refuses a volume
+// under volume_min there), so no speaker volume or mute is offered.
+function feedsDecoder(s) { return !!s && (s.volume_min > 0 || pdec(s) === "js8"); }
+function renderGainAudio(s) {
+  $("volSl").hidden = feedsDecoder(s);
+  const has = typeof s.gain_auto === "boolean";
+  $("gAuto").hidden = !has;
+  if (has) {
+    const on = gAuto(s);
+    $("gAutoOn").setAttribute("aria-pressed", String(on)); $("gAutoOff").setAttribute("aria-pressed", String(!on));
+    $("gAutoOn").textContent = (on ? "● " : "") + "Auto"; $("gAutoOff").textContent = (on ? "" : "● ") + "By hand";
+    if (!held("gain_db") && typeof s.gain_db === "number") setText($("gainV"), (on ? "Auto, " : "") + s.gain_db.toFixed(1) + " dB");
+    setText($("gWhy"), gainWhy(s)); $("gWhy").hidden = false;
+  }
+  const jc = $("jGainC");
+  jc.hidden = !has;
+  if (has && view === "digital") setText($("jGain"), (s.gain_auto ? "Auto " : "Set ") + (typeof s.gain_db === "number" ? s.gain_db.toFixed(1) : "—") + " dB", "v");
+  const a = s.audio;
+  const hasA = !!a && typeof a.auto === "boolean";
+  $("auSl").hidden = !hasA || view !== "listen";
+  $("audioCard").hidden = $("audioCard").hidden || !hasA;
+  if (!hasA) return;
+  const act = Array.isArray(a.active) ? a.active : [];
+  const sum = !a.auto ? "Off, untouched" : act.length ? "On: " + act.map(k => AU_WORDS[k]).filter(Boolean).join(", ") : "On, nothing for this mode";
+  $("auOn").setAttribute("aria-pressed", String(a.auto)); $("auOff").setAttribute("aria-pressed", String(!a.auto));
+  $("auOn").textContent = (a.auto ? "● " : "") + "On"; $("auOff").textContent = (a.auto ? "" : "● ") + "Off";
+  setText($("auS"), a.auto ? "On" : "Off", "val");
+  setText($("auNote"), sum);
+  setText($("auState"), a.auto ? (a.squelch_open === false ? "■ Squelch closed (quiet)" : a.squelch_open ? "● Squelch open (signal)" : "● On") : "Off", "val");
+  for (const b of $("auGrid").children) {
+    const k = b.dataset.k;
+    b.hidden = k === "squelch" && s.mode !== "FM";
+    const on = k === "nr" ? a.nr : a[k];
+    b.disabled = k !== "auto" && !a.auto;
+    b.setAttribute("aria-pressed", String(!!on));
+    b.textContent = "";
+    b.append((on ? "● " : "○ ") + (k === "filter" && s.mode === "FM" ? "Voice filter" : b.dataset.name));
+    const sm = document.createElement("small");
+    sm.textContent = (on ? "On" : "Off") + (k === "nr" && a.nr_setting === null ? " (by mode)" : "") +
+      (k === "squelch" && on && s.squelch !== null && s.squelch !== undefined ? ", the level squelch is on instead" : "");
+    b.appendChild(sm);
+  }
+}
+
 // ---------------------------------------------------------------- WSPR spots
 let wOn = false, wKey = null, wSeq = 0, wTimer = 0, wHeard = new Map(), wFilt = "", wBusy = false;
 function wsprSync() {
@@ -8322,6 +10254,197 @@ async function setReport(on) {
 }
 $("wRepOff").onclick = () => setReport(false);
 $("wRepOn").onclick = () => setReport(true);
+
+// ---------------------------------------------------------------- band plan and the band picker
+// rxd's band plan (status band_plan, GET/POST /api/bands): Auto picks the JS8
+// or WSPR band by conditions, time of day and what rxd has heard; Manual
+// stays put. The picker is a mode toggle plus a grid of bands.
+const BAND_ORDER = ["2190m", "630m", "160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m", "2m"];
+const DWELLS = [2, 4, 6, 8, 10, 15, 20, 30];
+const EVERY = [15, 30, 60, 120];
+let pickMode = null, bandsDoc = null, bandsAt = -1e9, bandsBusy = false, bpOpen = false;
+function bandWord(b) { return b ? b.replace(/m$/, " m") : "—"; }
+function bp() { return st && st.band_plan ? st.band_plan : null; }
+function bestBand(mode) {
+  if (!bandsDoc || !Array.isArray(bandsDoc.profiles)) return null;
+  let best = null;
+  for (const r of bandsDoc.profiles) if (r.mode === mode && r.eligible && (!best || r.score > best.score)) best = r;
+  return best && best.name;
+}
+function bandPickKey() { const b = bp(); return [pickMode, b && b.plan, b && b.mode, bestBand("js8"), bestBand("wspr")].join(); }
+function pickModeNow() { return pickMode || curDec() || (bp() && bp().mode) || "wspr"; }
+
+function bandBtn(p, best) {
+  const act = p.name === activeName() && !switching;
+  const el = document.createElement(act ? "div" : "button");
+  el.className = act ? "bbtn cur" : "btn bbtn";
+  const add = (cls, t) => { const s = document.createElement("span"); s.className = cls; s.textContent = t; el.appendChild(s); };
+  add("bb", bandWord(p.band));
+  add("bf", trim(p.freq / 1e6, 4));
+  if (act) add("ba", "● On");
+  else {
+    el.type = "button";
+    if (switching && switching.name === p.name) add("ba", "■ Switching");
+    else if (!!p.upconvert !== curUp()) add("bw", "▲ " + hiuWord(p.upconvert));
+    else if (best) add("ba", "★ Best now");
+    el.setAttribute("aria-label", decName(pdec(p)) + " " + bandWord(p.band) + ", " + fmtMHz(p.freq) + (best ? ", best now" : ""));
+    el.disabled = conn !== "ok" || !!switching;
+    el.onclick = () => askSwitch(p);
+  }
+  return el;
+}
+function renderBandPicker(all, mk) {
+  const box = $("jPickL");
+  const dig = all.filter(p => pdec(p));
+  if (!profiles || !dig.length) { mk("jPickL", dig, null); return; }
+  box.textContent = "";
+  const mode = pickModeNow();
+  const seg = document.createElement("div"); seg.className = "row2"; seg.setAttribute("role", "group"); seg.setAttribute("aria-label", "Mode");
+  for (const [d, t] of DECODERS) {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "btn"; b.setAttribute("aria-pressed", String(d === mode));
+    b.textContent = (d === mode ? "● " : "") + t + (d === curDec() ? " (on now)" : "");
+    b.onclick = () => { pickMode = d; pickKey = ""; renderProfiles(); };
+    seg.appendChild(b);
+  }
+  box.appendChild(seg);
+  const best = bp() && bp().plan === "auto" && bp().mode === mode ? bestBand(mode) : null;
+  const grid = document.createElement("div"); grid.className = "bgrid";
+  const plan = dig.filter(p => pdec(p) === mode && p.plan && p.band)
+    .sort((a, b) => BAND_ORDER.indexOf(a.band) - BAND_ORDER.indexOf(b.band));
+  for (const p of plan) grid.appendChild(bandBtn(p, p.name === best));
+  box.appendChild(grid);
+  const extra = dig.filter(p => pdec(p) === mode && !(p.plan && p.band));
+  if (extra.length) {
+    const h = document.createElement("div"); h.className = "pgroup"; h.textContent = "Other " + decName(mode) + " profiles"; box.appendChild(h);
+    const l = document.createElement("div"); l.className = "plist"; box.appendChild(l);
+    for (const p of extra) l.appendChild(profBtn(p, p.name, (p.description ? p.description + " · " : "") + fmtMHz(p.freq)));
+  }
+  if (bp() && bp().plan === "auto") {
+    const n = document.createElement("p"); n.className = "note";
+    n.textContent = "Auto is choosing the band. Picking one here sets the band plan to Manual.";
+    box.appendChild(n);
+  }
+}
+
+function bpMsg(t) { const m = $("bpMsg"); m.textContent = t ? "✕ " + t : ""; m.hidden = !t; }
+async function postBands(body) {
+  if (bandsBusy) return;
+  bandsBusy = true; bpMsg(""); renderBandPlan(st);
+  let r = null;
+  try { r = await api("/api/bands", body); } catch (e) {}
+  bandsBusy = false;
+  if (!r) bpMsg("Could not reach rxd. Nothing was changed.");
+  else if (!r.ok) bpMsg("rxd refused: " + ((r.doc && r.doc.error) || ("HTTP " + r.status)));
+  else if (r.doc) { bandsDoc = r.doc; bandsAt = now(); if (st) st.band_plan = r.doc.status; }
+  pickKey = ""; renderBandPlan(st); renderProfiles();
+}
+async function loadBands() {
+  bandsAt = now();
+  try {
+    const r = await api("/api/bands");
+    if (r.ok && r.doc) { bandsDoc = r.doc; pickKey = ""; renderProfiles(); }
+  } catch (e) {}
+}
+function localHM(epoch) { return epoch ? hhmm(new Date(epoch * 1000)) : "—"; }
+function pressed(id, on, text) {
+  const b = $(id); b.setAttribute("aria-pressed", String(!!on));
+  setText(b, (on ? "● " : "") + text);
+  b.disabled = conn !== "ok" || bandsBusy;
+}
+function renderBandPlan(s) {
+  const b = s && s.band_plan, card = $("bPlan");
+  if (!b) { card.hidden = true; return; }
+  if (view === "digital" && !card.hidden && now() - bandsAt > 60000) loadBands();
+  const auto = b.plan === "auto";
+  const sym = !auto ? "■ " : b.phase === "scan" ? "◔ " : b.phase === "idle" ? "▲ " : "● ";
+  setText($("bpState"), auto ? (b.phase === "scan" ? "Auto, scanning" : "Auto") : "Manual");
+  setText($("bpWhy"), sym + (b.reason || "—"), "bpwhy" + (b.phase === "idle" ? " warn" : ""));
+  const sun = b.sun || {};
+  const parts = [];
+  if (auto && b.phase === "hold" && b.next_at) parts.push("Next look " + localHM(b.next_at));
+  if (auto && b.switching_to && b.switching_to !== b.profile) parts.push("Switching to " + b.switching_to);
+  parts.push((sun.words ? sun.words[0].toUpperCase() + sun.words.slice(1) : "—") +
+    (sun.sunrise ? " · sunrise " + localHM(sun.sunrise) : "") + (sun.sunset ? " · sunset " + localHM(sun.sunset) : "") +
+    (sun.located === false ? " (no grid set: by this clock)" : ""));
+  setText($("bpSub"), parts.join(" · "));
+  pressed("bpAuto", auto, "Auto"); pressed("bpMan", !auto, "Manual");
+  $("bpAutoBox").hidden = !auto;
+  pressed("bpWspr", b.mode === "wspr", "WSPR"); pressed("bpJs8", b.mode === "js8", "JS8");
+  const c = b.conditions;
+  if (c) {
+    setText($("bpCond"), "Conditions: SFI " + c.sfi + " · A " + (c.a == null ? "—" : c.a) + " · K " + (c.k == null ? "—" : c.k) +
+      (c.fetched ? " · as of " + localHM(c.fetched) : ""));
+    const cr = $("bpCred");
+    if (c.source === "hamqsl") {
+      if (!cr.firstChild || cr.dataset.src !== "hamqsl") {
+        cr.textContent = "Band conditions courtesy of N0NBH, ";
+        const a = document.createElement("a"); a.href = "https://www.hamqsl.com/solar.html"; a.rel = "noopener"; a.target = "_blank";
+        a.textContent = "www.hamqsl.com"; cr.appendChild(a); cr.dataset.src = "hamqsl";
+      }
+    } else { cr.textContent = c.credit || ""; cr.dataset.src = c.source || ""; }
+    cr.hidden = false;
+  } else {
+    setText($("bpCond"), "▲ No band conditions" + (b.conditions_error ? ": can't reach hamqsl.com or NOAA" : "") +
+      ". Auto goes by time of day and what rxd has heard, scanning to learn.");
+    $("bpCred").hidden = true;
+  }
+  $("bpMore").setAttribute("aria-expanded", String(bpOpen));
+  setText($("bpMore"), bpOpen ? "Bands and timing ▴" : "Bands and timing ▾");
+  $("bpSet").hidden = !bpOpen;
+  if (!bpOpen) return;
+  // bands
+  const box = $("bpBands"), en = b.bands || [];
+  const key = JSON.stringify([en, b.side, b.cross_side, conn, bandsBusy]);
+  if (box.dataset.key !== key) {
+    box.dataset.key = key; box.textContent = "";
+    for (const band of BAND_ORDER) {
+      const on = en.indexOf(band) >= 0, up = !(band === "6m" || band === "2m");
+      const btn = document.createElement("button");
+      btn.type = "button"; btn.className = "btn bbtn"; btn.setAttribute("aria-pressed", String(on));
+      const t = document.createElement("span"); t.className = "bb"; t.textContent = bandWord(band); btn.appendChild(t);
+      const sub = document.createElement("span"); sub.className = "bf"; sub.textContent = on ? "✓ On" : "Off"; btn.appendChild(sub);
+      if ((up ? "UPCONVERT" : "BYPASS") !== b.side) {
+        const w = document.createElement("span"); w.className = "bw"; w.textContent = "▲ " + (up ? "UPCONVERT" : "BYPASS"); btn.appendChild(w);
+      }
+      btn.setAttribute("aria-label", bandWord(band) + (on ? ", on" : ", off") + ((up ? "UPCONVERT" : "BYPASS") !== b.side ? ", needs the Ham It Up on " + (up ? "UPCONVERT" : "BYPASS") : ""));
+      btn.disabled = conn !== "ok" || bandsBusy;
+      btn.onclick = () => postBands({bands: on ? en.filter(x => x !== band) : en.concat([band])});
+      box.appendChild(btn);
+    }
+  }
+  $("bpDef").hidden = !!b.default_bands;
+  $("bpDef").disabled = conn !== "ok" || bandsBusy;
+  pressed("bpSideOff", !b.cross_side, "Stay on this side"); pressed("bpSideOn", b.cross_side, "Allow, I'll flip it");
+  setText($("bpDw"), b.dwell_min + " min" + (b.mode === "wspr" ? ", 2 slots at least" : ""));
+  const di = DWELLS.indexOf(b.dwell_min);
+  $("bpDwDn").disabled = conn !== "ok" || bandsBusy || di === 0;
+  $("bpDwUp").disabled = conn !== "ok" || bandsBusy || di === DWELLS.length - 1;
+  const ev = $("bpEvery");
+  if (!ev.children.length) for (const m of EVERY) {
+    const x = document.createElement("button"); x.type = "button"; x.className = "btn"; x.dataset.m = m;
+    x.onclick = () => postBands({every_min: m}); ev.appendChild(x);
+  }
+  for (const x of ev.children) pressed(x.id || (x.id = "bpEv" + x.dataset.m), +x.dataset.m === b.every_min, x.dataset.m + " min");
+  $("bpScan").disabled = conn !== "ok" || bandsBusy;
+}
+$("bpAuto").onclick = () => postBands({plan: "auto"});
+$("bpMan").onclick = () => postBands({plan: "manual"});
+$("bpWspr").onclick = () => postBands({mode: "wspr"});
+$("bpJs8").onclick = () => postBands({mode: "js8"});
+$("bpMore").onclick = () => { bpOpen = !bpOpen; renderBandPlan(st); };
+$("bpDef").onclick = () => postBands({bands: null});
+$("bpSideOff").onclick = () => postBands({cross_side: false});
+$("bpSideOn").onclick = () => postBands({cross_side: true});
+function stepDwell(d) {
+  const b = bp(); if (!b) return;
+  let i = DWELLS.indexOf(b.dwell_min); if (i < 0) i = DWELLS.findIndex(x => x >= b.dwell_min);
+  const n = DWELLS[Math.max(0, Math.min(DWELLS.length - 1, (i < 0 ? 2 : i) + d))];
+  if (n !== b.dwell_min) postBands({dwell_min: n});
+}
+$("bpDwDn").onclick = () => stepDwell(-1);
+$("bpDwUp").onclick = () => stepDwell(1);
+$("bpScan").onclick = () => postBands({scan: true});
 
 // ---------------------------------------------------------------- start
 document.addEventListener("visibilitychange", () => {
@@ -8917,7 +11040,11 @@ def capture(p, st):
         p["demod_settings"] = dict(p.get("demod_settings") or {},
                                    bandwidth=float(st["bandwidth"]))
     if st.get("volume") is not None:
-        p["volume"] = float(st["volume"])
+        vol = float(st["volume"])
+        # A JS8 profile's volume is JS8Call's input level: never save it
+        # silent (an older rxd let a speaker mute through to it).
+        if not (p.get("js8call_dial") is not None and vol < 0.05):
+            p["volume"] = vol
     if "squelch" in st:  # in SDR++'s keys, which rxd reads back
         ds = dict(p.get("demod_settings") or {}, squelchEnabled=st["squelch"] is not None)
         if st["squelch"] is not None:
@@ -8925,6 +11052,15 @@ def capture(p, st):
         p["demod_settings"] = ds
     if st.get("gain_db") is not None:
         p["rtl"] = dict(p.get("rtl") or {}, gain_db=float(st["gain_db"]))
+    if "gain_auto" in st:  # with it on, gain_db is only where rxd starts
+        p["rtl"] = dict(p.get("rtl") or {}, gain_auto=bool(st["gain_auto"]))
+    au = st.get("audio")
+    if isinstance(au, dict):
+        saved = {k: au[k] for k in ("auto", "filter", "norm", "limit", "squelch") if k in au}
+        if "nr_setting" in au:  # the setting (None: by mode), not whether it's on now
+            saved["nr"] = au["nr_setting"]
+        if saved:
+            p["audio"] = saved
     # rxd is the source of truth for the dial too: JS8Call tunes it over
     # rigctl. Saving both dial and carrier keeps the calibration between them.
     if p.get("js8call_dial") is not None and st.get("freq") is not None:
