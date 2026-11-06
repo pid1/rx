@@ -1,9 +1,9 @@
 <!-- Hidden until a hero image exists. Add it, restore this line, then delete this note.
-<p align="center"><img src="docs/screenshots/uconsole.jpg" alt="The uConsole running JS8Call (an older screenshot, from when SDR++ was the receiver)" width="880"></p>
+<p align="center"><img src="docs/screenshots/uconsole.jpg" alt="The uConsole with rxd's Digital view showing JS8 decodes" width="880"></p>
 
 Asset to create: docs/screenshots/uconsole.jpg. A photo of the uConsole (or a
-1280x720 screenshot) with JS8Call decoding on workspace 2. Crop out the status
-bar's Wi-Fi name.
+1280x720 screenshot) with rxd's Digital view showing JS8 decodes. Crop out
+the status bar's Wi-Fi name.
 -->
 
 <p align="center">
@@ -37,8 +37,8 @@ script that provisions a blank card re-applies the configuration on every
 
 1. **Flash** Rex's image to a microSD card and finish its first-boot wizard.
 2. **Run** `curl -fsSL pid1.space/rx | sudo bash`, then reboot.
-3. **Listen.** `radio ghostnet` brings up the receiver tuned to 7.107 MHz and
-   JS8Call decoding GhostNet from it. `radio noaa` swaps to weather radio.
+3. **Listen.** `radio ghostnet` brings up the receiver tuned to 7.107 MHz,
+   decoding GhostNet's JS8 itself. `radio noaa` swaps to weather radio.
 4. **Go off-grid.** The clock keeps JS8-grade time from GPS and the RTC with no
    network, and the mesh map works from offline tiles.
 5. **Keep it current** with `sudo maint`: package upgrades, then this script
@@ -48,8 +48,9 @@ script that provisions a blank card re-applies the configuration on every
 
 - **Switches the SDR between setups in one command.** `radio NAME` closes what
   is running and brings NAME up tuned, playing, and resuming where you left it.
-- **Receives JS8** through the SDR: rxd, a headless receiver, feeds JS8Call
-  over a virtual audio cable, with GhostNet's groups set and every transmit and upload path off.
+- **Decodes JS8 and WSPR** from the SDR: rxd, a headless receiver, decodes
+  both itself and shows them in its browser UI and rxd-tui. Receive only;
+  the one upload is WSPR spots to WSPRnet, which a profile can turn off.
 - **Keeps time without a network**, from GPS PPS, the AIO's RTC and chrony.
 - **Runs a LoRa mesh node** on the AIO's SX1262, Meshtastic or MeshCore, on
   the North Texas community's settings, with node lists, messaging, a
@@ -77,7 +78,7 @@ Then:
 
 ```bash
 radio                       # list the SDR profiles
-radio ghostnet              # JS8 GhostNet: rxd on 7.107 MHz + JS8Call
+radio ghostnet              # JS8 GhostNet: rxd on 7.107 MHz, decoding it
 chronyc sources             # time: PPS marked '*' once the GPS has a fix
 radio meshtastic            # mesh node on North Texas settings (or: radio meshcore)
 radio mesh nodes            # who the mesh has heard
@@ -93,8 +94,8 @@ The account is assumed to be `jroemer`; pass another with
 | Command | What it does |
 |---|---|
 | `radio` | List profiles; `*` marks the active one |
-| `radio NAME` | Close what's running, start rxd on NAME. JS8 profiles also start JS8Call on the matching dial |
-| `radio off` | Save the active profile, stop rxd and close JS8Call |
+| `radio NAME` | Save the profile being left, start rxd on NAME. On JS8 and WSPR profiles rxd decodes too |
+| `radio off` | Save the active profile and stop rxd |
 | `radio resume` | Bring the active profile back (i3 runs this at login) |
 | `radio save [NAME]` | Keep rxd's current tuning in the active profile, or as a new one |
 | `radio reset NAME` | Back to the shipped default |
@@ -105,8 +106,9 @@ The account is assumed to be `jroemer`; pass another with
 
 | Profile | Tuning | Ham It Up |
 |---|---|---|
-| `ghostnet` | JS8 GhostNet, 7.107 MHz USB → JS8Call | upconvert |
-| `js8` | JS8, 7.078 MHz USB → JS8Call | upconvert |
+| `ghostnet` | JS8 GhostNet, 7.107 MHz USB, decoded | upconvert |
+| `js8` | JS8, 7.078 MHz USB, decoded | upconvert |
+| `wspr` | WSPR, 7.0386 MHz USB, decoded and reported | upconvert |
 | `vhf` | 2 m calling, 146.520 MHz FM | bypass |
 | `dcara` | DCARA, 146.920 MHz FM | bypass |
 | `uhf` | 70 cm calling, 446.000 MHz FM | bypass |
@@ -116,8 +118,9 @@ The account is assumed to be `jroemer`; pass another with
 
 `radio` says when the Ham It Up's switch needs flipping. Tune rxd live with
 `rxd-tui`, from a browser at `http://<uconsole>:8073/` on any device on the
-LAN or tailnet, over HTTP on port 8073 or Hamlib rigctl on `127.0.0.1:4532`;
-`radio save` keeps the result.
+LAN or tailnet, or over HTTP on port 8073; `radio save` keeps the result.
+Every band has `js8-BAND` and `wspr-BAND` profiles too, which rxd's band
+plan picks among ([docs/radio.md](docs/radio.md)).
 
 | `rxd-tui` key | Does |
 |---|---|
@@ -179,7 +182,6 @@ Defaults from [NTX Mesh](https://ntxmesh.com/join/); details in
 | `rxd-tui` | Tune the receiver from a terminal |
 | `journalctl --user -u 'rxd@*'` | The receiver's log |
 | `chirp` | CHIRP, for programming handhelds |
-| `js8call` | Plain JS8Call, without retuning the SDR |
 | `claude` | Claude Code |
 | `sudo tailscale up` | Join the tailnet |
 
@@ -201,7 +203,6 @@ which ones survive: [docs/desktop.md](docs/desktop.md#why-window-management-sits
 
 | Workspace | What lands there |
 |---|---|
-| `2` | JS8Call |
 | `3` | Meshtastic dashboard (`radio mesh`) |
 
 ### Launch and close

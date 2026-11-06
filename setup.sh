@@ -317,8 +317,8 @@ main() {
   if want base; then
     section "Base system"
 
-    # US/Central. Also matters beyond the clock display: JS8Call and the RTC
-    # both care, and gpsd/chrony will be feeding real time in shortly.
+    # US/Central. Also matters beyond the clock display: rxd's slot decoders
+    # and the RTC both care, and gpsd/chrony will be feeding real time in shortly.
     if command -v timedatectl >/dev/null 2>&1; then
       local current_tz
       current_tz=$(timedatectl show -p Timezone --value 2>/dev/null || echo "")
@@ -722,8 +722,7 @@ FWUNIT
                 i3 i3status dmenu alacritty brightnessctl \
                 fonts-dejavu-core fontconfig
 
-    # A Lite image has no audio userland at all, and both JS8Call and rxd
-    # need one. clockworkpi-audio carries the device-specific config.
+    # A Lite image has no audio userland at all, and rxd needs one. clockworkpi-audio carries the device-specific config.
     apt_install pipewire pipewire-pulse wireplumber || warn "audio stack install failed"
     if pkg_available clockworkpi-audio; then
       apt_install clockworkpi-audio || warn "clockworkpi-audio failed"
@@ -847,15 +846,13 @@ mode "resize" {
 bindsym $mod+r mode "resize"
 
 # --- application workspaces -------------------------------------------------
-assign [class="(?i)^js8call$"] workspace number 2
-
 # meshtastic-ui sets no WM_CLASS at all, so assign has no criteria to match
 # on. for_window fires once the window is mapped and titled instead.
 for_window [title="^Meshtastic"] move to workspace number 3
 
-# Only the receiver starts on its own. JS8Call and the Meshtastic dashboard
-# keep their placement rules above, so they land on 2 and 3 whenever started
-# -- from dmenu, or via `mesh`, which also brings meshtasticd up.
+# Only the receiver starts on its own. The Meshtastic dashboard keeps its
+# placement rule above, so it lands on 3 whenever started -- from dmenu, or
+# via `radio mesh`, which also brings meshtasticd up.
 #
 # rxd is headless, so it has no window to place. `radio resume` brings the
 # active profile back up as the rxd@PROFILE user service, already playing,
@@ -2237,13 +2234,13 @@ BLACKLIST
     # SDR++Brown's CPU on a CM4. librtlsdr0 and libpulse0 are loaded through
     # ctypes, so it needs no build step and no -dev packages. 'radio' starts
     # and stops it as the rxd@PROFILE user service below; HTTP control and the
-    # browser UI are on port 8073 (LAN-wide, per /etc/rx/rxd.env below) and
-    # Hamlib NET rigctl on 127.0.0.1:4532.
+    # browser UI are on port 8073 (LAN-wide, per /etc/rx/rxd.env below). It
+    # decodes JS8 itself (js8.py, below) and WSPR with wsprd.
     #
-    # The copies of rxd, rxd-tui and the browser UI are generated from
-    # rxd/rxd.py, rxd/rxd_tui.py and rxd/web/index.html by rxd/embed.sh, and
-    # build.sh refuses to publish when any differs. Edit those, not these
-    # heredocs.
+    # The copies of rxd, rxd-tui, the browser UI and the JS8 decoder are
+    # generated from rxd/rxd.py, rxd/rxd_tui.py, rxd/web/index.html and
+    # rxd/js8.py by rxd/embed.sh, and build.sh refuses to publish when any
+    # differs. Edit those, not these heredocs.
     write_file /usr/local/bin/rxd 0755 <<'RXD'
 #!/usr/bin/env python3
 """rxd: a small RTL-SDR receiver daemon, the receiver behind `radio`.
@@ -2258,28 +2255,27 @@ BLACKLIST
 
 It reads the same profile JSON as `radio`, opens the dongle by serial,
 demodulates one channel (USB, LSB, AM, FM or WFM) and plays it to a
-PipeWire/PulseAudio sink. Two control ports, both on 127.0.0.1 by default:
+PipeWire/PulseAudio sink. Control is over HTTP, on 127.0.0.1 by default:
 
-  4532  Hamlib NET rigctl (rig model 2), so JS8Call or `rigctl -m 2` can
-        read and set the frequency and mode
   8073  HTTP JSON: GET /api/status, POST /api/tune {"freq": 7078000,
         "mode": "USB", "bandwidth": 2800, "gain_db": 3.7, "volume": 0.2}
         ("gain_db" turns automatic gain off; "gain_auto": true turns it on;
         "audio_auto", "audio_nr", "audio_filter", "audio_norm", "audio_limit"
         and "audio_squelch" switch the listening clean-up)
 
-A WSPR profile ("decoder": "wspr") also decodes WSPR with wsprd and reports
-the spots to WSPRnet; GET /api/wspr lists them.
+A JS8 profile ("decoder": "js8") also decodes JS8 itself, with js8.py beside
+rxd or in /usr/local/lib/rxd/; GET /api/js8 lists the messages. A WSPR
+profile ("decoder": "wspr") decodes WSPR with wsprd and reports the spots to
+WSPRnet as $RXD_CALL at $RXD_GRID; GET /api/wspr lists them. Both decode
+the audio before squelch and volume, so the volume is only the speaker's.
 
-Frequencies on both ports are the dial, as JS8Call means it. A JS8 profile
-whose VFO sits off its js8call_dial (7077900 vs 7078000, tuned by hand)
-keeps that difference as a calibration, so the dial still reads 7078000.
+A profile's "frequency" is the dial: for USB, where a signal 1500 Hz up in
+the audio is 1500 Hz above it.
 
 SIGHUP re-reads the profile; SIGINT or SIGTERM stops.
 """
 import argparse
 import collections
-import configparser
 import ctypes
 import ctypes.util
 import json
@@ -2289,7 +2285,6 @@ import re
 import signal
 import socket
 import shutil
-import socketserver
 import subprocess
 import sys
 import threading
@@ -2318,14 +2313,9 @@ OFFSET_MODES = ("auto", "Ham-It-Up", "None", "Manual")
 UPCONVERTER_HZ = 125e6
 UPCONVERT_BELOW_HZ = 30e6
 # Profile sink descriptions -> PipeWire node names (None: default sink).
-SINKS = {"SDR to JS8 (virtual cable)": "SDR_to_JS8", "Built-in Audio": None}
+SINKS = {"Built-in Audio": None}
 MODES = ("USB", "LSB", "AM", "FM", "WFM")
 DECODERS = ("js8", "wspr", None)
-# A JS8 profile's sink is JS8Call's input: silence there means no decodes
-# (2026-11-06, a saved volume 0 cost 18 minutes of them). Below this rxd
-# refuses a volume; a profile saved with less loads at JS8_VOLUME.
-DECODER_MIN_VOLUME = 0.05
-JS8_VOLUME = 0.2
 DEFAULT_BW = {"USB": 2800.0, "LSB": 2800.0, "AM": 10000.0, "FM": 12500.0,
               "WFM": 150000.0}
 
@@ -2371,10 +2361,7 @@ class Settings:
             # SDR++'s squelchEnabled/squelchLevel, carried in demod_settings.
             self.squelch = float(ds["squelchLevel"]) if ds.get("squelchEnabled") and \
                 ds.get("squelchLevel") is not None else None
-            carrier = float(p["frequency"])  # SDR++'s VFO: the carrier
-            dial = float(p.get("js8call_dial", carrier))
-            self.cal = dial - carrier
-            self.dial = dial
+            self.dial = float(p["frequency"])
             self.offset_mode = p.get("offset", "auto")
             if self.offset_mode not in OFFSET_MODES:
                 raise ValueError("offset must be one of " + ", ".join(OFFSET_MODES))
@@ -2393,22 +2380,17 @@ class Settings:
             self.ppm = int(rtl.get("ppm", 0))
             self.bias_t = bool(rtl.get("biasT", False))
             self.sink = SINKS.get(p.get("sink"), p.get("sink"))
-            self.js8 = p.get("js8call_dial") is not None
-            # What decodes this profile's audio: JS8Call (any profile with a
-            # js8call_dial), rxd's own WSPR decoder, or nothing.
-            self.decoder = p.get("decoder") or ("js8" if self.js8 else None)
+            # What rxd decodes in this profile's audio: JS8, WSPR or nothing.
+            self.decoder = p.get("decoder")
             if self.decoder not in DECODERS:
                 raise ValueError("decoder must be one of " + ", ".join(d for d in DECODERS if d))
             self.wspr_report = bool(p.get("wspr_report", True))
-            if self.decoder == "js8" and self.volume < DECODER_MIN_VOLUME:
-                log("volume %g would silence JS8Call: using %g" % (self.volume, JS8_VOLUME))
-                self.volume = JS8_VOLUME
             self.version = getattr(self, "version", 0) + 1
 
     def snapshot(self):
         with self.lock:
             return dict(mode=self.mode, bandwidth=self.bandwidth, dial=self.dial,
-                        cal=self.cal, upconverter=self.upconverter(),
+                        upconverter=self.upconverter(),
                         offset_mode=self.offset_mode,
                         upconvert_below=self.upconvert_below,
                         agc_attack=self.agc_attack, agc_decay=self.agc_decay,
@@ -2459,9 +2441,6 @@ class Settings:
                 volume = float(volume)
                 if not 0 <= volume <= 4:
                     raise ValueError("volume must be between 0 and 4")
-                if self.decoder == "js8" and volume < DECODER_MIN_VOLUME:
-                    raise ValueError("JS8Call decodes this audio: volume can't go below %g"
-                                     % DECODER_MIN_VOLUME)
                 self.volume = volume
             if squelch is not Ellipsis:  # None (JSON null) turns it off
                 if squelch is not None:
@@ -3382,7 +3361,7 @@ class Receiver:
                            snap["agc_decay"])
 
     def rf(self, snap):
-        return snap["dial"] - snap["cal"] + snap["upconverter"]
+        return snap["dial"] + snap["upconverter"]
 
     def retune(self, snap, force=False):
         rf = self.rf(snap)
@@ -3450,13 +3429,14 @@ class Receiver:
                 self.wspr.push(audio, snap["dial"])
             if self.js8dec is not None:  # likewise
                 self.js8dec.push(audio, snap["dial"])
-            # Listening clean-up; a decoder's sink (JS8Call's cable) stays clean.
+            # Listening clean-up, for the speaker and the stream alike; the
+            # decoders above have had the audio as it was.
             heard = self.listening(audio, snap)
-            audio = self.gate(audio if self.s.decoder else heard, snap["squelch"])
+            audio = self.gate(heard, snap["squelch"])
             pcm = np.clip(audio * snap["volume"] * 32767, -32768, 32767).astype("<i2")
             self.sink.write(pcm)
             if self.listeners:
-                self.stream(heard if self.s.decoder else audio)
+                self.stream(heard)
             dt = time.thread_time() - t0
             self.cpu += (dt / (len(x) / self.chain.rate) - self.cpu) * 0.05
             self.blocks += 1
@@ -3513,8 +3493,8 @@ class Receiver:
         p = p.reshape(self.SPECTRUM_BINS, -1).mean(axis=1)
         db = 10 * np.log10(p + 1e-12)
         rate = self.chain.rate
-        # RF -> dial scale: take off the upconverter, put back the calibration.
-        to_dial = -snap["upconverter"] + snap["cal"]
+        # RF -> dial scale: take off the upconverter.
+        to_dial = -snap["upconverter"]
         center = self.src.center + to_dial
         dial, bw, mode = snap["dial"], snap["bandwidth"], snap["mode"]
         if mode == "USB":
@@ -3580,11 +3560,9 @@ class Receiver:
     def status(self):
         snap = self.s.snapshot()
         return {"profile": self.s.name, "freq": snap["dial"],
-                "vfo_hz": snap["dial"] - snap["cal"], "cal_hz": snap["cal"],
                 "mode": snap["mode"], "bandwidth": snap["bandwidth"],
                 "gain_db": snap["gain_db"], "volume": snap["volume"],
                 "squelch": snap["squelch"],
-                "volume_min": DECODER_MIN_VOLUME if self.s.decoder == "js8" else 0.0,
                 "squelch_open": self.squelch_open and (self.fx is None or self.fx.sq_open),
                 "gain_auto": snap["gain_auto"],
                 "gain_loop": self.autogain.status() if self.autogain is not None else
@@ -3602,115 +3580,12 @@ class Receiver:
                 "dsp_cpu": round(self.cpu, 3), "blocks": self.blocks,
                 "dropped": self.dropped, "error": self.error,
                 "running": not self.stop.is_set(), "gains": self.src.gains(),
-                "js8": self.s.js8, "js8_call": js8_mycall() if self.s.js8 else None,
-                "decoder": self.s.decoder,
+                "decoder": self.s.decoder, "station": station_status(),
                 "wspr": self.wspr.status() if self.wspr is not None else None,
-                "js8_decoder": self.js8dec.status() if self.js8dec is not None else
-                ({"engine": "js8call"} if self.s.decoder == "js8" else None),
+                "js8_decoder": self.js8dec.status() if self.js8dec is not None else None,
                 "clock": clock_status(),
                 "band_plan": self.bands.status() if self.bands is not None else None,
                 "listeners": len(self.listeners)}
-
-
-# ----------------------------------------------------------- Hamlib rigctl
-
-# Hamlib mode bits (rig.h): AM 0x1, USB 0x4, LSB 0x8, FM 0x20, WFM 0x40.
-MODE_BITS = 0x1 | 0x4 | 0x8 | 0x20 | 0x40
-
-DUMP_STATE = "\n".join([
-    "1", "2", "0",
-    # rx range: start end modes low_power high_power vfo ant
-    "100000.000000 1700000000.000000 0x%x -1 -1 0x1 0x1" % MODE_BITS,
-    "0 0 0 0 0 0 0",
-    "0 0 0 0 0 0 0",          # no tx ranges: receive only
-    "0x%x 1" % MODE_BITS,     # tuning step 1 Hz
-    "0 0",
-    "0xc 2800", "0xc 2400", "0xc 3000", "0x1 10000", "0x20 12500",
-    "0x40 150000", "0 0",
-    "0", "0", "0", "0",       # max rit, xit, if shift, announces
-    "",                       # preamps
-    "",                       # attenuators
-    "0x0", "0x0",             # has get/set func
-    "0x40000000", "0x0",      # get level: STRENGTH; set level: none
-    "0x0", "0x0",             # get/set parm
-    "vfo_ops=0x0", "ptt_type=0x0", "targetable_vfo=0x0",
-    "has_set_vfo=0", "has_get_vfo=1", "has_set_freq=1", "has_get_freq=1",
-    "has_set_conf=0", "has_get_conf=0", "has_power2mW=0", "has_mW2power=0",
-    "timeout=0", "rig_model=2", "rigctld_version=rxd 0.1",
-    "done", ""])
-
-
-def rigctl_reply(cmd, rx):
-    """One rigctl command line -> the reply text, or None to hang up."""
-    parts = cmd.strip().split()
-    if not parts:
-        return ""
-    head, args = parts[0], parts[1:]
-    ok, nimpl, einval = "RPRT 0\n", "RPRT -11\n", "RPRT -1\n"
-    s = rx.s
-    if head in ("q", "Q", "\\quit"):
-        return None
-    if head in ("\\chk_vfo", "chk_vfo"):
-        return "0\n"
-    if head in ("\\dump_state", "dump_state"):
-        return DUMP_STATE
-    if head in ("f", "\\get_freq"):
-        return "%d\n" % round(s.snapshot()["dial"])
-    if head in ("F", "\\set_freq"):
-        try:
-            s.update(freq=float(args[0]))
-        except (IndexError, ValueError):
-            return einval
-        return ok
-    if head in ("m", "\\get_mode"):
-        snap = s.snapshot()
-        return "%s\n%d\n" % (snap["mode"], snap["bandwidth"])
-    if head in ("M", "\\set_mode"):
-        try:
-            bw = float(args[1]) if len(args) > 1 and float(args[1]) > 0 else None
-            # JS8Call asks for PKTUSB; data modes are plain SSB here.
-            s.update(mode=args[0].upper().replace("PKT", ""), bandwidth=bw)
-        except (IndexError, ValueError):
-            return einval
-        return ok
-    if head in ("v", "\\get_vfo"):
-        return "VFOA\n"
-    if head in ("V", "\\set_vfo"):
-        return ok
-    if head in ("t", "\\get_ptt"):
-        return "0\n"
-    if head in ("T", "\\set_ptt"):
-        # Receive only. Accept "off" so a client releasing PTT is not an error.
-        return ok if args and args[0] == "0" else nimpl
-    if head in ("s", "\\get_split_vfo"):
-        return "0\nVFOA\n"
-    if head in ("S", "\\set_split_vfo"):
-        return ok if args and args[0] == "0" else nimpl
-    if head == "\\get_powerstat":
-        return "1\n"
-    if head in ("l", "\\get_level"):
-        if args and args[0] == "STRENGTH":
-            # dB relative to S9 (-73 dBm). Uncalibrated: dBFS + 73 is only a guess.
-            return "%d\n" % round(rx.chain.level_db + 73)
-        return nimpl
-    return nimpl
-
-
-class RigctlHandler(socketserver.StreamRequestHandler):
-    def handle(self):
-        rx = self.server.rx
-        for raw in self.rfile:
-            line = raw.decode(errors="replace")
-            # Several commands may share a line ("f\nm\n" arrives either way).
-            reply = rigctl_reply(line, rx)
-            if reply is None:
-                return
-            self.wfile.write(reply.encode())
-
-
-class RigctlServer(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
 
 
 # ---------------------------------------------------------------------- HTTP
@@ -3735,12 +3610,11 @@ def list_profiles():
 def spawn_switch(name):
     """Run `radio NAME` outside this unit: it stops this very rxd to start the next.
 
-    systemd-run --scope puts radio (and any JS8Call it starts) in a scope of
-    its own, so neither dies with rxd@OLD when radio stops it.
+    systemd-run --scope puts radio in a scope of its own, so it doesn't die
+    with rxd@OLD when it stops it.
     """
     env = dict(os.environ)
-    env.setdefault("DISPLAY", ":0")  # radio drives JS8Call's window through i3
-    argv = [RADIO, "--no-focus", name]
+    argv = [RADIO, name]
     if shutil.which("systemd-run"):
         argv = ["systemd-run", "--user", "--scope", "--collect", "--quiet",
                 "--unit=radio-switch-%d" % int(time.time() * 1000)] + argv
@@ -3797,34 +3671,22 @@ def clock_status():
     return doc
 
 
-# ----------------------------------------------------------- JS8Call's log
-
-JS8_LOG = os.path.expanduser(os.environ.get("RXD_JS8_LOG",
-                                            "~/.local/share/JS8Call/DIRECTED.TXT"))
-JS8_INI = os.path.expanduser("~/.config/JS8Call.ini")
-
-
-def js8_mycall():
-    cp = configparser.ConfigParser(interpolation=None, strict=False, delimiters=("=",),
-                                   comment_prefixes=())
-    cp.optionxform = str
-    try:
-        cp.read(JS8_INI, encoding="utf-8")
-    except (OSError, configparser.Error):
-        return None
-    for sec in ("Configuration", "Common"):
-        if cp.has_option(sec, "MyCall"):
-            return cp.get(sec, "MyCall").strip() or None
-    return None
-
+# ------------------------------------------------------------- JS8 messages
 
 # A callsign: a 1-3 character prefix, a digit, a 1-4 letter suffix, and an
 # optional /P-style part. Not "INFO", "HELLO" or a group like "@HB".
 CALLSIGN = re.compile(r"^(?:[A-Z0-9]{1,4}/)?[A-Z0-9]{1,3}[0-9][A-Z]{1,4}(?:/[A-Z0-9]{1,4})?$")
 
 
+JS8_DIR = os.path.expanduser(os.environ.get("RXD_JS8_DIR", "~/.local/share/rxd/js8"))
+JS8_LOG = os.path.join(JS8_DIR, "DIRECTED.TXT")
+
+
 class Js8Feed:
-    """New lines of DIRECTED.TXT, parsed and numbered, read as they're asked for."""
+    """New lines of the JS8 decoder's DIRECTED.TXT (JS8's usual message log
+    format), parsed and numbered, read as they're asked for. It outlives the
+    profile, so /api/js8 keeps its history on a WSPR profile and after a
+    restart."""
 
     KEEP = 500
 
@@ -3842,7 +3704,7 @@ class Js8Feed:
         f = raw.rstrip("\n").split("\t")
         if len(f) < 5:
             return None
-        text = f[4].replace("\u2662", "").strip()  # JS8Call's end-of-message diamond
+        text = f[4].replace("\u2662", "").strip()  # JS8's end-of-message diamond
         frm, _, body = text.partition(":")
         words = body.split()
         to = words[0] if words and CALLSIGN.match(words[0]) else None
@@ -3893,28 +3755,18 @@ class Js8Feed:
             return {"seq": self.seq, "lines": out}
 
 
-# ------------------------------------------------- rxd's own JS8 decoder
+# ------------------------------------------------------------ JS8 decoder
 
-# A JS8 profile with "js8_engine": "rxd" (or RXD_JS8_ENGINE=rxd) decodes JS8
-# in rxd itself, with rxd/js8.py, instead of in JS8Call. It records slots of
-# this audio, before squelch and volume, and writes JS8Call-style ALL.TXT and
-# DIRECTED.TXT under ~/.local/share/rxd/js8/, which Js8Feed then tails, so
-# /api/js8 keeps its line shape. "js8_submodes" picks the speeds to decode
-# (default normal, fast and slow, about a fifth of one CM4 core; turbo adds
-# about 14%).
-JS8_ENGINES = ("js8call", "rxd")
+# A JS8 profile ("decoder": "js8") decodes JS8 with js8.py. It records slots
+# of this audio, before squelch and volume, and writes ALL.TXT (frames) and
+# DIRECTED.TXT (messages) under JS8_DIR, which Js8Feed tails for /api/js8.
+# "js8_submodes" picks the speeds to decode (default normal, fast and slow,
+# about a third of one CM4 core; turbo adds about a fifth).
 JS8_SUBMODES = ("normal", "fast", "turbo", "slow")
 JS8_DEFAULT_SUBMODES = ["normal", "fast", "slow"]
 JS8_PY = (os.environ.get("RXD_JS8_PY", ""),
           os.path.join(os.path.dirname(os.path.abspath(__file__)), "js8.py"),
           "/usr/local/lib/rxd/js8.py")
-
-
-def js8_engine(p):
-    engine = os.environ.get("RXD_JS8_ENGINE") or p.get("js8_engine") or "js8call"
-    if engine not in JS8_ENGINES:
-        raise ValueError("js8_engine must be one of " + ", ".join(JS8_ENGINES))
-    return engine
 
 
 def load_js8():
@@ -3980,22 +3832,13 @@ def grid_km(a, b):
     return int(round(float(2 * 6371 * np.arcsin(np.sqrt(h)))))
 
 
+STATION_MISSING = "set RXD_CALL and RXD_GRID in /etc/rx/rxd.env"
+
+
 def station_id():
-    """(call, grid) to report as: $RXD_CALL/$RXD_GRID, else JS8Call's MyCall/MyGrid."""
-    call = os.environ.get("RXD_CALL") or js8_mycall()
+    """(call, grid): this station, from $RXD_CALL and $RXD_GRID (rxd.env)."""
+    call = os.environ.get("RXD_CALL")
     grid = os.environ.get("RXD_GRID")
-    if not grid:
-        cp = configparser.ConfigParser(interpolation=None, strict=False, delimiters=("=",),
-                                       comment_prefixes=())
-        cp.optionxform = str
-        try:
-            cp.read(JS8_INI, encoding="utf-8")
-        except (OSError, configparser.Error):
-            pass
-        for sec in ("Configuration", "Common"):
-            if cp.has_option(sec, "MyGrid"):
-                grid = cp.get(sec, "MyGrid").strip()
-                break
     call = call.strip().upper() if call else None
     if grid and GRID.match(grid.strip()):
         g = grid.strip()
@@ -4003,6 +3846,16 @@ def station_id():
     else:
         grid = None
     return call or None, grid
+
+
+def station_status():
+    """{"call", "grid"}, and "missing" saying what to set when either is."""
+    call, grid = station_id()
+    doc = {"call": call, "grid": grid}
+    if not call or not grid:
+        doc["missing"] = "no %s: %s" % (" or ".join(
+            x for x, v in (("callsign", call), ("grid", grid)) if not v), STATION_MISSING)
+    return doc
 
 
 # wspr_spots.txt, which wsprd rewrites each run: date time sync snr dt freq
@@ -4299,8 +4152,7 @@ class WsprDecoder:
         snap = self.s.snapshot()
         if self.reporter is None:
             report = {"enabled": False, "call": self.call, "grid": self.grid,
-                      "reason": "no callsign and grid: set MyCall and MyGrid in JS8Call, "
-                                "or RXD_CALL and RXD_GRID in /etc/rx/rxd.env"}
+                      "reason": "no callsign and grid to report as: " + STATION_MISSING}
         else:
             report = self.reporter.status()
             report["enabled"] = bool(snap.get("wspr_report"))
@@ -4686,19 +4538,14 @@ class BandHistory:
 
 
 def js8_decoding(rx):
-    """Whether something is decoding JS8 for rxd: rxd's own decoder when it has
-    one (rx.js8dec, decoding unless its status reports an error), else JS8Call."""
+    """Whether rxd's JS8 decoder (rx.js8dec) is running without an error."""
     dec = getattr(rx, "js8dec", None)
-    if dec is not None and hasattr(dec, "status"):
-        try:
-            st = dec.status()
-            return bool(st.get("running", not st.get("error")))
-        except Exception:  # noqa: BLE001
-            return False
+    if dec is None or not hasattr(dec, "status"):
+        return False
     try:
-        return subprocess.run(["pgrep", "-x", "js8call"], stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, timeout=5).returncode == 0
-    except (OSError, subprocess.SubprocessError):
+        st = dec.status()
+        return bool(st.get("running", not st.get("error")))
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -5467,10 +5314,8 @@ def parse_args(argv=None):
                     help="tuner frequency the IQ file was recorded at")
     ap.add_argument("--audio", default="pulse",
                     help="pulse, pulse:SINK, stdout or null (default: the profile's sink)")
-    # Defaults from the environment, so the systemd unit's EnvironmentFile
+    # From the environment by default, so the systemd unit's EnvironmentFile
     # (/etc/rx/rxd.env) can open HTTP to the LAN without editing the unit.
-    ap.add_argument("--rigctl", default=os.environ.get("RXD_RIGCTL", "127.0.0.1:4532"),
-                    help="HOST:PORT, or off (default $RXD_RIGCTL or 127.0.0.1:4532)")
     ap.add_argument("--http", default=os.environ.get("RXD_HTTP", "127.0.0.1:8073"),
                     help="HOST:PORT, or off (default $RXD_HTTP or 127.0.0.1:8073)")
     return ap.parse_args(argv)
@@ -5486,7 +5331,7 @@ def main(argv=None):
     snap = settings.snapshot()
 
     if a.iq == "synth":
-        src = SynthSource(snap["dial"] - snap["cal"] + snap["upconverter"] + 1500)
+        src = SynthSource(snap["dial"] + snap["upconverter"] + 1500)
     elif a.iq:
         src = FileSource(a.iq, a.iq_center)
     else:
@@ -5505,16 +5350,14 @@ def main(argv=None):
     if settings.decoder == "wspr":
         rx.wspr = make_wspr(settings)
     try:
-        if settings.decoder == "js8" and js8_engine(p) == "rxd":
+        if settings.decoder == "js8":
             rx.js8dec = make_js8(settings, p)
     except ValueError as e:
         sys.exit("rxd: " + str(e))
+    if not all(station_id()):
+        log("no station identity: " + STATION_MISSING)
     rx.start()
     servers = []
-    if a.rigctl != "off":
-        rs = RigctlServer(hostport(a.rigctl, 4532), RigctlHandler)
-        rs.rx = rx
-        servers.append(rs)
     if a.http != "off":
         hs = ThreadingHTTPServer(hostport(a.http, 8073), Api)
         hs.daemon_threads = True
@@ -5535,9 +5378,9 @@ def main(argv=None):
     signal.signal(signal.SIGHUP, reload)
     signal.signal(signal.SIGTERM, lambda *_: rx.stop.set())
     st = rx.status()
-    log("%s %.4f MHz %s, tuner %.4f MHz, rigctl %s, http %s"
+    log("%s %.4f MHz %s, tuner %.4f MHz, http %s"
         % (os.path.basename(path), st["freq"] / 1e6, st["mode"],
-           (st["tuner_hz"] or 0) / 1e6, a.rigctl, a.http))
+           (st["tuner_hz"] or 0) / 1e6, a.http))
     try:
         while not rx.stop.wait(0.5):
             pass
@@ -5565,23 +5408,22 @@ has three views, like rxd's browser UI. The view follows the receiver's
 profile; 1, 2 and 3 pick one.
 
   1 Digital  the digital modes, with a picker for their profiles grouped
-             by mode (JS8: Ghostnet or regular JS8Call; WSPR). On JS8 it
-             shows JS8Call's decodes and the clock; on WSPR, rxd's own spots,
-             the two-minute cycle and the reporting to WSPRnet, which r turns
-             on and off. Nothing to tune.
+             by mode (JS8: GhostNet or the band plan's; WSPR). On JS8 it
+             shows rxd's decodes and the clock; on WSPR, its spots, the
+             two-minute cycle and the reporting to WSPRnet, which r turns on
+             and off. Nothing to tune.
   2 Listen   a picker of broadcast FM, VHF/UHF and AM stations, with gain,
              bandwidth, squelch (NFM) and the uConsole speaker's volume.
   3 Manual   the full instrument: tuning, spectrum and waterfall.
 
 Picking a station or frequency switches rxd's profile; rxd restarts, which
-takes a few seconds. Leaving a JS8 profile asks first, since it closes
-JS8Call.
+takes a few seconds.
 
 Times are shown in this machine's time zone ($TZ), 24-hour.
 
 l plays the receiver's audio on this machine, through the first of pw-cat,
 paplay, aplay, ffplay or sox's play on PATH (or --player), so the TUI works
-as a remote listening station; on JS8 the audio goes to JS8Call instead.
+as a remote listening station, on any profile.
 [ ] set its volume here; M mutes the uConsole's own speaker meanwhile.
 --listen starts with it on.
 
@@ -5790,11 +5632,8 @@ def mode_label(mode):
 
 
 def decoder_of(d):
-    """What decodes a profile's (or a status's) audio: "js8", "wspr" or None.
-    An older rxd or `radio --json` has only the js8 flag."""
-    if "decoder" in d:
-        return d["decoder"] if d["decoder"] in dict(DECODERS) else None
-    return "js8" if d.get("js8") else None
+    """What rxd decodes in a profile's (or a status's) audio: "js8", "wspr" or None."""
+    return d.get("decoder") if d.get("decoder") in dict(DECODERS) else None
 
 
 def profile_kind(p):
@@ -6545,12 +6384,8 @@ def help_items(g, view="manual", mode=None, listening=False, decoder=None, repor
         items = [(ud + " Enter", "switch")] + ([("a", "auto")] if plan else [])
         if decoder == "wspr" and report:
             items.append(("r", "reporting"))
-        if decoder != "js8":
-            items += [("l", "listen")] + ([("[ ]", "volume")] if listening else [])
-        items += [("PgUp PgDn", "scroll"), ("/", "filter")]
-        if decoder == "js8" and listening:
-            items.append(("l", "stop audio"))
-        items.append(("1 2 3", "view"))
+        items += [("l", "listen")] + ([("[ ]", "volume")] if listening else [])
+        items += [("PgUp PgDn", "scroll"), ("/", "filter"), ("1 2 3", "view")]
     elif view == "listen":
         items = [(ud + " Enter", "station"), ("g G", "gain"), ("a", "auto gain"),
                  ("A", "auto audio"), ("b", "bandwidth")]
@@ -6562,7 +6397,7 @@ def help_items(g, view="manual", mode=None, listening=False, decoder=None, repor
         items = [(k["left"] + k["sep"] + k["right"], "tune"), (k["up"] + k["sep"] + k["down"], "step"),
                  ("f", "freq"), ("m", "mode"), ("l", "listen"), ("[ ]", "bandwidth"),
                  ("g G", "gain"), ("a", "auto gain"), ("A n h e c", "clean-up")] + \
-            ([] if decoder == "js8" else [("- +", "volume")]) + [("1 2 3", "view")]
+            [("- +", "volume"), ("1 2 3", "view")]
     return items + [("?", "help"), ("q", "quit")]
 
 
@@ -7303,7 +7138,6 @@ class App:
         self.entry = None       # text being typed, or None
         self.entry_kind = None  # "freq" or "filter"
         self.show_help = False
-        self.confirm = None     # the profile a y/n question is about
         self.lo = self.hi = None  # smoothed spectrum range
         self.wf_cache = {}      # waterfall rows already resampled to the screen
         # views
@@ -7426,7 +7260,7 @@ class App:
                      % (self.g.drop, hiu_word(up), sw["desc"]), "warn")
         else:
             self.say("%s Now on %s" % (self.g.rx, sw["desc"]), "ok")
-        if sw.get("muted") is not None and st.get("volume") and decoder_of(st) != "js8":
+        if sw.get("muted") is not None and st.get("volume"):
             self.mute_prev = st["volume"]
             self.send(volume=0.0)
         self.js8_scroll = 0
@@ -7455,13 +7289,6 @@ class App:
         s = self.update()
         if self.show_help:
             self.show_help = False
-            return True
-        if self.confirm is not None:
-            p, self.confirm = self.confirm, None
-            if ch in (ord("y"), ord("Y")):
-                self.do_switch(p, s)
-            else:
-                self.say("Stayed on %s" % self.active_name(s))
             return True
         if self.entry is not None:
             return self.entry_key(ch)
@@ -7538,11 +7365,7 @@ class App:
         elif not s["reachable"]:
             self.say("Not switched: can't reach rxd", "err")
         else:
-            cur = self.active_profile(s)
-            if decoder_of(st) == "js8" or (cur and decoder_of(cur) == "js8"):
-                self.confirm = p
-            else:
-                self.do_switch(p, s)
+            self.do_switch(p, s)
 
     def do_switch(self, p, s):
         st = s["status"]
@@ -7559,8 +7382,6 @@ class App:
         elif self.audio.on:
             self.audio.stop()
             self.say("%s Stopped listening here" % self.g.stop)
-        elif self.decoder(s) == "js8":
-            self.say("No audio here on JS8: it goes to JS8Call. 2 or 3 to listen.")
         else:
             self.audio.start(rate_for(s["status"].get("mode")))
 
@@ -7577,9 +7398,7 @@ class App:
 
     def mute_key(self, s):
         st = s["status"]
-        if self.decoder(s) == "js8":
-            self.say("Not on JS8: the receiver's audio feeds JS8Call")
-        elif st.get("volume") is None:
+        if st.get("volume") is None:
             self.not_yet()
         elif self.mute_prev is not None:
             v, self.mute_prev = self.mute_prev, None
@@ -7591,8 +7410,6 @@ class App:
             self.send(volume=0.0)
 
     def speaker_key(self, ch, st):
-        if decoder_of(st) == "js8":
-            return self.say("Not on JS8: the receiver's audio feeds JS8Call")
         if st.get("volume") is None:
             return self.not_yet()
         d = 1 if ch in (ord("+"), ord("=")) else -1
@@ -7845,8 +7662,6 @@ class App:
             x += len(text)
         if self.show_help:
             self.draw_box(scr, self.help_lines())
-        elif self.confirm is not None:
-            self.draw_box(scr, self.confirm_lines(s))
 
     def draw_bar(self, scr, s):
         g, w = self.g, scr.w
@@ -8084,12 +7899,12 @@ class App:
             elif wspr:
                 text = "No spots yet. They appear here as each two-minute slot is decoded."
             else:
-                text = "No decodes yet. They appear here as JS8Call hears them."
+                text = "No decodes yet. They appear here as rxd decodes each slot."
             scr.put(y, 2, clip(text, w - 3, g), "dim")
             return
         end = len(shown) - self.js8_scroll
         view = shown[max(0, end - area):end]
-        call = st.get("js8_call")
+        call = (st.get("station") or {}).get("call")
         for i, line in enumerate(view):
             if wspr:
                 scr.put(y + i, 1, format_wspr(line, st.get("freq"), w - 2, g))
@@ -8368,7 +8183,6 @@ class App:
                 "m         Auto listens for WSPR / JS8",
                 "s         scan the bands now (and Auto)",
                 "l         play the audio on this machine / stop",
-                "          (not on JS8: its audio goes to JS8Call)",
                 "[ ]       volume of the audio here",
             ] + views + [
                 "",
@@ -8425,18 +8239,6 @@ class App:
             "",
             "Any key closes this.",
         ]
-
-    def confirm_lines(self, s):
-        p = self.confirm
-        lines = ["Switch to %s?" % p["name"], ""]
-        if p.get("description"):
-            lines[0] = "Switch to %s (%s)?" % (p["name"], p["description"])
-        lines += ["Leaving %s closes JS8Call. rxd restarts," % self.active_name(s),
-                  "which takes a few seconds."]
-        if flip_needed(p, s["status"]):
-            lines += ["", "%s Then flip the Ham It Up to %s." % (self.g.drop,
-                                                                 hiu_word(p.get("upconvert")))]
-        return lines + ["", "y switches; any other key stays."]
 
     def draw_box(self, scr, lines):
         lines = [self.g.text(x) for x in lines]
@@ -8744,11 +8546,6 @@ body[data-view=digital] .jlist{max-height:none;overflow:visible}
 .prof .pf{font-size:16px;font-weight:600;color:var(--dim)}
 .prof .pa{font-size:16px;font-weight:800;color:var(--accent)}
 .prof .pw{font-size:15px;font-weight:700;color:var(--warn)}
-dialog{background:var(--panel);color:var(--fg);border:2px solid var(--line);border-radius:14px;padding:16px;width:calc(100vw - 24px);max-width:520px}
-dialog::backdrop{background:rgba(0,0,0,.65)}
-dialog h2{margin:0 0 10px;font-size:22px}
-dialog p{margin:0 0 12px;font-size:18px}
-dialog .row2{margin-top:6px}
 .jf{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:6px}
 .jmsg{margin:8px 0 0;color:var(--dim);font-size:16px;font-weight:600}
 .jlist{list-style:none;margin:8px 0 0;padding:0;max-height:480px;overflow-y:auto;border-top:1px solid var(--line)}
@@ -8908,7 +8705,7 @@ body[data-view=listen] #gWhy{display:none}
 <fieldset id="ctl" data-v="manual" disabled>
 <div class="layout">
   <section class="card tuner">
-    <div class="lbl"><span>Dial, MHz</span><span id="cal"></span></div>
+    <div class="lbl"><span>Dial, MHz</span></div>
     <div id="freq" class="freq live" aria-live="off"><span id="fM">—</span><span id="fH" class="hz"></span></div>
     <div class="meter live">
       <div class="mbar" role="meter" aria-label="Signal level" aria-valuemin="-100" aria-valuemax="0" id="mbar"><i id="mfill"></i></div>
@@ -8951,7 +8748,7 @@ body[data-view=listen] #gWhy{display:none}
 <fieldset class="card" id="audioCard" data-v="manual" data-live disabled hidden>
   <div class="lbl"><span>Audio clean-up</span><span id="auState" class="val"></span></div>
   <div class="augrid" role="group" aria-label="Audio clean-up" id="auGrid"></div>
-  <p class="note">For the uConsole speaker and the audio on this device. JS8Call and the WSPR decoder always get the audio untouched.</p>
+  <p class="note">For the uConsole speaker and the audio on this device. The JS8 and WSPR decoders always get the audio untouched.</p>
 </fieldset>
 <section class="card" id="aPick" data-v="manual">
   <div class="lbl"><span>Profiles</span></div>
@@ -8963,10 +8760,6 @@ body[data-view=listen] #gWhy{display:none}
   <div class="appear" role="group" aria-label="Appearance" id="appear"></div>
 </section>
 </div>
-<dialog id="dlg" aria-labelledby="dlgT">
-  <h2 id="dlgT"></h2><div id="dlgB"></div>
-  <div class="row2"><button type="button" class="btn" id="dlgNo">Cancel</button><button type="button" class="btn pri" id="dlgYes">Switch</button></div>
-</dialog>
 <script>
 "use strict";
 (function () {
@@ -9006,7 +8799,7 @@ function fmtHz(v) {
   return [String(v), "Hz"];
 }
 function fmtBw(v) { const p = fmtHz(v); return p[0] + " " + p[1]; }
-// rxd sends UTC: "2026-11-06 10:47:03" (JS8Call) or "2026-11-06T12:20:00Z".
+// rxd sends UTC: "2026-11-06 10:47:03" (JS8) or "2026-11-06T12:20:00Z" (WSPR).
 // Everything shown is the browser's local time, 24 hour.
 function utcDate(t) {
   const m = /^(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d)(?::(\d\d))?/.exec(String(t || ""));
@@ -9145,7 +8938,6 @@ function applyStatus(s) {
   renderFreq();
   setText($("profile"), s.profile || "rxd");
   const tag = $("modeTag"); tag.hidden = false; setText(tag, localMode);
-  setText($("cal"), s.cal_hz ? "VFO " + freqParts(s.vfo_hz).join(" ") + " (cal " + (s.cal_hz > 0 ? "+" : "−") + Math.abs(Math.round(s.cal_hz)) + " Hz)" : "");
   for (const b of $("modes").children) b.setAttribute("aria-pressed", String(b.dataset.m === localMode));
 
   // Ham It Up
@@ -9195,8 +8987,6 @@ function applyStatus(s) {
 
   syncMute();
   autoView();
-  // JS8's audio is only tones; WSPR's speaker is muted by design, so the phone may listen
-  if (A.on && pdec(s) === "js8" && view === "digital") stopListen();
   const vk = [view, curKind(), pdec(s), profAvail, A.on].join();
   if (vk !== viewKey) { viewKey = vk; renderView(); }
   renderProfiles(); renderQual();
@@ -9569,7 +9359,7 @@ let profiles = null, profAvail = true, profLoading = false, profAskedFor = null;
 let switching = null, switchTimer = 0, flipText = "";
 let view = load("view") === "manual" ? "manual" : null, viewFor = null;
 // rxd and radio say "decoder"; older ones only the js8 flag
-function pdec(p) { return p.decoder !== undefined ? p.decoder || null : p.js8 ? "js8" : null; }
+function pdec(p) { return p.decoder || null; }
 function pkind(p) { return pdec(p) ? "digital" : LISTEN_MODES.indexOf(p.mode) >= 0 ? "listen" : "manual"; }
 function curDec() { if (st) return pdec(st); const p = activeProf(); return p ? pdec(p) : null; }
 function decName(d) { const x = DECODERS.find(x => x[0] === d); return x ? x[1] : "digital"; }
@@ -9635,13 +9425,13 @@ function renderView() {
     if (el.parentElement.closest("[data-v]")) { el.hidden = el.dataset.v.split(" ").indexOf(v) < 0; continue; }
     el.hidden = !v || el.dataset.v.split(" ").indexOf(v) < 0 || (el.hasAttribute("data-live") && mis);
   }
-  // each decode list needs its decoder; Listen stays reachable while audio
-  // plays, and on WSPR, where the phone is the only way to hear it
+  // each decode list needs its decoder; Listen stays reachable on JS8 and
+  // WSPR, so the phone can hear the band too
   const dec = curDec();
   if (!st || pdec(st) !== "js8") $("js8").hidden = true;
   if (!st || pdec(st) !== "wspr") $("wspr").hidden = $("wStat").hidden = true;
   $("jCount").hidden = $("wCount").hidden = v === "digital";
-  if (v === "digital" && (A.on || (dec === "wspr" && !mis))) $("listenCard").hidden = false;
+  if (v === "digital" && (A.on || (dec && !mis))) $("listenCard").hidden = false;
   $("aPick").hidden = $("aPick").hidden || !profiles;
   $("lPick").hidden = $("lPick").hidden || !profAvail;
   $("jPick").hidden = $("jPick").hidden || !profAvail;
@@ -9673,7 +9463,7 @@ function profBtn(p, top, sub) {
     if (switching && switching.name === p.name) add("pa", "■ Switching…");
     else if (!!p.upconvert !== curUp()) add("pw", "▲ Flip the Ham It Up to " + hiuWord(p.upconvert));
     el.disabled = conn !== "ok" || !!switching;
-    el.onclick = () => askSwitch(p);
+    el.onclick = () => doSwitch(p);
   }
   return el;
 }
@@ -9706,23 +9496,6 @@ function renderProfiles() {
 }
 
 // switching
-const dlg = $("dlg");
-let dlgAct = null;
-$("dlgNo").onclick = () => dlg.close();
-$("dlgYes").onclick = () => { dlg.close(); if (dlgAct) dlgAct(); };
-dlg.addEventListener("close", () => { dlgAct = null; });
-function askSwitch(p) {
-  const cur = activeProf(), leavingJs8 = curDec() === "js8" || !!(cur && pdec(cur) === "js8");
-  if (!leavingJs8) return doSwitch(p);
-  $("dlgT").textContent = "Switch to " + p.name + "?";
-  const b = $("dlgB"); b.textContent = "";
-  const para = t => { const e = document.createElement("p"); e.textContent = t; b.appendChild(e); };
-  para("Leaving " + activeName() + " closes JS8Call. rxd restarts, which takes a few seconds.");
-  if (!!p.upconvert !== curUp()) para("▲ Then flip the Ham It Up to " + hiuWord(p.upconvert) + ".");
-  $("dlgYes").textContent = "Switch";
-  dlgAct = () => doSwitch(p);
-  dlg.showModal();
-}
 async function doSwitch(p) {
   showPmsg(""); $("swErr").hidden = true; $("flip").hidden = true;
   let r;
@@ -9745,8 +9518,8 @@ function finishSwitch() {
     setText($("flipT"), "▲ Flip the Ham It Up to " + hiuWord(curUp()) + ". " + sw.desc + " needs it; without it you hear nothing.");
     $("flip").hidden = false;
   }
-  // a mute carries over to the next station, never to JS8: its audio is JS8Call's input
-  if (muted() && st.volume > 0 && !feedsDecoder(st)) { store("spkprev", String(st.volume)); tune({volume: 0}, 0); }
+  // a mute carries over to the next station
+  if (muted() && st.volume > 0) { store("spkprev", String(st.volume)); tune({volume: 0}, 0); }
   jKey = null; wKey = null;
   renderConn(); renderView();
   loadProfiles();
@@ -9821,12 +9594,11 @@ function renderQual() {
 // ---------------------------------------------------------------- uConsole speaker mute
 function muted() { return load("spkprev") !== null; }
 function syncMute() {
-  if (muted() && st && st.volume > 0 && !held("volume") && !feedsDecoder(st)) forget("spkprev");
+  if (muted() && st && st.volume > 0 && !held("volume")) forget("spkprev");
   renderMute();
 }
 function renderMute() {
   const b = $("mute"), m = muted();
-  b.hidden = feedsDecoder(st);
   b.disabled = conn !== "ok" || !!switching || !st || (!m && st.volume === 0);
   b.setAttribute("aria-pressed", String(m));
   if (m) setText(b, "Unmute uConsole speaker (back to " + Math.round(+load("spkprev") * 100) + " %)");
@@ -10018,14 +9790,14 @@ async function pollJs8() {
 }
 function mineLine(l) {
   if (l.mycall === true) return true;
-  const c = (st && st.js8_call || "").toUpperCase();
+  const c = (st && st.station && st.station.call || "").toUpperCase();
   if (!c) return false;
   return (l.to || "").toUpperCase() === c || String(l.text || "").toUpperCase().split(/[^A-Z0-9\/]+/).indexOf(c) >= 0;
 }
 function jMatch(li) { return !jFilt || li.dataset.k.indexOf(jFilt) >= 0; }
 function addJs8(lines) {
   if (!lines.length) return jStatus("");
-  const list = $("jList"), frag = document.createDocumentFragment(), call = (st && st.js8_call) || "";
+  const list = $("jList"), frag = document.createDocumentFragment(), call = (st && st.station && st.station.call) || "";
   for (let i = lines.length - 1; i >= 0; i--) {
     const l = lines[i], li = document.createElement("li"), mine = mineLine(l), fr = String(l.from || "?");
     li.className = "jl" + (mine ? " me" : "");
@@ -10057,7 +9829,7 @@ function jStatus(err) {
   let shown = 0; if (jFilt) for (const li of list.children) if (!li.hidden) shown++;
   setText($("jCount"), heard); setText($("jHeard"), n + (n === 1 ? " station" : " stations"), "v");
   if (err) setText($("jMsg"), err);
-  else if (!list.children.length) setText($("jMsg"), "No decodes yet. They appear here as JS8Call hears them.");
+  else if (!list.children.length) setText($("jMsg"), "No decodes yet. They appear here as rxd decodes each slot.");
   else if (jFilt) setText($("jMsg"), shown ? "Showing " + shown + " of " + list.children.length + " lines with " + jFilt : "No lines with " + jFilt + ".");
   else setText($("jMsg"), "");
 }
@@ -10150,11 +9922,7 @@ function sqRenderAuto(level) {
   $("sqOff").setAttribute("aria-pressed", String(!level && !au));
   $("sqOn").textContent = av ? "Level" : "On";
 }
-// A JS8 profile's speaker audio is JS8Call's input (rxd refuses a volume
-// under volume_min there), so no speaker volume or mute is offered.
-function feedsDecoder(s) { return !!s && (s.volume_min > 0 || pdec(s) === "js8"); }
 function renderGainAudio(s) {
-  $("volSl").hidden = feedsDecoder(s);
   const has = typeof s.gain_auto === "boolean";
   $("gAuto").hidden = !has;
   if (has) {
@@ -10352,7 +10120,7 @@ function bandBtn(p, best) {
     else if (best) add("ba", "★ Best now");
     el.setAttribute("aria-label", decName(pdec(p)) + " " + bandWord(p.band) + ", " + fmtMHz(p.freq) + (best ? ", best now" : ""));
     el.disabled = conn !== "ok" || !!switching;
-    el.onclick = () => askSwitch(p);
+    el.onclick = () => doSwitch(p);
   }
   return el;
 }
@@ -10533,10 +10301,10 @@ RXDWEB
     # uses instead of the JS8Call desktop app. rxd loads it from here.
     write_file /usr/local/lib/rxd/js8.py 0644 <<'RXDJS8'
 #!/usr/bin/env python3
-"""js8: rxd's own JS8 receiver, so a JS8 profile needs no JS8Call.
+"""js8: rxd's JS8 receiver.
 
 Receive only. It takes slots of 12 kHz audio, finds JS8 signals in them and
-turns them into the frames and messages JS8Call shows:
+turns them into JS8 frames and messages:
 
   candidates    a spectrogram one symbol long, a quarter symbol apart, scored
                 against the three 7x7 Costas arrays every JS8 signal carries
@@ -10551,12 +10319,12 @@ turns them into the frames and messages JS8Call shows:
                 or data frame -> text, then frames are joined into messages
 
 Run as a script it serves decodes for rxd over a pipe (--serve), decodes WAV
-files (--wav), or reports what it is (--version). See rxd/README.md for the
+files (--wav), builds the JSC word table (--jsc-import-source), or reports
+what it is (--version). See rxd/README.md for the
 protocol sources and their licences: no JS8Call or WSJT-X code is used here.
 """
 import json
 import os
-import struct
 import sys
 import time
 
@@ -11162,7 +10930,7 @@ GROUPS = ("<....>", "@ALLCALL", "@JS8NET", "@DX/NA", "@DX/SA", "@DX/EU", "@DX/AS
 GROUP_VALUE = {g: NBASECALL + 1 + i for i, g in enumerate(GROUPS)}
 VALUE_GROUP = {v: g for g, v in GROUP_VALUE.items()}
 
-# Directed commands by their 5-bit code, as JS8Call writes them.
+# Directed commands by their 5-bit code, as JS8 writes them out.
 COMMANDS = {0: " SNR?", 1: " DIT DIT", 2: " NACK", 3: " HEARING?", 4: " GRID?", 5: ">",
             6: " STATUS?", 7: " STATUS", 8: " HEARING", 9: " MSG", 10: " MSG TO:",
             11: " QUERY", 12: " QUERY MSGS", 13: " QUERY CALL", 14: " ACK", 15: " GRID",
@@ -11173,7 +10941,7 @@ COMMAND_CODE = {v: k for k, v in COMMANDS.items()}
 SNR_COMMANDS = (25, 29)
 # Commands whose text comes after them in data frames, with a checksum of
 # that text at the end: relay, MSG, MSG TO:, QUERY, QUERY MSGS, QUERY CALL,
-# CMD. JS8Call drops one whose checksum is wrong, and so does rxd.
+# CMD. One whose checksum is wrong is dropped, as JS8 applications do.
 CHECKSUMMED = (5, 9, 10, 11, 12, 13, 24)
 CHECK_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?"
 CQS = ("CQ CQ CQ", "CQ DX", "CQ QRP", "CQ CONTEST", "CQ FIELD", "CQ FD", "CQ CQ", "CQ")
@@ -11409,7 +11177,7 @@ def _huffman(bits):
 
 def unpack(frame, i3):
     """One frame -> a dict: kind (heartbeat, cq, compound, directed, data or
-    raw), text as JS8Call shows it, and the parts. Data that needs the JSC
+    raw), text as JS8 shows it, and the parts. Data that needs the JSC
     table and doesn't have it comes back as kind "jsc" with text None."""
     v = frame_value(frame)
     flag = _field(v, 0, 3)
@@ -11528,21 +11296,21 @@ def value_frame(v):
 
 # --------------------------------------------------------- the messages
 
-EOT = "♢"   # JS8Call's end-of-message mark
+EOT = "♢"   # JS8's end-of-message mark
 GAP = "……"
 
 
 class Assembler:
-    """Joins frames into the messages JS8Call writes to DIRECTED.TXT.
+    """Joins frames into messages, as written to DIRECTED.TXT.
 
     A message is the frames one station sends at one offset, slot after slot,
     from a frame flagged first to one flagged last. Heartbeats, CQs and
     directed commands start one; data frames continue it. A missing frame
     shows as '……', and a message that stops without its last frame is let go
     after a few slots. feed(slot, decodes) returns the finished messages as
-    dicts: from, to, text (in JS8Call's form), freq, snr, submode, slot."""
+    dicts: from, to, text (in JS8's usual form), freq, snr, submode, slot."""
 
-    TOLERANCE = 10.0   # Hz between frames of one message (JS8Call's default)
+    TOLERANCE = 10.0   # Hz between frames of one message
     LINGER = 3         # slots without a frame before an unfinished message goes
 
     def __init__(self):
@@ -11680,14 +11448,14 @@ class Assembler:
 # ----------------------------------------------------------- the records
 
 def all_line(slot, d, text):
-    """A line in JS8Call's ALL.TXT form."""
+    """A line in JS8's usual ALL.TXT form."""
     return "%s%3d %4.1f %4d %s  %-12s         %d   %s" % (
         time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(slot)), d["snr"], d["dt"],
         int(round(d["freq"])), d["submode"], d["frame"], d["i3"], text if text is not None else "")
 
 
 def directed_line(when, dial, msg):
-    """A line in JS8Call's DIRECTED.TXT form (the offset is the sender's)."""
+    """A line in JS8's usual DIRECTED.TXT form (the offset is the sender's)."""
     return "%s\t%.6f\t%d\t%s\t%s" % (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(when)),
                                      dial / 1e6, int(round(msg["freq"])), snr_text(msg["snr"]),
                                      msg["text"])
@@ -11798,7 +11566,7 @@ class Resampler:
 
 class SlotDecoder:
     """rxd's audio -> slots by the system clock -> the decoder process ->
-    ALL.TXT and DIRECTED.TXT under datadir, in JS8Call's forms.
+    ALL.TXT and DIRECTED.TXT under datadir, in JS8's usual log forms.
 
     push() is called from rxd's DSP thread with the audio before squelch and
     volume; it only copies into a ring and hands finished slots to a worker
@@ -11996,88 +11764,107 @@ def jsc_path():
 # ------------------------------------------------- the JSC word table
 
 JSC_WORDS = 262144
+# The table's source: JS8Call's jsc_map.cpp (GPL-3, (C) 2018 Jordan Sherer),
+# so it is never in rx; setup.sh fetches it at install and this importer,
+# rx's own code, turns it into the word list rxd reads. Pinned to the commit
+# of JS8Call v2.2.0-ga in the original repository. The same table, entry for
+# entry, is in that repository's later main and in JS8Call-improved v3.0.3
+# (JS8_JSC/JSC_map.cpp), whose file is laid out differently.
+JSC_SOURCE_URL = ("https://raw.githubusercontent.com/js8call/js8call/"
+                  "99018054a3b273f7086f4e086f5b848c645c23c8/jsc_map.cpp")
+JSC_SOURCE_BYTES = 6296397
+JSC_SOURCE_SHA256 = "63dcea037badcdc49c5fc29a23438b66953fbfefcc1e354331f58c7dec232927"
+_JSC_ENTRY = None
 
 
-def jsc_import(src, dest=None):
+def jsc_table_path():
+    return os.path.join(JS8_DIR, "jsc_map.txt")
+
+
+def jsc_installed_sha256(dest=None):
+    """The SHA-256 of the source the installed table was built from, or None."""
+    try:
+        with open((dest or jsc_table_path()) + ".sha256", encoding="ascii") as fh:
+            return fh.read().split()[0]
+    except (OSError, IndexError):
+        return None
+
+
+def jsc_import(src, dest=None, sha256=JSC_SOURCE_SHA256, words=JSC_WORDS):
     """Write the JSC word table, one word per line in code order (escaped as
-    Python writes a string's insides, since one word is a newline), from the
-    user's own copy of JS8Call: its program, /usr/bin/js8call from the
-    js8call package.
-    The table is JS8Call's (GPL-3); rxd neither ships nor needs it, but with
-    it rxd can show compressed free text. Returns (dest, word count)."""
-    dest = dest or os.path.join(os.path.expanduser("~/.local/share/rxd/js8"), "jsc_map.txt")
+    Python writes a string's insides, since one word is a newline), from a
+    copy of jsc_map.cpp checked against sha256, and beside it the source's
+    SHA-256 (DEST.sha256). Nothing is replaced unless all of it succeeds, so
+    a bad or partial download leaves the table already there. Returns (dest,
+    word count)."""
+    import hashlib
+    dest = dest or jsc_table_path()
     with open(src, "rb") as fh:
         data = fh.read()
-    if data[:4] != b"\x7fELF":
-        raise ValueError("%s is not a program; give the path to js8call" % src)
-    words = _jsc_from_elf(data)
-    if len(words) != JSC_WORDS:
-        raise ValueError("%s: found %d JSC words, not %d" % (src, len(words), JSC_WORDS))
+    digest = hashlib.sha256(data).hexdigest()
+    if sha256 is not None and digest != sha256:
+        raise ValueError("%s is not the pinned jsc_map.cpp (sha256 %s, want %s)"
+                         % (src, digest, sha256))
+    table = jsc_parse(data.decode("latin-1"), words)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    tmp = dest + ".new"
-    with open(tmp, "w", encoding="ascii", newline="\n") as fh:
-        fh.write("".join(w.encode("unicode_escape").decode("ascii") + "\n" for w in words))
-    os.replace(tmp, dest)
-    return dest, len(words)
+    for path, body in ((dest, "".join(w.encode("unicode_escape").decode("ascii") + "\n"
+                                      for w in table)),
+                       (dest + ".sha256", digest + "  " + os.path.basename(src) + "\n")):
+        tmp = path + ".new"
+        with open(tmp, "w", encoding="ascii", newline="\n") as fh:
+            fh.write(body)
+        os.replace(tmp, path)
+    global _JSC
+    _JSC = None   # this process reads it at its next look; rxd at its next start
+    return dest, len(table)
 
 
-def _jsc_from_elf(data):
-    """JSC::map in a 64-bit little-endian ELF: 262144 entries of {char *str,
-    int size, int index}, index counting up from 0. In a position-independent
-    program the pointers are filled in at load time, so they are read from
-    the relative relocations."""
-    if data[4] != 2 or data[5] != 1:
-        raise ValueError("only 64-bit little-endian programs")
-    shoff, = struct.unpack_from("<Q", data, 0x28)
-    phoff, = struct.unpack_from("<Q", data, 0x20)
-    phnum, = struct.unpack_from("<H", data, 0x38)
-    shnum, = struct.unpack_from("<H", data, 0x3C)
-    loads = []
-    for i in range(phnum):
-        p_type, _, p_offset, p_vaddr, _, p_filesz = struct.unpack_from("<IIQQQQ", data, phoff + 56 * i)
-        if p_type == 1:
-            loads.append((p_vaddr, p_offset, p_filesz))
+def jsc_parse(text, words=JSC_WORDS):
+    """The words of jsc_map.cpp's JSC::map array, by index: entries
+    {"word", size, index}, a C string literal, sometimes with a comment."""
+    import re
+    global _JSC_ENTRY
+    _JSC_ENTRY = _JSC_ENTRY or re.compile(
+        r'\{\s*"((?:[^"\\]|\\.)*)"\s*(?:/\*.*?\*/\s*)?,\s*\d+\s*,\s*(\d+)\s*\}')
+    start = text.index("JSC::map[")
+    body = text[start:text.index("};", start)]
+    n = words
+    words = [None] * n
+    for m in _JSC_ENTRY.finditer(body):
+        i = int(m.group(2))
+        if i < n:
+            words[i] = _c_unescape(m.group(1))
+    if None in words:
+        raise ValueError("jsc_map.cpp: %d of %d words missing" % (words.count(None), n))
+    return words
 
-    def at(vaddr):
-        for va, off, size in loads:
-            if va <= vaddr < va + size:
-                return off + vaddr - va
-        raise ValueError("address %#x is not in the program" % vaddr)
 
-    def vaddr_of(off):
-        for va, o, size in loads:
-            if o <= off < o + size:
-                return va + off - o
-        raise ValueError("offset %#x is not loaded" % off)
-
-    relocs = {}
-    for i in range(shnum):
-        sh = struct.unpack_from("<IIQQQQIIQQ", data, shoff + 64 * i)
-        if sh[1] == 4 and sh[9] == 24:   # SHT_RELA
-            r = np.frombuffer(data, "<u8", count=sh[5] // 8, offset=sh[4]).reshape(-1, 3)
-            rel = r[(r[:, 1] & 0xFFFFFFFF) == 1027]   # R_AARCH64_RELATIVE
-            relocs.update(zip(rel[:, 0].tolist(), rel[:, 2].tolist()))
-    u = np.frombuffer(data[: len(data) // 4 * 4], "<u4")
-    hits = np.nonzero((u[:-20] == 0) & (u[4:-16] == 1) & (u[8:-12] == 2) &
-                      (u[12:-8] == 3) & (u[16:-4] == 4))[0]
-    for h in hits:
-        base = 4 * int(h) - 12
-        idx = u[(base + 12) // 4::4][:JSC_WORDS]
-        if len(idx) < JSC_WORDS or not (idx == np.arange(JSC_WORDS)).all():
+def _c_unescape(s):
+    simple = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"', "'": "'", "a": "\a",
+              "b": "\b", "f": "\f", "v": "\v", "?": "?"}
+    out, i = [], 0
+    while i < len(s):
+        if s[i] != "\\":
+            out.append(s[i])
+            i += 1
             continue
-        words = []
-        for e in range(JSC_WORDS):
-            off = base + 16 * e
-            ptr, = struct.unpack_from("<Q", data, off)
-            ptr = ptr or relocs.get(vaddr_of(off))
-            if not ptr:
-                break
-            s = at(ptr)
-            words.append(data[s:data.index(b"\0", s)].decode("latin-1"))
-        if len(words) == JSC_WORDS:
-            return words
-    raise ValueError("no JSC word table in this program")
-
+        n = s[i + 1]
+        if n == "x":
+            j = i + 2
+            while j < len(s) and s[j] in "0123456789abcdefABCDEF":
+                j += 1
+            out.append(chr(int(s[i + 2:j], 16) & 0xFF))
+            i = j
+        elif n in "01234567":
+            j = i + 1
+            while j < len(s) and j < i + 4 and s[j] in "01234567":
+                j += 1
+            out.append(chr(int(s[i + 1:j], 8) & 0xFF))
+            i = j
+        else:
+            out.append(simple.get(n, n))
+            i += 2
+    return "".join(out)
 
 def main(argv=None):
     import argparse
@@ -12087,8 +11874,12 @@ def main(argv=None):
     ap.add_argument("--t0", type=float, default=0.0,
                     help="where the WAV starts, in seconds from the slot's start")
     ap.add_argument("--submode", default="normal", help="normal, fast, turbo, slow or all")
-    ap.add_argument("--jsc-import", metavar="FILE",
-                    help="build the JSC word table from your JS8Call (/usr/bin/js8call)")
+    ap.add_argument("--jsc-import-source", metavar="FILE",
+                    help="build the JSC word table from JS8Call's jsc_map.cpp "
+                    "(JSC_SOURCE_URL, checked against JSC_SOURCE_SHA256)")
+    ap.add_argument("--jsc-pin", action="store_true",
+                    help="print the pinned source's URL, SHA-256, and whether the "
+                    "installed table was built from it")
     ap.add_argument("--version", action="store_true")
     a = ap.parse_args(argv)
     if a.version:
@@ -12096,8 +11887,17 @@ def main(argv=None):
         return 0
     if a.serve:
         return serve()
-    if a.jsc_import:
-        dest, n = jsc_import(a.jsc_import)
+    if a.jsc_pin:
+        print(JSC_SOURCE_URL)
+        print(JSC_SOURCE_SHA256)
+        print("installed" if jsc_installed_sha256() == JSC_SOURCE_SHA256 else "missing")
+        return 0
+    if a.jsc_import_source:
+        try:
+            dest, n = jsc_import(a.jsc_import_source)
+        except (OSError, ValueError) as e:
+            print("js8: %s; the table already there is kept" % e, file=sys.stderr)
+            return 1
         print("wrote %d JSC words to %s" % (n, dest))
         return 0
     if a.wav:
@@ -12117,27 +11917,66 @@ if __name__ == "__main__":
 RXDJS8
     log "installed rxd's JS8 decoder"
 
-    # Where rxd listens when its command line does not say.
-    # Written once and then left alone, so turning the LAN off survives
-    # 'maint'. Rigctl stays on loopback: only JS8Call uses it.
+    # JS8's compressed free text needs JS8Call's JSC word table (GPL-3, so rx
+    # doesn't carry it). js8.py pins its source -- JS8Call's jsc_map.cpp at a
+    # fixed commit of the original repository -- by URL and SHA-256; it is
+    # fetched here, checked, and turned into the desktop user's
+    # ~/.local/share/rxd/js8/jsc_map.txt by js8.py itself, run as that user.
+    # Skipped when the table there was built from the pinned file. A failed
+    # download or check keeps whatever table is already there, and rxd works
+    # without one: those words show as "……".
+    if $DRY_RUN; then
+      log "[dry-run] would fetch and install JS8's JSC word table for $DESKTOP_USER"
+    else
+      local jsc_url="" jsc_sha="" jsc_state="" jsc_tmp
+      { read -r jsc_url; read -r jsc_sha; read -r jsc_state; } < <(
+        runuser -u "$DESKTOP_USER" -- env HOME="$USER_HOME" \
+          python3 /usr/local/lib/rxd/js8.py --jsc-pin 2>/dev/null) || true
+      if [[ $jsc_state == installed ]]; then
+        log "JS8's JSC word table is current"
+      elif [[ -z $jsc_url || -z $jsc_sha ]]; then
+        warn "could not read the JSC word table's pin from js8.py; JS8 free text will show gaps"
+      else
+        jsc_tmp=$(mktemp /tmp/jsc_map.XXXXXX.cpp)
+        if curl -fsSL --max-time 120 -o "$jsc_tmp" "$jsc_url" \
+            && [[ $(sha256sum "$jsc_tmp" | cut -d' ' -f1) == "$jsc_sha" ]]; then
+          chmod 0644 "$jsc_tmp"
+          if runuser -u "$DESKTOP_USER" -- env HOME="$USER_HOME" \
+              python3 /usr/local/lib/rxd/js8.py --jsc-import-source "$jsc_tmp"; then
+            log "installed JS8's JSC word table (JS8Call's, GPL-3) for $DESKTOP_USER"
+          else
+            warn "the JSC word table didn't install; any earlier one is kept"
+          fi
+        else
+          warn "could not fetch JS8's JSC word table, or it didn't match its pin; any earlier one is kept"
+        fi
+        rm -f "$jsc_tmp"
+      fi
+    fi
+
+    # Where rxd listens when its command line does not say, and who this
+    # station is. Written once and then left alone, so turning the LAN off
+    # survives 'maint'.
     if [[ -e /etc/rx/rxd.env ]]; then
       log "kept /etc/rx/rxd.env as it is"
     else
       write_file /etc/rx/rxd.env 0644 <<'RXDENV'
 # Managed by rx/setup.sh, written once: edits here survive re-runs.
-# Where rxd listens, as HOST:PORT; read by rxd@.service. A --http or
-# --rigctl flag wins over these.
+# Read by rxd@.service; after a change, 'systemctl --user restart rxd@*'.
 #
-# RXD_HTTP=0.0.0.0:8073 serves rxd's API and browser UI to the LAN and the
-# tailnet (the firewall admits 8073 from nowhere else). There is no
-# authentication: anyone on the LAN can tune the radio. To keep it to this
-# machine, set RXD_HTTP=127.0.0.1:8073, then
-# 'systemctl --user restart rxd@*'.
-#
-# RXD_RIGCTL is left unset, so rigctl stays on 127.0.0.1:4532 for JS8Call.
+# RXD_HTTP is where rxd listens, as HOST:PORT (a --http flag wins).
+# 0.0.0.0:8073 serves rxd's API and browser UI to the LAN and the tailnet
+# (the firewall admits 8073 from nowhere else). There is no authentication:
+# anyone on the LAN can tune the radio. To keep it to this machine, set
+# RXD_HTTP=127.0.0.1:8073.
 RXD_HTTP=0.0.0.0:8073
+#
+# This station: the callsign and Maidenhead grid rxd reports WSPR spots as
+# and puts at the centre of its station map.
+RXD_CALL=KA1PID
+RXD_GRID=EM13lc
 RXDENV
-      log "wrote /etc/rx/rxd.env (HTTP on the LAN)"
+      log "wrote /etc/rx/rxd.env (HTTP on the LAN, station KA1PID at EM13lc)"
     fi
 
     # A template, never enabled: 'radio' starts and stops rxd@NAME itself, so
@@ -12197,13 +12036,12 @@ RXDUNIT
 """Managed by rx/setup.sh — switchable, resumable receiver profiles.
 
   radio                list profiles; * marks the active one
-  radio NAME           switch to NAME. rxd, the receiver, restarts on NAME; a
-                       JS8 profile also brings up JS8Call on its dial, and
-                       a WSPR profile has rxd decode WSPR itself. The
-                       profile being left is saved first, so coming back to
-                       it resumes where it was. NAME when it is already up
+  radio NAME           switch to NAME. rxd, the receiver, restarts on NAME; on
+                       a JS8 or WSPR profile it decodes that mode itself.
+                       The profile being left is saved first, so coming back
+                       to it resumes where it was. NAME when it is already up
                        changes nothing.
-  radio off            save the active profile, stop rxd, close JS8Call
+  radio off            save the active profile and stop rxd
   radio resume         bring the active profile back up (i3 runs it at login)
   radio save [NAME]    save rxd's current tuning as NAME (default: active)
   radio reset NAME     forget your saved state for NAME; back to its default
@@ -12225,7 +12063,7 @@ RXDUNIT
   networks share one radio, so choosing one stops the other. Neither starts at
   boot.
 
-  --no-focus           leave focus where it is (JS8Call)
+  --no-focus           leave focus where it is (radio mesh opens its client)
 
 Tab completes profile names (/usr/share/bash-completion/completions/radio).
 
@@ -12235,11 +12073,13 @@ names, js8 and wspr (js8-40m and wspr-40m mean the same). 6 m and 2 m need
 the Ham It Up on BYPASS. rxd's band plan (Auto in its Digital view) picks
 among them by band conditions, time of day and what it has heard.
 
-A profile is tuning only: frequency, offset mode, demodulator and its
-settings, audio sink and volume, the RTL-SDR's settings and, for JS8
-profiles, JS8Call's dial. A WSPR profile ("decoder": "wspr") also says
-whether rxd reports its spots to WSPRnet ("wspr_report", on by default). The defaults below are starting points; saved
-state lives in ~/.config/rx/radio/ and wins.
+A profile is tuning only: the dial frequency, offset mode, demodulator and
+its settings, audio sink and volume, the RTL-SDR's settings, and what rxd
+decodes ("decoder": "js8" or "wspr"). A WSPR profile also says whether rxd
+reports its spots to WSPRnet ("wspr_report", on by default). Both decoders
+work on the audio before the volume, so the volume is only the speaker's.
+The defaults below are starting points; saved state lives in
+~/.config/rx/radio/ and wins.
 
 rxd (systemd user unit rxd@NAME) reads only ~/.config/rx/radio/NAME.json, so
 the merged profile is written there before it starts. Its HTTP status on
@@ -12248,7 +12088,6 @@ holds the dongle. Edit NAME.json while it plays and
 'systemctl --user kill -s HUP rxd@NAME' makes it re-read the file.
 """
 import argparse
-import configparser
 import copy
 import json
 import os
@@ -12263,19 +12102,12 @@ import urllib.request
 HOME = os.path.expanduser("~")
 STATE = os.path.join(HOME, ".config", "rx", "radio")
 ACTIVE = os.path.join(STATE, "active")
-JS8_INI = os.path.join(HOME, ".config", "JS8Call.ini")
-
-JS8_CRIT, JS8_TREE = "(?i)^js8call$", 'js8call"'  # i3 criteria / tree match
-# By absolute path, so a stray wrapper earlier on PATH cannot recurse.
-JS8CALL = "/usr/bin/js8call"
-JS8_NODE = "SDR_to_JS8"
 
 # rxd's HTTP control port; module-level so the tests can point it elsewhere.
 RXD_URL = "http://127.0.0.1:8073"
 RXD_START_SECS = 15
 
 NOOELEC = "57818712"  # NESDR SMArt v5, behind the Ham It Up
-JS8_SINK = "SDR to JS8 (virtual cable)"
 SPEAKER = "Built-in Audio"
 
 
@@ -12294,14 +12126,11 @@ AM = {"bandwidth": 10000.0}
 
 
 def js8(desc, dial):
-    # The VFO sits 100 Hz under the dial, as tuned by hand for GhostNet; rxd
-    # keeps that difference as a calibration. "decoder": "js8" and the dial
-    # are all a JS8 profile says about decoding: JS8Call today (radio starts
-    # it on js8call_dial), rxd's own decoder when it has one.
-    return {"description": desc, "frequency": dial - 100.0,
-            "offset": "auto", "demod": "USB",
-            "demod_settings": USB_JS8, "sink": JS8_SINK, "volume": 0.2090567648410797,
-            "rtl": rtl(4), "decoder": "js8", "js8call_dial": dial}
+    # rxd decodes each slot itself, from the audio before the volume; the
+    # speaker plays it quietly, and the browser and rxd-tui can listen too.
+    return {"description": desc, "frequency": float(dial), "offset": "auto",
+            "demod": "USB", "demod_settings": USB_JS8, "sink": SPEAKER,
+            "volume": 0.2, "rtl": rtl(4), "decoder": "js8"}
 
 
 def wspr(desc, dial):
@@ -12373,7 +12202,7 @@ def band_profiles():
                                      ("wspr", WSPR_DIALS, wspr, "WSPR")):
         for band, dial in dials:
             out[band_profile_name(mode, band)] = make(
-                "%s, %s" % (title, band_label(band)), float(dial) if mode == "wspr" else dial)
+                "%s, %s" % (title, band_label(band)), float(dial))
     return out
 
 
@@ -12415,29 +12244,6 @@ def dump(path, doc):
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=4)
     os.replace(tmp, path)
-
-
-def read_ini():
-    # Same parser settings as js8call-ghostnet-config: QSettings values
-    # carry bare '%', ';' and '#', and keys are case-sensitive.
-    cp = configparser.ConfigParser(interpolation=None, strict=False,
-                                   delimiters=("=",), comment_prefixes=())
-    cp.optionxform = str
-    if os.path.isfile(JS8_INI):
-        with open(JS8_INI, encoding="utf-8") as fh:
-            cp.read_file(fh)
-    return cp
-
-
-def write_dial(hz):
-    cp = read_ini()
-    if not cp.has_section("Common"):
-        cp.add_section("Common")
-    cp.set("Common", "DialFreq", str(hz))
-    tmp = JS8_INI + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        cp.write(fh, space_around_delimiters=False)
-    os.replace(tmp, JS8_INI)
 
 
 # --------------------------------------------------------------- profiles
@@ -12505,7 +12311,7 @@ def upconverting(p):
 
 
 def decoder(p):
-    return p.get("decoder") or ("js8" if p.get("js8call_dial") is not None else None)
+    return p.get("decoder")
 
 
 def summary(name, p):
@@ -12533,9 +12339,9 @@ _desktop = {}
 
 
 def desktop():
-    """The environment for i3-msg and JS8Call: the desktop's, even when radio
-    runs from SSH, a service or rxd (band plan switches), where DISPLAY and
-    I3SOCK are unset. i3's socket is found the way i3 --get-socketpath would
+    """The environment for i3-msg (radio mesh moves its client's window): the
+    desktop's, even when radio runs from SSH, a service or rxd (band plan
+    switches), where DISPLAY and I3SOCK are unset. i3's socket is found the way i3 --get-socketpath would
     be asked, or failing that from i3's runtime directory."""
     if _desktop:
         return _desktop
@@ -12560,55 +12366,9 @@ def desktop():
     return _desktop
 
 
-def has_window(pat):
-    tree = subprocess.run(["i3-msg", "-t", "get_tree"], env=desktop(),
-                          capture_output=True, text=True).stdout
-    return re.search(r'"class":"' + pat, tree, re.I) is not None
-
-
 def i3(cmd):
     subprocess.run(["i3-msg", "-q", cmd], env=desktop(),
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
-def close(proc, crit):
-    """Close politely, so the app saves its own config; True if it was up."""
-    if not running(proc):
-        return False
-    i3('[class="%s"] kill' % crit)
-    for sig in (None, "-TERM", "-KILL"):
-        if sig:
-            subprocess.run(["pkill", sig, "-x", proc])
-        for _ in range(30):
-            if not running(proc):
-                return True
-            time.sleep(0.5)
-    die("%s would not exit" % proc)
-
-
-def start(argv, pat):
-    subprocess.Popen(argv, env=desktop(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True)
-    for _ in range(60):
-        if has_window(pat):
-            return
-        time.sleep(0.5)
-    die("%s did not open a window" % argv[0])
-
-
-def ensure_js8_sink():
-    # Normally made by /etc/pipewire/pipewire.conf.d/50-sdr-js8.conf when
-    # PipeWire starts; a session that predates that file has to be given it.
-    nodes = subprocess.run(["pw-cli", "ls", "Node"], capture_output=True,
-                           text=True).stdout
-    if 'node.name = "%s"' % JS8_NODE in nodes:
-        return
-    if subprocess.run(["pw-cli", "create-node", "adapter",
-                       "{ factory.name=support.null-audio-sink node.name=%s "
-                       "node.description=\"%s\" media.class=Audio/Sink "
-                       "audio.position=[FL FR] object.linger=true }" % (JS8_NODE, JS8_SINK)],
-                      stdout=subprocess.DEVNULL).returncode != 0:
-        die("could not create the %s audio sink" % JS8_NODE)
 
 
 def check_clock(mode):
@@ -12683,19 +12443,15 @@ def capture(p, st):
     p.pop("vfo_offset", None)  # SDR++'s; rxd ignores it
     # offset is left as it was: status reports the upconverter now in
     # effect, and saving that would pin an "auto" profile to one side.
-    if st.get("vfo_hz") is not None:
-        p["frequency"] = float(st["vfo_hz"])  # the carrier, as rxd reads it
+    if st.get("freq") is not None:
+        p["frequency"] = float(st["freq"])  # the dial
     if st.get("mode"):
         p["demod"] = st["mode"]
     if st.get("bandwidth") is not None:
         p["demod_settings"] = dict(p.get("demod_settings") or {},
                                    bandwidth=float(st["bandwidth"]))
     if st.get("volume") is not None:
-        vol = float(st["volume"])
-        # A JS8 profile's volume is JS8Call's input level: never save it
-        # silent (an older rxd let a speaker mute through to it).
-        if not (p.get("js8call_dial") is not None and vol < 0.05):
-            p["volume"] = vol
+        p["volume"] = float(st["volume"])
     if "squelch" in st:  # in SDR++'s keys, which rxd reads back
         ds = dict(p.get("demod_settings") or {}, squelchEnabled=st["squelch"] is not None)
         if st["squelch"] is not None:
@@ -12712,10 +12468,6 @@ def capture(p, st):
             saved["nr"] = au["nr_setting"]
         if saved:
             p["audio"] = saved
-    # rxd is the source of truth for the dial too: JS8Call tunes it over
-    # rigctl. Saving both dial and carrier keeps the calibration between them.
-    if p.get("js8call_dial") is not None and st.get("freq") is not None:
-        p["js8call_dial"] = int(round(float(st["freq"])))
     report = (st.get("wspr") or {}).get("report") or {}
     if p.get("decoder") == "wspr" and "reason" not in report and "enabled" in report:
         p["wspr_report"] = bool(report["enabled"])
@@ -12731,23 +12483,16 @@ def save_running(name):
     return True
 
 
-def switch(name, focus, resume=False):
+def switch(name, resume=False):
     prev = active()
     target = profile(name)
-    unit_name(name)  # a name rxd cannot be started on fails before anything closes
-    js8 = target.get("js8call_dial") is not None
-    # "js8_engine": "rxd" has rxd decode JS8 itself; JS8Call isn't needed.
-    app = js8 and target.get("js8_engine", "js8call") != "rxd"
+    unit_name(name)  # a name rxd cannot be started on fails before anything stops
 
     # Re-running the profile already playing changes nothing: a restart would
-    # throw away tuning done live through rigctl or HTTP. rxd's own idea of
-    # its profile guards against an instance started for some other name.
+    # throw away tuning done live over HTTP. rxd's own idea of its profile
+    # guards against an instance started for some other name.
     st = rxd_status()
     same = prev == name and st is not None and st.get("profile", name) == name
-
-    # Only re-running a JS8Call profile already up leaves JS8Call be.
-    if not (app and prev == name):
-        close("js8call", JS8_CRIT)
 
     # Save the profile being left, so coming back resumes it. Resuming at
     # login has nothing current to save.
@@ -12757,25 +12502,11 @@ def switch(name, focus, resume=False):
 
     set_active(name)
     if not same:
-        if app:
-            ensure_js8_sink()  # before rxd starts: it opens its sink then
         ensure_stored(name, target)
         rxd_stop()
         rxd_start(name)
 
-    if app:
-        want = str(target["js8call_dial"])
-        if same and st.get("freq") is not None:
-            # JS8Call may have moved rxd since the profile was saved; the
-            # running dial is the current one.
-            want = str(int(round(float(st["freq"]))))
-        if read_ini().get("Common", "DialFreq", fallback="") != want:
-            close("js8call", JS8_CRIT)
-            write_dial(want)
-        if not running("js8call"):
-            start([JS8CALL], JS8_TREE)
-        check_clock("JS8")
-    elif js8:
+    if decoder(target) == "js8":
         check_clock("JS8")
     elif decoder(target) == "wspr":
         check_clock("WSPR")
@@ -12788,8 +12519,6 @@ def switch(name, focus, resume=False):
         if was != now:
             say("flip the Ham It Up to %s" % ("UPCONVERT" if now else "BYPASS"),
                 "warning")
-    if focus and app:
-        i3('[class="%s"] focus' % JS8_CRIT)
 
 
 # --------------------------------------------------------------------- mesh
@@ -13034,11 +12763,11 @@ def main():
         for n in known():
             p = profile(n)
             rows.append({"name": n, "description": p.get("description", ""),
-                         "freq": float(p.get("js8call_dial", p["frequency"])),
+                         "freq": float(p["frequency"]),
                          "mode": p["demod"], "upconvert": upconverting(p),
-                         "js8": p.get("js8call_dial") is not None,
+                         "js8": decoder(p) == "js8",
                          "decoder": decoder(p),
-                         "band": band_of(float(p.get("js8call_dial", p["frequency"]))),
+                         "band": band_of(float(p["frequency"])),
                          "plan": n in BAND_PLAN,
                          "saved": os.path.isfile(os.path.join(STATE, n + ".json"))})
         print(json.dumps({"active": active(), "profiles": rows}))
@@ -13054,15 +12783,14 @@ def main():
         print(__doc__.split("\n\n", 1)[1].split("\nA profile is")[0])
     elif a.cmd == "off":
         name = active()
-        close("js8call", JS8_CRIT)
         if name:
             save_running(name)
         rxd_stop()
-        print("rxd stopped, JS8Call closed" + ("; 'radio resume' brings back %s" % name if name else ""))
+        print("rxd stopped" + ("; 'radio resume' brings back %s" % name if name else ""))
     elif a.cmd == "resume":
         name = active()
         if name:
-            switch(name, focus, resume=True)
+            switch(name, resume=True)
         else:
             print("no active profile; 'radio NAME' picks one")
     elif a.cmd == "save":
@@ -13089,7 +12817,7 @@ def main():
     elif a.cmd == "show":
         print(json.dumps(profile(a.arg or active() or "ghostnet"), indent=2))
     else:
-        switch(a.cmd, focus)
+        switch(a.cmd)
 
 
 if __name__ == "__main__":
@@ -13133,10 +12861,6 @@ RADIOCOMP
   if want ham; then
     section "Amateur radio"
     apt_install python3
-    # libhamlib-utils, not hamlib-utils: Debian names the binary package after
-    # the library. It provides rigctl/rotctl, which is what JS8Call drives a
-    # rig with.
-    apt_install_opt js8call libhamlib-utils
 
     # wsjtx for wsprd, the WSPR decoder rxd runs on its own recordings (the
     # WSJT-X GUI itself is not used). Pinned to Debian's build: the ClockworkPi
@@ -13164,250 +12888,9 @@ WSJTXPIN
 
     note "CHIRP: run 'chirp' or 'chirpw' (dmenu, Alt+Shift+d). Serial cables need the dialout group, which you have — it applies after a full re-login."
     note "CHIRP is Debian's build and lags upstream, so a radio released since then may not be listed. For a current one, download the wheel from chirpmyradio.com in a browser (its archive blocks scripted access), then: sudo apt remove chirp && pipx install --system-site-packages ./chirp-*.whl"
-    log "installed js8call and hamlib-utils"
+    log "installed wsjtx (for wsprd) and CHIRP"
 
-    # GhostNet (S2 Underground) config, migrated from a working macOS install.
-    # Identity, groups and dial frequency are baked in; audio devices, PTT and
-    # rig control are not, since those depend on the radio attached here.
-    write_file /usr/local/sbin/js8call-ghostnet-config 0755 <<'JS8CONF'
-#!/usr/bin/env python3
-"""Managed by rx/setup.sh — apply the GhostNet JS8Call configuration.
-
-Migrated selectively from a working macOS JS8Call install. Only portable keys
-are written: identity, groups, heartbeat/autoreply behaviour, and the dial
-frequency. Deliberately NOT carried over, because they would be wrong or
-harmful on the uConsole:
-
-  SoundInId/SoundInName/SoundOutId/SoundOutName   macOS Core Audio devices
-                                                  (SoundInName instead defaults
-                                                  to the SDR loopback; below)
-  WindowGeometry, Font, RXTextFont, TXTextFont    sized for a Mac, not 1280x480
-  Rig, PTTMethod, PTTport, CATSerialPort          depends on the attached radio
-  Notifications\\*\\path                            macOS sound file paths
-  CallActivity, stations                          stale per-callsign heard data
-
-JS8Call reads this with QSettings. Values are written exactly as QSettings
-itself stores them — in particular MyGroups keeps its doubled '@@', which is
-QSettings' own escaping. Do not "tidy" it to a single '@'.
-"""
-import argparse
-import configparser
-import os
-import shutil
-import subprocess
-import sys
-import time
-
-CALLSIGN = "KA1PID"
-GRID = "EM13LC"
-GROUPS = "@@GHOSTNET, @@GSTFLASH, @@GNUSATX"
-GHOSTNET_DIAL = "7107000"  # GhostNet calling frequency, 7.107 MHz
-
-SETTINGS = {
-    "Common": {
-        "Freq": "1000",          # audio offset within the passband
-        "SubMode": "0",          # normal speed
-        "SubModeHB": "false",
-        "SubModeHBAck": "false",
-        "SubModeMultiDecode": "true",
-        "HBInterval": "0",       # heartbeat off by default
-        "CQInterval": "0",
-    },
-    "Configuration": {
-        "MyCall": CALLSIGN,
-        "MyGrid": GRID,
-        "MyGroups": GROUPS,
-        "AutoreplyOnAtStartup": "true",
-        "AutoreplyConfirmation": "true",
-        "HeartbeatQSOPause": "true",
-        "HeartbeatAckSNR": "false",
-        "HBRateLimit": "false",
-        "HBMessage": "HB <MYGRID4>",
-        "CQMessage": "CQ CQ CQ <MYGRID4>",
-        "MyStatus": "IDLE <MYIDLE> VERSION <MYVERSION>",
-        "Reply": "HW CPY?",
-        "Macros": "TNX 73 GL",
-        "AutoGrid": "false",
-        "AvoidAllcall": "false",
-        "TxIdleWatchdog": "60",
-        # Receive-only on the SDR: nothing transmits or uploads on its own.
-        "AutoreplyOnAtStartup": "false",
-        "PSKReporter": "false",
-        "SpotToAPRS": "false",
-    },
-    # Layout set by hand on the uConsole's 1280x720 panel. The ByteArrays are QSettings' own encoding, copied
-    # verbatim; they are opaque and only JS8Call can regenerate them.
-    "MainWindow": {
-        "BandHBActivityVisible": "false",
-        "ShowTooltips": "false",
-        "MainSplitter": r"@ByteArray(\0\0\0\xff\0\0\0\x1\0\0\0\x4\0\0\0}\0\0\x1\xb3\0\0\0\x1e\0\0\0\0\x1\0\0\0\x6\x1\0\0\0\x2\x1)",
-        "TextHorizontalSplitter": r"@ByteArray(\0\0\0\xff\0\0\0\x1\0\0\0\x3\0\0\x1\x1\0\0\0\xb1\0\0\0\xb2\x1\0\0\0\x6\x1\0\0\0\x1\0)",
-        "geometry": r"@ByteArray(\x1\xd9\xd0\xcb\0\x3\0\0\0\0\x2\x80\0\0\0\x1c\0\0\x4\xff\0\0\x2\xcf\0\0\x2\x82\0\0\0\x36\0\0\x4\xfd\0\0\x2\xcd\0\0\0\0\0\0\0\0\x5\0\0\0\x2\x82\0\0\0\x36\0\0\x4\xfd\0\0\x2\xcd)",
-        "state": r"@ByteArray(\0\0\0\xff\0\0\0\0\xfd\0\0\0\0\0\0\x2|\0\0\x2l\0\0\0\x4\0\0\0\x4\0\0\0\b\0\0\0\b\xfc\0\0\0\0)",
-    },
-    "WideGraph": {
-        "HideControls": "true",
-        "PlotWidth": "479",
-        "geometry": r"@ByteArray(\x1\xd9\xd0\xcb\0\x3\0\0\0\0\0\0\0\0\0\0\0\0\x1\xde\0\0\0\t\0\0\0\0\0\0\0\x14\0\0\x1\xf9\0\0\x1\xb7\0\0\0\0\x2\0\0\0\x5\0\0\0\0\0\0\0\0\0\0\0\x1\xde\0\0\0\t)",
-    },
-}
-
-# Written only when the key is absent or empty, so a later choice survives
-# re-runs.
-DEFAULTS = {
-    "Common": {
-        # 'radio' sets the dial when switching JS8 profiles; forcing it here
-        # would pull JS8Call back to GhostNet on every maint run while rxd
-        # stayed on the other frequency.
-        "DialFreq": GHOSTNET_DIAL,
-    },
-    "Configuration": {
-        # Monitor of the PipeWire loopback sink rxd plays into.
-        "SoundInName": "SDR_to_JS8.monitor",
-    },
-}
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--home", default=os.path.expanduser("~"))
-    ap.add_argument("--dry-run", action="store_true")
-    args = ap.parse_args()
-
-    ini = os.path.join(args.home, ".config", "JS8Call.ini")
-
-    # JS8Call writes its whole ini back on exit, so anything written while it
-    # runs is silently undone the next time it closes.
-    if not args.dry_run and subprocess.run(
-            ["pgrep", "-x", "js8call"], stdout=subprocess.DEVNULL).returncode == 0:
-        print("  JS8Call is running and would overwrite %s on exit — close it and re-run" % ini)
-        return 2
-
-    cp = configparser.ConfigParser(
-        interpolation=None,   # values contain bare '%' and '$'
-        strict=False,         # tolerate duplicate keys from older writes
-        delimiters=("=",),
-        comment_prefixes=(),  # ';' and '#' are legal inside values here
-    )
-    cp.optionxform = str      # QSettings keys are case-sensitive
-
-    existed = os.path.isfile(ini)
-    if existed:
-        try:
-            with open(ini, encoding="utf-8") as fh:
-                cp.read_file(fh)
-        except (configparser.Error, OSError, UnicodeDecodeError) as exc:
-            print("  existing %s is unparseable (%s) — refusing to touch it" % (ini, exc))
-            return 1
-    else:
-        print("  no existing JS8Call.ini — creating one")
-
-    changed = []
-    for section, keys in SETTINGS.items():
-        if not cp.has_section(section):
-            cp.add_section(section)
-        for key, val in keys.items():
-            if cp.get(section, key, fallback=None) != val:
-                changed.append("%s/%s" % (section, key))
-            cp.set(section, key, val)
-    for section, keys in DEFAULTS.items():
-        if not cp.has_section(section):
-            cp.add_section(section)
-        for key, val in keys.items():
-            if not cp.get(section, key, fallback=""):
-                changed.append("%s/%s" % (section, key))
-                cp.set(section, key, val)
-
-    if args.dry_run:
-        print("  [dry-run] would write %d key(s) to %s" % (len(changed), ini))
-        return 0
-
-    # Re-running as config management must be a no-op when nothing differs:
-    # no rewrite, and above all no new backup file each time.
-    if existed and not changed:
-        print("  %s already correct; nothing to do" % ini)
-        return 0
-
-    if existed:
-        backup = "%s.bak-%s" % (ini, time.strftime("%Y%m%d-%H%M%S"))
-        shutil.copy2(ini, backup)
-        print("  backed up existing config to %s" % backup)
-
-    os.makedirs(os.path.dirname(ini), exist_ok=True)
-    tmp = ini + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        cp.write(fh, space_around_delimiters=False)
-    os.replace(tmp, ini)
-
-    print("  wrote GhostNet config to %s (%d key(s) changed)" % (ini, len(changed)))
-    print("  callsign %s, grid %s, groups %s"
-          % (CALLSIGN, GRID, GROUPS.replace("@@", "@")))
-    print("  dial frequency %s MHz" % (int(GHOSTNET_DIAL) / 1e6))
-    print("  audio in: %s (unless already set)"
-          % cp.get("Configuration", "SoundInName", fallback=""))
-    print("  NOT set (device-specific, configure in JS8Call): audio out, PTT method, rig")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-JS8CONF
-
-    if $DRY_RUN; then
-      log "[dry-run] would write the GhostNet JS8Call config for $DESKTOP_USER"
-    else
-      local js8rc=0
-      /usr/local/sbin/js8call-ghostnet-config --home "$USER_HOME" || js8rc=$?
-      case $js8rc in
-        0) ;;
-        2) note "JS8Call config skipped because JS8Call was open (it rewrites its ini on exit). Close it and re-run: sudo maint, or --only ham." ;;
-        *) warn "JS8Call config failed — any existing config was left untouched" ;;
-      esac
-      chown "${DESKTOP_USER}:${USER_GROUP}" "$USER_HOME/.config/JS8Call.ini" 2>/dev/null || true
-    fi
-    # Receive path for JS8 without a rig: rxd demodulates USB into this
-    # null sink, and JS8Call records from its monitor. A null sink rather
-    # than the speaker's monitor so decoding does not depend on the volume
-    # key, and the speaker stays quiet. System-wide, so it needs no per-user
-    # PipeWire config; PipeWire picks it up at its next start.
-    write_file /etc/pipewire/pipewire.conf.d/50-sdr-js8.conf 0644 <<'PWSINK'
-# Managed by rx/setup.sh — virtual audio cable from rxd to JS8Call.
-# rxd plays into "SDR_to_JS8"; JS8Call records from SDR_to_JS8.monitor.
-context.objects = [
-  { factory = adapter
-    args = {
-      factory.name     = support.null-audio-sink
-      node.name        = "SDR_to_JS8"
-      node.description = "SDR to JS8 (virtual cable)"
-      media.class      = Audio/Sink
-      audio.position   = [ FL FR ]
-      audio.rate       = 48000
-    }
-  }
-]
-PWSINK
-    log "PipeWire loopback sink SDR_to_JS8 configured"
-
-    # JS8 receive is 'radio ghostnet' / 'radio js8' (the sdr section).
-    # Earlier revisions installed launchers for it -- js8, then js8ghost with
-    # js8call as a symlink -- and js8 and js8call shadowed JS8Call's own
-    # binaries. Remove them, but only ours.
-    local old
-    for old in /usr/local/bin/js8 /usr/local/bin/js8ghost; do
-      if grep -qs 'Managed by rx/setup.sh' "$old"; then
-        run rm -f "$old"
-        log "removed the old launcher $old"
-      fi
-    done
-    if [[ -L /usr/local/bin/js8call && $(readlink /usr/local/bin/js8call) == js8ghost ]]; then
-      run rm -f /usr/local/bin/js8call
-      log "removed the old js8call launcher symlink"
-    fi
-
-    note "JS8Call: groups @GHOSTNET, @GSTFLASH, @GNUSATX; dial 7.107 MHz (GhostNet)."
-    note "JS8 receive: 'radio ghostnet' (7.107) or 'radio js8' (7.078) brings up rxd tuned there and JS8Call on the matching dial on workspace 2. JS8Call's audio input defaults to the SDR_to_JS8.monitor loopback; a device picked under Settings -> Audio is kept on re-runs."
-    note "JS8Call: 7.107 is set as the dial but is not in the preset Frequencies list; add it under Settings -> Frequencies to get it in the dropdown."
-    note "JS8Call transmit needs an external rig (CAT + USB audio) — the SDR is receive-only. Set audio out and PTT under Settings -> Audio / Radio."
+    note "JS8 and WSPR receive: rxd decodes both itself. 'radio js8', 'radio ghostnet' (7.107, GhostNet) or 'radio wspr', then watch the Digital view at http://$(hostname):8073/ or in rxd-tui."
   fi
 
   # ---------------------------------------------------------------- tailscale
