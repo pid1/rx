@@ -32,6 +32,7 @@ starting points. `vfo_offset`, left in older profiles, is no longer used.
 |---|---|---|
 | `ghostnet` | 7.107 MHz USB → JS8Call | upconvert |
 | `js8` | 7.078 MHz USB → JS8Call | upconvert |
+| `wspr` | 7.0386 MHz USB → rxd's WSPR decoder, reported to WSPRnet | upconvert |
 | `vhf` | 146.520 MHz FM (2 m calling) | bypass |
 | `dcara` | 146.920 MHz FM (DCARA) | bypass |
 | `uhf` | 446.000 MHz FM (70 cm calling) | bypass |
@@ -108,8 +109,34 @@ The GhostNet config is receive-only: auto-reply at startup, PSK Reporter and
 APRS spotting are forced off, and the window layout set by hand on this panel
 is reapplied on every run.
 
-JS8 profiles warn if chrony is not synchronised: JS8 slots tolerate about
-2 s of clock error and fail silently beyond it.
+JS8 and WSPR profiles warn if chrony is not synchronised: both modes'
+slots tolerate about 2 s of clock error and fail silently beyond it.
+
+## WSPR
+
+**`radio wspr`** (7.0386 MHz, WSPR's 40 m dial) has rxd decode WSPR itself;
+JS8Call closes and WSJT-X is not involved. rxd records each two-minute slot
+from its own audio, from the even minute, and runs `wsprd` from Debian's
+`wsjtx` package on it. The uConsole's speaker stays silent (volume 0), but the
+browser UI and `rxd-tui -l` can still listen.
+
+- **Spots** show in the Digital view of the browser UI and of `rxd-tui`, and
+  come from `GET /api/wspr`. wsprd's own log, `ALL_WSPR.TXT`, is kept in
+  `~/.local/share/rxd/wspr/` and reloaded when rxd restarts.
+- **Reporting** to WSPRnet is on by default. rxd posts each spot the way
+  WSJT-X does, plus a heartbeat for a slot with none, so the station shows
+  as on the air.
+  - The callsign and grid are JS8Call's `MyCall` and `MyGrid`, unless
+    `RXD_CALL` and `RXD_GRID` are set in `/etc/rx/rxd.env`. Without both, rxd
+    decodes but doesn't report, and says why.
+  - Spots that can't be sent (no internet) wait, up to 2000 of them, and go
+    with the next slot.
+  - Turn reporting off from the Digital view, or with
+    `POST /api/tune {"wspr_report": false}`; `radio` saves the choice with
+    the profile.
+- **wsjtx** is pinned to Debian's build (`/etc/apt/preferences.d/rx-wsjtx`).
+  The ClockworkPi repo's 2.7.0 conflicts with Debian's `wsjtx-data` and
+  would fail to install or upgrade.
 
 ## When rxd is silent
 
