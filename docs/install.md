@@ -73,15 +73,15 @@ Every section is skippable with `--skip NAME`, or run alone with `--only NAME`.
 | Section | What it does |
 |---|---|
 | `base` | Timezone (America/Chicago), hushlogin, sshd enabled, GitHub-backed `authorized_keys` sync, the `maint` maintenance command, hardware group membership |
-| `firewall` | Default-deny inbound: SSH and replies only, IPv4 and IPv6 (nftables) |
+| `firewall` | Default-deny inbound: SSH, rxd's HTTP from the LAN and tailnet, and replies, IPv4 and IPv6 (nftables) |
 | `desktop` | X11 + i3, autologin on tty1, Alacritty, Atkinson fonts, PipeWire, blanking disabled |
 | `claude` | Claude Code from Anthropic's signed apt repo |
 | `aio` | HackerGadgets AIO v2 metapackage, GPIO power rails, boot overlays |
 | `rtc` | PCF85063A over i2c, bound once the AIO rails are up (`uconsole-rtc`), `fake-hwclock` as fallback |
 | `gps` | UART + PPS overlays, serial console removed, `gpsd` on `/dev/ttyS0` |
 | `lora` | `meshtasticd` with its own config, the dashboard and map tiles; MeshCore (MeshCoreRPI, pinned); both clients; `rx-mesh`, so neither starts at boot |
-| `sdr` | `rtl-sdr`, DVB-T driver blacklisted, rxd and its `rxd@` user unit, `radio` profiles; purges `sdrpp-brown`/`sdrpp` |
-| `ham` | JS8Call + hamlib, receive-only GhostNet configuration, SDR→JS8Call loopback sink, CHIRP |
+| `sdr` | `rtl-sdr`, DVB-T driver blacklisted, rxd with its JS8 decoder and its `rxd@` user unit, `rxd-tui`, the browser UI, `/etc/rx/rxd.env` (listen address, station call and grid), `radio` profiles; fetches JS8's JSC word table (pinned, checked) and the offline callsign database for the map; purges `sdrpp-brown`/`sdrpp` |
+| `ham` | `wsjtx`, pinned to Debian's build, for `wsprd` (rxd's WSPR decoder; the WSJT-X GUI isn't used), and CHIRP |
 | `tailscale` | Tailscale from its official repo |
 
 ### Flags
@@ -123,16 +123,12 @@ ssh jroemer@<its IP or tailnet name>  # from another machine (mDNS is firewalled
 sudo tailscale up                     # unless TS_AUTHKEY was passed
 ```
 
-Four things the script deliberately leaves to you:
+Three things the script deliberately leaves to you:
 
 - **No mesh runs** until `radio meshtastic` or `radio meshcore`. Starting one
   applies `LORA_REGION` (`US`) and the North Texas settings; outside the US,
   change `LORA_REGION` in `setup.sh` first — the wrong region is a regulatory
   problem, not a config annoyance.
-- **JS8Call transmit** is not configured — audio out and PTT depend on the
-  rig attached. Groups, grid, callsign, the dial and the SDR receive input
-  *are* set, and `radio` tunes rxd to match (see
-  [Radio profiles](radio.md#radio-profiles)).
 - **`hwclock -r` alone can lie**, reporting plausible time sourced from
   elsewhere. Check `/dev/rtc*` and `dmesg`. No output at all usually means the
   CR1220 is in backwards.

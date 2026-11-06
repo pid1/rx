@@ -1,0 +1,2383 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f4f4f2">
+<title>rxd</title>
+<script>
+try { var t = localStorage.getItem("rxd.theme");
+  if (["auto", "light", "dark", "night"].indexOf(t) >= 0) document.documentElement.dataset.theme = t;
+} catch (e) {}
+</script>
+<style>
+:root{
+  --bg:#f4f4f2;--panel:#fff;--fg:#111;--dim:#555;--line:#c4c4bf;--accent:#0b57c9;--accent-fg:#fff;
+  --ok:#14713f;--warn:#9a5200;--bad:#b3261e;--plot:#fcfcfb;--grid:#e3e3df;--trace:#0b57c9;
+  --pass:rgba(11,87,201,.14);--mark:#c2185b;color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root[data-theme=auto]{
+  --bg:#111214;--panel:#1d1e21;--fg:#f2f2f2;--dim:#a8a8a8;--line:#3c3d42;--accent:#4c9dff;--accent-fg:#000;
+  --ok:#4fd27d;--warn:#ffb02e;--bad:#ff6b5e;--plot:#0a0a0b;--grid:#25262a;--trace:#74b6ff;
+  --pass:rgba(76,157,255,.18);--mark:#ff6fa8;color-scheme:dark}}
+:root[data-theme=dark]{
+  --bg:#111214;--panel:#1d1e21;--fg:#f2f2f2;--dim:#a8a8a8;--line:#3c3d42;--accent:#4c9dff;--accent-fg:#000;
+  --ok:#4fd27d;--warn:#ffb02e;--bad:#ff6b5e;--plot:#0a0a0b;--grid:#25262a;--trace:#74b6ff;
+  --pass:rgba(76,157,255,.18);--mark:#ff6fa8;color-scheme:dark}
+:root[data-theme=night]{
+  --bg:#000;--panel:#140000;--fg:#ff3b2f;--dim:#b8281f;--line:#4a0e09;--accent:#ff3b2f;--accent-fg:#000;
+  --ok:#ff3b2f;--warn:#ff3b2f;--bad:#ff3b2f;--plot:#000;--grid:#2a0604;--trace:#ff3b2f;
+  --pass:rgba(255,40,20,.20);--mark:#ff2a10;color-scheme:dark}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html{background:var(--bg);color:var(--fg);scrollbar-color:var(--line) var(--bg)}
+body{margin:0;background:var(--bg);color:var(--fg);font:18px/1.3 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  font-variant-numeric:tabular-nums;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  -webkit-text-size-adjust:100%}
+::selection{background:var(--accent);color:var(--accent-fg)}
+button,input{font:inherit;color:inherit}
+:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+.wrap{max-width:1400px;margin:0 auto;padding:10px 12px 16px;display:grid;gap:10px}
+header{display:flex;align-items:center;gap:10px;min-height:44px}
+header .id{flex:1;min-width:0;display:flex;align-items:baseline;gap:10px;font-size:22px;font-weight:700;white-space:nowrap;overflow:hidden}
+#profile{overflow:hidden;text-overflow:ellipsis}
+.tag{font-size:17px;font-weight:700;border:2px solid var(--fg);border-radius:6px;padding:0 6px}
+.app{color:var(--dim);font-weight:600}
+.pill{font-size:17px;font-weight:600;white-space:nowrap}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.dimc{color:var(--dim)}
+.jclock{grid-column:1/-1;margin:4px 0 0}
+.banner{border:2px solid var(--bad);color:var(--bad);background:var(--panel);border-radius:10px;padding:12px 14px;font-weight:700;font-size:19px}
+.hiu{border:2px solid var(--accent);border-radius:10px;padding:10px 14px;display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;background:var(--panel)}
+.hiu b{font-size:22px}
+.hiu.up{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+:root[data-theme=night] .hiu.up{background:#3d0804;color:var(--fg);border-width:3px}
+.hiu span{font-size:16px}
+.hiu.stale{opacity:.55}
+input:disabled{opacity:.45}
+.stats{display:grid;grid-template-columns:1fr;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:4px 12px}
+.stat{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding:3px 0;min-width:0}
+.stat+.stat{border-top:1px solid var(--line)}
+.stat .v{text-align:right}
+@media (min-width:600px){.stats{grid-template-columns:repeat(3,1fr);background:none;border:0;padding:0;gap:8px}
+.stat,.stat+.stat{display:block;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:6px 10px}.stat .v{text-align:left}}
+.k{display:block;font-size:15px;color:var(--dim);font-weight:600;letter-spacing:.02em}
+.v{display:block;font-size:18px;font-weight:650;overflow-wrap:anywhere}
+fieldset{border:0;margin:0;padding:0;min-width:0}
+fieldset:disabled .live{opacity:.45}
+.layout{display:grid;gap:10px;grid-template-columns:minmax(0,1fr);grid-template-areas:"tuner" "scope" "modes" "sliders"}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;min-width:0}
+.tuner{grid-area:tuner}.scope{grid-area:scope}.modes{grid-area:modes}.sliders{grid-area:sliders}
+.lbl{display:flex;justify-content:space-between;gap:8px;font-size:15px;color:var(--dim);font-weight:600}
+.freq{font-size:clamp(40px,13.2vw,76px);font-weight:700;line-height:1.05;letter-spacing:-.01em;white-space:nowrap;margin:2px 0 6px;cursor:ns-resize}
+.freq .hz{font-size:.72em;color:var(--dim);margin-left:.18em}
+.meter{display:grid;grid-template-columns:1fr auto;align-items:center;gap:4px 12px;margin-bottom:10px}
+.mbar{height:14px;border:1px solid var(--line);border-radius:7px;overflow:hidden;background:var(--bg)}
+.mbar i{display:block;height:100%;width:0;background:var(--accent)}
+.mnum{font-size:22px;font-weight:700;min-width:6.5em;text-align:right}
+.mscale{grid-column:1;display:flex;justify-content:space-between;font-size:13px;color:var(--dim)}
+.btn{min-height:56px;border:2px solid var(--line);background:var(--bg);border-radius:10px;font-weight:700;font-size:20px;
+  cursor:pointer;touch-action:manipulation;padding:4px 8px}
+.btn[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
+.btn:disabled{cursor:default;opacity:.45}
+@media (hover:hover){.btn:not(:disabled):hover{border-color:var(--accent)}}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.steps{display:grid;grid-template-columns:repeat(7,1fr);gap:5px;margin:8px 0}
+.steps .btn{font-size:17px;line-height:1.05;padding:2px;min-width:0}
+.steps .btn small{display:block;font-size:13px;font-weight:600}
+form{display:grid;grid-template-columns:1fr auto;gap:8px}
+input[type=text]{min-height:56px;border:2px solid var(--line);border-radius:10px;background:var(--bg);padding:0 12px;font-size:22px;width:100%;min-width:0}
+input[type=text]::placeholder{color:var(--dim);opacity:1}
+.msg{margin:8px 0 0;font-weight:700;color:var(--bad);font-size:17px}
+.hint{font-size:14px;color:var(--dim);margin:8px 0 0;display:none}
+@media (hover:hover) and (pointer:fine){.hint{display:block}}
+.scope{display:flex;flex-direction:column;gap:6px}
+canvas[hidden]{display:none}
+canvas{display:block;width:100%;border-radius:6px;cursor:crosshair;touch-action:manipulation;background:var(--plot)}
+#spec{height:150px}#wf{height:150px}
+.mgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:6px}
+.sl{margin-top:4px}.sl+.sl{margin-top:10px}
+.sl .lbl .val{color:var(--fg);font-size:19px}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:56px;background:transparent;margin:0;cursor:pointer;touch-action:pan-y;--p:0%}
+input[type=range]::-webkit-slider-runnable-track{height:10px;border-radius:5px;background:linear-gradient(to right,var(--accent) var(--p),var(--line) var(--p))}
+input[type=range]::-moz-range-track{height:10px;border-radius:5px;background:linear-gradient(to right,var(--accent) var(--p),var(--line) var(--p))}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:34px;height:34px;margin-top:-12px;border-radius:50%;background:var(--panel);border:4px solid var(--accent)}
+input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;background:var(--panel);border:4px solid var(--accent)}
+.appear{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:6px;max-width:620px}
+.appear .btn{font-size:17px;padding:2px}
+@media (min-width:900px){
+  .wrap{padding:14px 20px 20px}
+  .top{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr);gap:10px}
+  .layout{grid-template-columns:minmax(380px,460px) minmax(0,1fr);grid-template-areas:"tuner scope" "modes scope" "sliders scope"}
+  .scope{grid-row:1/4}
+  #spec{height:240px}#wf{flex:1;min-height:240px}
+  .freq{font-size:64px}
+}
+.top{display:grid;gap:10px}
+.banner .sub{display:block;font-weight:600;font-size:16px;color:var(--dim);margin-top:4px}
+.banner.sw{border-color:var(--accent);color:var(--fg)}
+.banner.flip{border-color:var(--warn);color:var(--fg);display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 12px}
+.banner .btn{font-size:18px;padding:4px 14px}
+.views{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.views .btn{font-size:19px}
+.views .btn small{display:block;font-size:13px;font-weight:600}
+.nname{font-size:clamp(30px,9vw,44px);font-weight:750;line-height:1.1;margin:2px 0;overflow-wrap:anywhere}
+.nfreq{font-size:24px;font-weight:650;color:var(--dim);margin-bottom:10px}
+.row3{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:6px 0 4px}
+.row3 .btn{font-size:18px;line-height:1.1;padding:2px}
+.row3 .btn small{display:block;font-size:14px;font-weight:600}
+#sqLv{margin-top:8px}
+.pgroup{font-size:15px;color:var(--dim);font-weight:700;margin:12px 0 0}
+.pgroup:first-child{margin-top:4px}
+.jstat{display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;padding:8px 12px}
+@media (min-width:700px){.jstat{grid-template-columns:repeat(5,auto);justify-content:space-between}}
+.wrap>*{order:0}
+body[data-view=manual] #aPick,body[data-view=manual] #js8,body[data-view=manual] #wspr,body[data-view=manual] #listenCard{order:1}
+body[data-view=digital] #listenCard,body[data-view=digital] #js8,body[data-view=digital] #wspr{order:1}
+body[data-view=manual] #pmsg,#appear0{order:2}
+body[data-view=digital] .jlist{max-height:none;overflow:visible}
+@media (min-width:900px){
+  body[data-view=listen] .wrap,body[data-view=digital] .wrap{max-width:1100px}
+  body[data-view=listen] .wrap{grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start;grid-auto-flow:row dense}
+  body[data-view=listen] .wrap>*{grid-column:1/-1}
+  body[data-view=listen] #now,body[data-view=listen] .top,body[data-view=listen] #listenCard,body[data-view=listen] #qual{grid-column:1}
+  body[data-view=listen] #lPick{grid-column:2;grid-row:span 4}
+  body[data-view=listen] .top{grid-template-columns:1fr}
+}
+.btn.big{width:100%;min-height:72px;font-size:22px;margin-top:6px}
+.btn.wide{width:100%;margin-top:8px;font-size:18px}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
+.astate{margin:8px 0 0;font-weight:700;font-size:19px}
+.note{font-size:14px;color:var(--dim);margin:8px 0 0}
+.plist{display:grid;gap:8px;margin-top:6px;grid-template-columns:repeat(auto-fill,minmax(230px,1fr))}
+.prof{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:1px;text-align:left;width:100%;min-height:76px;padding:6px 12px}
+.prof.cur{border:3px solid var(--accent);background:var(--panel);border-radius:10px;font-weight:700}
+.prof .pd{font-size:21px;font-weight:750}
+.prof .pf{font-size:16px;font-weight:600;color:var(--dim)}
+.prof .pa{font-size:16px;font-weight:800;color:var(--accent)}
+.prof .pw{font-size:15px;font-weight:700;color:var(--warn)}
+.jf{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:6px}
+.jmsg{margin:8px 0 0;color:var(--dim);font-size:16px;font-weight:600}
+.jlist{list-style:none;margin:8px 0 0;padding:0;max-height:480px;overflow-y:auto;border-top:1px solid var(--line)}
+.jl{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 10px;padding:6px 4px;border-bottom:1px solid var(--line)}
+.jl .jt,.jl .js{font-size:15px;font-weight:600;color:var(--dim)}
+.jl .jfr{font-size:18px}
+.jl .jme{font-size:15px;font-weight:800;color:var(--accent)}
+.jl .jx{flex-basis:100%;font-size:17px;overflow-wrap:anywhere}
+.jl.me{background:var(--pass);border-left:5px solid var(--accent);padding-left:8px}
+@media (min-width:900px){.jl .jx{flex:1 1 300px}}
+.wst{display:grid;grid-template-columns:1fr;gap:6px 12px;padding:8px 12px}
+@media (min-width:700px){.wst{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.wst .banner{grid-column:1/-1;margin:4px 0 0}
+.wrep{grid-column:1/-1;margin-top:4px}
+.wrep .lbl .val{color:var(--fg);font-size:19px}
+.wl .wc{font-size:20px;font-weight:750}
+.wl .wg{font-size:18px;font-weight:650}
+.wl .wd{font-size:18px}
+.wl .wx{flex-basis:100%;font-size:16px;font-weight:600;color:var(--dim)}
+/* gain: auto RF gain and audio clean-up */
+#gAuto{margin:6px 0 0}
+#gAuto .btn small,#auSl .btn small,.augrid .btn small{display:block;font-size:14px;font-weight:600}
+#gWhy{margin:4px 0 0}
+body[data-view=listen] #gWhy{display:none}
+.augrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:6px;margin-top:6px}
+.augrid .btn{font-size:18px;line-height:1.1;text-align:left;padding:4px 10px}
+@media (min-width:700px){#jStat{grid-template-columns:repeat(6,auto)}}
+/* band plan and the band picker */
+.seg{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:6px;margin-top:6px}
+.bgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:6px;margin-top:8px}
+.bbtn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0;min-height:64px;padding:4px;line-height:1.1;text-align:center;width:100%}
+.bbtn .bb{font-size:21px;font-weight:750}
+.bbtn .bf{font-size:14px;font-weight:600;color:var(--dim)}
+.bbtn .ba{font-size:14px;font-weight:800;color:var(--accent)}
+.bbtn .bw{font-size:14px;font-weight:700;color:var(--warn)}
+.bbtn.cur{border:3px solid var(--accent);background:var(--panel);border-radius:10px;min-height:64px}
+.bbtn[aria-pressed=true] .bf,.bbtn[aria-pressed=true] .bw{color:inherit}
+.bpwhy{margin:4px 0 2px;font-size:21px;font-weight:750;overflow-wrap:anywhere}
+.bpsub{margin:0 0 4px;font-size:16px;font-weight:600;color:var(--dim)}
+.bpk{margin:12px 0 0;font-size:15px;color:var(--dim);font-weight:700}
+.bpstep{display:grid;grid-template-columns:72px 1fr 72px;gap:6px;align-items:center;margin-top:6px}
+.bpstep .val{text-align:center;font-size:20px;font-weight:700}
+.bpcred{font-size:14px;color:var(--dim);margin:6px 0 0}
+.bpcred a{color:var(--accent)}
+/* ---------------------------------------------------------------- station map (map helper) */
+.mapc .btn.wide{margin-top:0}
+.mapv{position:relative;height:min(62vh,520px);margin-top:8px;border:1px solid var(--line);border-radius:10px;overflow:hidden;
+  background:var(--plot);touch-action:none;user-select:none;-webkit-user-select:none;cursor:grab}
+@media (min-width:900px){.mapv{height:min(70vh,640px)}}
+.mtiles{position:absolute;inset:0;overflow:hidden;isolation:isolate}
+.mtiles img{position:absolute;left:0;top:0;pointer-events:none;-webkit-user-drag:none;max-width:none}
+:root[data-theme=dark] .mtiles img{filter:invert(1) hue-rotate(180deg) brightness(.8) contrast(.9)}
+@media (prefers-color-scheme:dark){:root[data-theme=auto] .mtiles img{filter:invert(1) hue-rotate(180deg) brightness(.8) contrast(.9)}}
+/* Night: grey, inverted (dark land), then multiplied by pure red, so no tile pixel can be anything but red or black */
+:root[data-theme=night] .mtiles img{filter:grayscale(1) invert(1) brightness(.85) contrast(1.15)}
+:root[data-theme=night] .mtiles::after{content:"";position:absolute;inset:0;background:#f00;mix-blend-mode:multiply;z-index:1}
+.mapv canvas{position:absolute;inset:0;width:100%;height:100%;background:transparent;border-radius:0;touch-action:none;cursor:inherit}
+.mattr{position:absolute;right:0;bottom:0;font-size:13px;font-weight:600;padding:1px 6px;background:var(--panel);color:var(--dim);border-top-left-radius:6px;opacity:.9}
+.mctl{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}
+.mctl .btn{font-size:19px;padding:2px;min-width:0}
+.mleg{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:8px;font-size:17px;font-weight:650}
+.mleg .s{font-size:20px;margin-right:4px}
+.mk-js8{color:var(--accent)}.mk-wspr{color:var(--mark)}.mk-me{color:var(--fg)}.mk-hollow{color:var(--dim)}.mleg .s.big{font-size:28px;line-height:20px}
+.minfo{margin-top:8px;border-top:1px solid var(--line);padding-top:6px;font-size:17px}
+.minfo .mi+.mi{border-top:1px solid var(--line);margin-top:6px;padding-top:6px}
+.minfo .mc{font-size:22px;font-weight:750;margin-right:8px}
+.minfo .mm{font-size:15px;font-weight:800;border:2px solid currentColor;border-radius:6px;padding:0 5px}
+.minfo .md{display:block;font-size:17px;color:var(--dim);font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="id"><span class="app">rxd</span><span id="profile">—</span><span id="modeTag" class="tag" hidden></span></div>
+  <div id="conn" class="pill dimc" aria-live="polite">◌ Connecting</div>
+</header>
+<nav id="views" class="views" aria-label="View" hidden></nav>
+<div id="down" class="banner" hidden>✕ Disconnected from rxd. Retrying.</div>
+<div id="err" class="banner" hidden></div>
+<div id="sw" class="banner sw" role="status" aria-live="polite" hidden><span id="swT"></span><span id="swS" class="sub"></span></div>
+<div id="swErr" class="banner flip" role="alert" hidden><span id="swErrT"></span><button type="button" class="btn" id="swErrOk">OK</button></div>
+<div id="flip" class="banner flip" role="alert" hidden><span id="flipT"></span><button type="button" class="btn" id="flipOk">✓ Done, it's flipped</button></div>
+<div id="note" class="banner sw" hidden></div>
+<section class="card" id="now" data-v="listen" data-live>
+  <div class="lbl"><span>Station</span><span id="nMode" class="tag"></span></div>
+  <div id="nName" class="nname">—</div>
+  <div id="nFreq" class="nfreq">—</div>
+  <div class="meter">
+    <div class="mbar" role="meter" aria-label="Signal level" aria-valuemin="-100" aria-valuemax="0" id="mbar2"><i id="mfill2"></i></div>
+    <div id="mnum2" class="mnum">— dBFS</div>
+    <div class="mscale"><span>−100</span><span>−75</span><span>−50</span><span>−25</span><span>0</span></div>
+  </div>
+</section>
+<div class="top" data-v="listen manual" data-live>
+  <div id="hiu" class="hiu"><b id="hiuW">Ham It Up: —</b><span id="hiuS"></span></div>
+  <div class="stats" data-v="manual">
+    <div class="stat"><span class="k">Receiver</span><span id="sRx" class="v">—</span></div>
+    <div class="stat"><span class="k">DSP CPU</span><span id="sCpu" class="v">—</span></div>
+    <div class="stat"><span class="k">Blocks</span><span id="sDrop" class="v">—</span></div>
+  </div>
+</div>
+<section class="card" id="listenCard" data-v="listen manual" data-live>
+  <div class="lbl"><span>Audio on this device</span><span id="aDepth"></span></div>
+  <button type="button" class="btn big" id="listen" aria-pressed="false">▶ Listen on this device</button>
+  <p id="aState" class="astate" role="status">■ Not listening</p>
+  <div class="sl"><div class="lbl"><label for="pvol">Volume on this device</label><span id="pvolV" class="val">—</span></div>
+    <input type="range" id="pvol" min="0" max="150" step="1"></div>
+  <button type="button" class="btn wide" id="mute" aria-pressed="false" disabled>Mute uConsole speaker</button>
+  <p class="note">Audio may stop when the phone locks or the browser goes to the background.</p>
+</section>
+<section class="card" id="bPlan" data-v="digital" data-live hidden>
+  <div class="lbl"><span>Band plan</span><span id="bpState"></span></div>
+  <p id="bpWhy" class="bpwhy" role="status" aria-live="polite">—</p>
+  <p id="bpSub" class="bpsub"></p>
+  <div class="row2" role="group" aria-label="Band plan"><button type="button" class="btn" id="bpAuto">Auto</button><button type="button" class="btn" id="bpMan">Manual</button></div>
+  <div id="bpAutoBox">
+    <p class="bpk">Auto listens for</p>
+    <div class="row2" role="group" aria-label="Auto listens for"><button type="button" class="btn" id="bpWspr">WSPR</button><button type="button" class="btn" id="bpJs8">JS8</button></div>
+  </div>
+  <p id="bpCond" class="bpsub"></p>
+  <p id="bpCred" class="bpcred" hidden></p>
+  <p id="bpMsg" class="msg" role="status" hidden></p>
+  <button type="button" class="btn wide" id="bpMore" aria-expanded="false" aria-controls="bpSet">Bands and timing ▾</button>
+  <div id="bpSet" hidden>
+    <p class="bpk">Bands Auto may use</p>
+    <div id="bpBands" class="bgrid" role="group" aria-label="Bands Auto may use"></div>
+    <button type="button" class="btn wide" id="bpDef">Use the default bands</button>
+    <p class="bpk">Other side of the Ham It Up</p>
+    <div class="row2" role="group" aria-label="Other side of the Ham It Up"><button type="button" class="btn" id="bpSideOff">Stay on this side</button><button type="button" class="btn" id="bpSideOn">Allow, I'll flip it</button></div>
+    <p class="bpk">Time on each band when scanning</p>
+    <div class="bpstep"><button type="button" class="btn" id="bpDwDn" aria-label="Less time on each band">−</button><span id="bpDw" class="val">—</span><button type="button" class="btn" id="bpDwUp" aria-label="More time on each band">+</button></div>
+    <p class="bpk">Check for a better band every</p>
+    <div id="bpEvery" class="seg" role="group" aria-label="Check for a better band every"></div>
+    <button type="button" class="btn wide" id="bpScan">Scan the bands now</button>
+  </div>
+</section>
+<section class="card" id="jPick" data-v="digital">
+  <div class="lbl"><span>Mode and frequency</span></div>
+  <div id="jPickL"></div>
+</section>
+<section class="card jstat" id="jStat" data-v="digital" data-live>
+  <div><span class="k">Ham It Up</span><span id="jHiu" class="v">—</span></div>
+  <div><span class="k">Receiver</span><span id="jRx" class="v">—</span></div>
+  <div><span class="k">Signal</span><span id="jLvl" class="v">— dBFS</span></div>
+  <div><span class="k">Heard</span><span id="jHeard" class="v">—</span></div>
+  <div><span class="k">Clock</span><span id="jClock" class="v">—</span></div>
+  <div id="jGainC" hidden><span class="k">RF gain</span><span id="jGain" class="v">—</span></div>
+  <p id="jClockBad" class="banner jclock" role="alert" hidden></p>
+</section>
+<section class="card wst" id="wStat" data-v="digital" data-live hidden>
+  <div><span class="k">Cycle</span><span id="wCycle" class="v">—</span></div>
+  <div><span class="k">Last slot</span><span id="wLast" class="v">—</span></div>
+  <div><span class="k">Reporting</span><span id="wRep" class="v">—</span></div>
+  <p id="wErr" class="banner" role="alert" hidden></p>
+  <div id="wRepSl" class="wrep" hidden><div class="lbl"><span>Report spots to WSPRnet</span><span id="wRepS" class="val">—</span></div>
+    <div class="row2" role="group" aria-label="Report spots to WSPRnet"><button type="button" class="btn" id="wRepOff">Off</button><button type="button" class="btn" id="wRepOn">On</button></div>
+    <p id="wMsg" class="msg" role="status" hidden></p></div>
+</section>
+<section class="card mapc" id="mapCard" data-v="digital" data-live>
+  <button type="button" class="btn wide" id="mapTog" aria-expanded="false" aria-controls="mapBody">▸ Show map of stations</button>
+  <div id="mapBody" hidden>
+    <div class="mapv" id="mapV" role="application" aria-label="Map of stations heard. Drag to pan, pinch or use the buttons to zoom, tap a station for its details.">
+      <div class="mtiles" id="mTiles"></div>
+      <canvas id="mCan"></canvas>
+      <div class="mattr" id="mAttr" hidden></div>
+    </div>
+    <div class="mctl" role="group" aria-label="Map controls">
+      <button type="button" class="btn" id="mOut" aria-label="Zoom out">−</button>
+      <button type="button" class="btn" id="mIn" aria-label="Zoom in">+</button>
+      <button type="button" class="btn" id="mFit">Fit all</button>
+      <button type="button" class="btn" id="mPath" aria-pressed="false">Paths</button>
+    </div>
+    <div class="mleg" id="mLeg"></div>
+    <div class="minfo" id="mInfo" role="status" aria-live="polite"></div>
+    <p class="jmsg" id="mMsg"></p>
+  </div>
+</section>
+<section class="card" id="js8" data-v="digital manual" data-live hidden>
+  <div class="lbl"><span>JS8 decodes, newest first</span><span id="jCount"></span></div>
+  <div class="jf"><input type="text" id="jFilter" placeholder="Filter by callsign" aria-label="Filter decodes by callsign" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="done">
+    <button type="button" class="btn" id="jClear" hidden>Clear</button></div>
+  <p id="jMsg" class="jmsg" role="status"></p>
+  <ol id="jList" class="jlist"></ol>
+</section>
+<section class="card" id="wspr" data-v="digital manual" data-live hidden>
+  <div class="lbl"><span>WSPR spots, newest first</span><span id="wCount"></span></div>
+  <div class="jf"><input type="text" id="wFilter" placeholder="Filter by callsign or grid" aria-label="Filter spots by callsign or grid" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="done">
+    <button type="button" class="btn" id="wClear" hidden>Clear</button></div>
+  <p id="wsMsg" class="jmsg" role="status"></p>
+  <ol id="wList" class="jlist"></ol>
+</section>
+<section class="card" id="lPick" data-v="listen">
+  <div class="lbl"><span>Stations</span></div>
+  <div id="lPickL"></div>
+</section>
+<fieldset id="qual" class="card" data-v="listen" data-live disabled>
+  <div class="lbl"><span>Bandwidth</span><span id="bwPV" class="val">—</span></div>
+  <div class="row3" id="bwP" role="group" aria-label="Bandwidth"></div>
+</fieldset>
+<fieldset id="ctl" data-v="manual" disabled>
+<div class="layout">
+  <section class="card tuner">
+    <div class="lbl"><span>Dial, MHz</span></div>
+    <div id="freq" class="freq live" aria-live="off"><span id="fM">—</span><span id="fH" class="hz"></span></div>
+    <div class="meter live">
+      <div class="mbar" role="meter" aria-label="Signal level" aria-valuemin="-100" aria-valuemax="0" id="mbar"><i id="mfill"></i></div>
+      <div id="mnum" class="mnum">— dBFS</div>
+      <div class="mscale"><span>−100</span><span>−75</span><span>−50</span><span>−25</span><span>0</span></div>
+    </div>
+    <div class="row2">
+      <button type="button" class="btn" id="dn">− 1 kHz</button>
+      <button type="button" class="btn" id="up">+ 1 kHz</button>
+    </div>
+    <div class="steps" role="group" aria-label="Tuning step" id="steps"></div>
+    <form id="entry" autocomplete="off">
+      <input type="text" id="fin" inputmode="decimal" enterkeyhint="go" spellcheck="false" aria-label="Frequency in MHz, kHz or Hz" placeholder="7.078, 146.52 or Hz">
+      <button class="btn" type="submit">Tune</button>
+    </form>
+    <p id="msg" class="msg" role="status" hidden></p>
+    <p class="hint">Keys: ← → tune by the step, ↑ ↓ change the step. Scroll over the dial or spectrum to tune.</p>
+  </section>
+  <section class="card scope">
+    <div class="lbl"><span>Spectrum and waterfall</span><span id="tapHint">Tap or click to tune</span></div>
+    <canvas id="spec" aria-label="Spectrum. Click to tune."></canvas>
+    <canvas id="wf" aria-label="Waterfall. Click to tune."></canvas>
+  </section>
+  <section class="card modes">
+    <div class="lbl"><span>Mode</span></div>
+    <div class="mgrid" role="group" aria-label="Mode" id="modes"></div>
+  </section>
+  <section class="card sliders" id="sliders">
+    <div class="sl"><div class="lbl"><label for="bw">Bandwidth</label><span id="bwV" class="val">—</span></div>
+      <input type="range" id="bw" min="300" max="4000" step="100"></div>
+    <div class="sl" id="gainSl"><div class="lbl"><label for="gain">RF gain</label><span id="gainV" class="val">—</span></div>
+      <div class="row2" id="gAuto" role="group" aria-label="RF gain: automatic or set by hand" hidden><button type="button" class="btn" id="gAutoOff">By hand</button><button type="button" class="btn" id="gAutoOn">Auto</button></div>
+      <input type="range" id="gain" min="0" max="50" step="0.1">
+      <p id="gWhy" class="note" hidden></p></div>
+    <div class="sl" id="volSl"><div class="lbl"><label for="vol">uConsole speaker</label><span id="volV" class="val">—</span></div>
+      <input type="range" id="vol" min="0" max="1000" step="1"></div>
+  </section>
+</div>
+</fieldset>
+<fieldset class="card" id="audioCard" data-v="manual" data-live disabled hidden>
+  <div class="lbl"><span>Audio clean-up</span><span id="auState" class="val"></span></div>
+  <div class="augrid" role="group" aria-label="Audio clean-up" id="auGrid"></div>
+  <p class="note">For the uConsole speaker and the audio on this device. The JS8 and WSPR decoders always get the audio untouched.</p>
+</fieldset>
+<section class="card" id="aPick" data-v="manual">
+  <div class="lbl"><span>Profiles</span></div>
+  <div id="aPickL" class="plist"></div>
+</section>
+<p id="pmsg" class="msg" role="status" hidden></p>
+<section class="card" id="appear0">
+  <div class="lbl"><span>Appearance</span></div>
+  <div class="appear" role="group" aria-label="Appearance" id="appear"></div>
+</section>
+</div>
+<script>
+"use strict";
+(function () {
+const $ = id => document.getElementById(id);
+const STEPS = [10, 100, 1e3, 5e3, 12.5e3, 100e3, 1e6];
+const MODES = ["USB", "LSB", "AM", "FM", "WFM"];
+const BWR = {USB: [300, 4000, 100], LSB: [300, 4000, 100], AM: [2000, 20000, 500], FM: [5000, 30000, 500], WFM: [50000, 250000, 5000]};
+const FMIN = 100e3, FMAX = 1.7e9;
+const THEMES = [["auto", "Automatic"], ["light", "Light"], ["dark", "Dark"], ["night", "Night"]];
+
+function load(k) { try { return localStorage.getItem("rxd." + k); } catch (e) { return null; } }
+function store(k, v) { try { localStorage.setItem("rxd." + k, v); } catch (e) {} }
+function forget(k) { try { localStorage.removeItem("rxd." + k); } catch (e) {} }
+function now() { return performance.now(); }
+
+// ---------------------------------------------------------------- state
+let st = null;            // last status from rxd
+let conn = "connecting";  // connecting | ok | down
+let fails = 0;
+let localFreq = null, localMode = null;
+let step = +load("step"); if (STEPS.indexOf(step) < 0) step = 1e3;
+const holdUntil = {}, active = {};
+function held(k) { return !!active[k] || (holdUntil[k] || 0) > now(); }
+function hold(k, ms) { holdUntil[k] = Math.max(holdUntil[k] || 0, now() + ms); }
+function release(k) { holdUntil[k] = 0; }
+
+// ---------------------------------------------------------------- formatting
+function freqParts(hz) {
+  hz = Math.round(hz);
+  const m = Math.floor(hz / 1e6), r = hz - m * 1e6;
+  return [m + "." + String(Math.floor(r / 1000)).padStart(3, "0"), String(r % 1000).padStart(3, "0")];
+}
+function trim(x, d) { return x.toFixed(d).replace(/\.?0+$/, ""); }
+function fmtHz(v) {
+  if (v >= 1e6) return [trim(v / 1e6, 3), "MHz"];
+  if (v >= 1e3) return [trim(v / 1e3, 2), "kHz"];
+  return [String(v), "Hz"];
+}
+function fmtBw(v) { const p = fmtHz(v); return p[0] + " " + p[1]; }
+// rxd sends UTC: "2026-11-06 10:47:03" (JS8) or "2026-11-06T12:20:00Z" (WSPR).
+// Everything shown is the browser's local time, 24 hour.
+function utcDate(t) {
+  const m = /^(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d)(?::(\d\d))?/.exec(String(t || ""));
+  return m ? new Date(Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0))) : null;
+}
+const p2 = n => String(n).padStart(2, "0");
+function hhmm(d, secs) { return p2(d.getHours()) + ":" + p2(d.getMinutes()) + (secs ? ":" + p2(d.getSeconds()) : ""); }
+// a time for a list line: the day too when it isn't today
+function lineTime(t, secs) {
+  const d = utcDate(t);
+  if (!d) return String(t || "");
+  const today = new Date().toDateString() === d.toDateString();
+  return (today ? "" : d.toLocaleDateString(undefined, {month: "short", day: "numeric"}) + " ") + hhmm(d, secs);
+}
+function slotTime(t) { const d = utcDate(t); return d ? hhmm(d) : "—"; }
+function signed(n) { return (n > 0 ? "+" : n < 0 ? "−" : "") + Math.abs(n); }
+function parseFreq(t) {
+  t = t.trim().toLowerCase().replace(/[\s,_']/g, "");
+  const m = t.match(/^(\d+(?:\.\d*)?|\.\d+)(mhz|m|khz|k|hz)?$/);
+  if (!m) return null;
+  let v = parseFloat(m[1]); const u = m[2] || "";
+  if (u[0] === "m") v *= 1e6;
+  else if (u[0] === "k") v *= 1e3;
+  else if (u === "hz") {}
+  else if (v < 2000) v *= 1e6;      // bare 7.078, 146.52, 1296: MHz
+  else if (v < 100000) v *= 1e3;    // bare 14074: kHz
+  return Math.round(v);             // bare 7078000: Hz
+}
+
+// ---------------------------------------------------------------- network
+async function api(path, body) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 4000);
+  try {
+    const opt = body === undefined ? {cache: "no-store", signal: ctl.signal}
+      : {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body), signal: ctl.signal};
+    const r = await fetch(path, opt);
+    let doc = null;
+    try { doc = await r.json(); } catch (e) {}
+    return {ok: r.ok, status: r.status, doc: doc};
+  } finally { clearTimeout(t); }
+}
+
+let statusTimer = 0, backoff = 0;
+async function pollStatus() {
+  clearTimeout(statusTimer);
+  try {
+    const r = await api("/api/status");
+    if (!r.ok || !r.doc || typeof r.doc.freq !== "number") throw new Error("bad status");
+    fails = 0; backoff = 0;
+    setConn("ok");
+    applyStatus(r.doc);
+  } catch (e) {
+    fails++;
+    backoff = Math.min(backoff ? backoff * 2 : 1000, switching ? 1000 : 10000);
+    if (fails >= 2 || conn !== "ok") setConn("down");
+  }
+  statusTimer = setTimeout(pollStatus, backoff || (document.hidden ? 5000 : 500));
+}
+
+// Tuning: fields merge into one pending request; one request in flight at a time.
+let pend = {}, inflight = false, tuneTimer = 0, entryText = "";
+function tune(fields, delay) {
+  Object.assign(pend, fields);
+  for (const k in fields) hold(k, 2000);
+  if (!delay) { clearTimeout(tuneTimer); tuneTimer = 0; flush(); }
+  else if (!tuneTimer) tuneTimer = setTimeout(() => { tuneTimer = 0; flush(); }, delay);
+}
+async function flush() {
+  if (inflight || !Object.keys(pend).length) return;
+  const body = pend; pend = {}; inflight = true;
+  try {
+    const r = await api("/api/tune", body);
+    if (r.ok && r.doc && typeof r.doc.freq === "number") {
+      clearMsg();
+      if ("freq" in body) entryText = "";
+      for (const k in body) if (!(k in pend) && !active[k]) { release(k); hold(k, 400); }
+      setConn("ok");
+      applyStatus(r.doc);
+    } else {
+      fail(body, "rxd refused: " + ((r.doc && r.doc.error) || ("HTTP " + r.status)));
+    }
+  } catch (e) {
+    fail(body, "Could not reach rxd. Nothing was changed.");
+  }
+  inflight = false;
+  if (Object.keys(pend).length) flush();
+}
+function fail(body, text) {
+  showMsg(text);
+  if ("freq" in body && entryText && !$("fin").value) $("fin").value = entryText;
+  for (const k in body) if (!(k in pend)) release(k);
+  if ("freq" in body && !("freq" in pend) && st) localFreq = st.freq;
+  if ("mode" in body && !("mode" in pend) && st) localMode = st.mode;
+  if (st) applyStatus(st);
+}
+function showMsg(t) { const m = $("msg"); m.textContent = "✕ " + t; m.hidden = false; }
+function clearMsg() { $("msg").hidden = true; }
+
+// ---------------------------------------------------------------- status rendering
+let viewKey = "";
+let lastDropped = null, dropAt = -1e9, lastBlocks = null, stallCount = 0, gainsKey = "";
+function setText(el, t, cls) {
+  if (el.textContent !== t) el.textContent = t;
+  if (cls !== undefined && el.className !== cls) el.className = cls;
+}
+function setConn(c) {
+  if (c === conn) return;
+  conn = c;
+  renderConn();
+  if (c === "down") {
+    setText($("sRx"), "— Unknown", "v dimc"); setText($("sCpu"), "—", "v dimc"); setText($("sDrop"), "—", "v dimc");
+    if (st) { $("hiu").classList.add("stale"); setText($("hiuS"), "Last known. rxd is not answering."); }
+    drawSpecMsg(downMsg());
+  }
+  if (c === "ok") { pollSpecSoon(); if (profAvail && !profiles) loadProfiles(); }
+}
+function downMsg() { return switching ? "■ Switching to " + switching.name + "…" : "✕ Disconnected"; }
+function renderConn() {
+  const el = $("conn");
+  if (switching) setText(el, "■ Switching", "pill warn");
+  else if (conn === "ok") setText(el, "● Connected", "pill ok");
+  else if (conn === "down") setText(el, "✕ Disconnected", "pill bad");
+  $("down").hidden = conn !== "down" || !!switching;
+  $("ctl").disabled = $("qual").disabled = $("audioCard").disabled = conn !== "ok" || !!switching;
+  $("sw").hidden = !switching;
+  if (switching) $("note").hidden = true;
+  renderProfiles(); renderMute();
+}
+
+function applyStatus(s) {
+  st = s;
+  if (switching && s.profile === switching.name) finishSwitch();
+  if (!held("freq")) localFreq = s.freq;
+  if (!held("mode")) localMode = s.mode;
+  renderFreq();
+  setText($("profile"), s.profile || "rxd");
+  const tag = $("modeTag"); tag.hidden = false; setText(tag, localMode);
+  for (const b of $("modes").children) b.setAttribute("aria-pressed", String(b.dataset.m === localMode));
+
+  // Ham It Up
+  const up = s.upconverter_hz > 0, hiu = $("hiu");
+  hiu.className = "hiu" + (up ? " up" : "");
+  setText($("hiuW"), up ? "⇅ Ham It Up: UPCONVERT" : "→ Ham It Up: BYPASS");
+  var below = trim((s.upconvert_below_hz || 30e6) / 1e6, 3) + " MHz";
+  setText($("hiuS"), up ? "Set the switch to UPCONVERT (+" + trim(s.upconverter_hz / 1e6, 3) + " MHz)" + (s.offset_mode === "auto" ? ", below " + below : "")
+    : "Set the switch to BYPASS" + (s.offset_mode === "auto" ? ", " + below + " and up" : ""));
+
+  // receiver
+  if (s.error) { $("err").hidden = false; setText($("err"), "✕ rxd error: " + s.error); } else $("err").hidden = true;
+  if (lastBlocks !== null && s.blocks === lastBlocks) stallCount++; else stallCount = 0;
+  lastBlocks = s.blocks;
+  if (!s.running) setText($("sRx"), "■ Stopped", "v bad");
+  else if (s.error) setText($("sRx"), "✕ Error", "v bad");
+  else if (stallCount >= 3) setText($("sRx"), "▲ No samples", "v warn");
+  else setText($("sRx"), "● Receiving", "v ok");
+
+  const cpu = Math.round((s.dsp_cpu || 0) * 100);
+  setText($("sCpu"), (cpu >= 80 ? "▲ " : "") + cpu + " %", cpu >= 80 ? "v warn" : "v");
+
+  if (lastDropped !== null && s.dropped > lastDropped) dropAt = now();
+  lastDropped = s.dropped;
+  if (now() - dropAt < 10000) setText($("sDrop"), "▲ Dropping (" + s.dropped + " lost)", "v warn");
+  else if (s.dropped > 0) setText($("sDrop"), "✓ OK, " + s.dropped + " lost earlier", "v");
+  else setText($("sDrop"), "✓ None lost", "v ok");
+
+  // meter
+  const lv = s.level_dbfs;
+  if (typeof lv === "number") {
+    const pct = Math.max(0, Math.min(100, (lv + 100)));
+    for (const i of ["", "2"]) {
+      $("mfill" + i).style.width = pct + "%";
+      $("mbar" + i).setAttribute("aria-valuenow", String(lv));
+      setText($("mnum" + i), (lv < 0 ? "−" : "") + Math.abs(lv).toFixed(1) + " dBFS");
+    }
+  } else for (const i of ["", "2"]) { $("mfill" + i).style.width = "0"; setText($("mnum" + i), "— dBFS"); }
+
+  // sliders
+  if (!held("bandwidth")) setBw(localMode, s.bandwidth);
+  const gains = Array.isArray(s.gains) ? s.gains : [];
+  const gk = gains.join(",");
+  if (gk !== gainsKey) { gainsKey = gk; setupGain(gains); }
+  if (!held("gain_db")) setGain(s.gain_db);
+  if (!held("volume")) setVol(s.volume);
+
+  syncMute();
+  autoView();
+  const vk = [view, curKind(), pdec(s), profAvail, A.on].join();
+  if (vk !== viewKey) { viewKey = vk; renderView(); }
+  renderProfiles(); renderQual();
+  renderJs8Stat(s, $("sRx").textContent, $("sRx").className);
+  renderWsprStat(s);
+  renderGainAudio(s);
+  renderBandPlan(s);
+  if (profAvail && profiles && !switching && !profLoading && s.profile !== profiles.active && s.profile !== profAskedFor) loadProfiles();
+  if (A.on && rateFor(s.mode) !== A.want) connectAudio();
+  js8Sync(); wsprSync();
+}
+
+function renderFreq() {
+  if (localFreq == null) return;
+  const p = freqParts(localFreq);
+  setText($("fM"), p[0]); setText($("fH"), " " + p[1]);
+}
+
+// ---------------------------------------------------------------- tuning controls
+function clampF(f) { return Math.max(FMIN, Math.min(FMAX, f)); }
+function tuneTo(f) {
+  f = Math.round(clampF(f));
+  localFreq = f; renderFreq();
+  tune({freq: f}, 0);
+}
+function stepBy(n) {
+  if (localFreq == null || conn !== "ok") return;
+  const q = localFreq / step, e = 1e-6;
+  const k = n > 0 ? Math.floor(q + e) + n : Math.ceil(q - e) + n;
+  tuneTo(k * step);
+}
+function renderSteps() {
+  const p = fmtHz(step), t = p[0] + " " + p[1];
+  $("dn").textContent = "− " + t; $("up").textContent = "+ " + t;
+  $("dn").setAttribute("aria-label", "Tune down " + t); $("up").setAttribute("aria-label", "Tune up " + t);
+  for (const b of $("steps").children) b.setAttribute("aria-pressed", String(+b.dataset.s === step));
+}
+function setStep(s) { step = s; store("step", String(s)); renderSteps(); }
+for (const s of STEPS) {
+  const b = document.createElement("button");
+  const p = fmtHz(s);
+  b.type = "button"; b.className = "btn"; b.dataset.s = s;
+  b.setAttribute("aria-label", "Step " + p[0] + " " + p[1]);
+  b.innerHTML = p[0] + "<small>" + p[1] + "</small>";
+  b.onclick = () => setStep(s);
+  $("steps").appendChild(b);
+}
+$("dn").onclick = () => stepBy(-1);
+$("up").onclick = () => stepBy(1);
+renderSteps();
+
+$("entry").onsubmit = e => {
+  e.preventDefault();
+  const inp = $("fin"), t = inp.value;
+  if (!t.trim()) { showMsg("Type a frequency first: 7.078 (MHz), 14074 (kHz) or 7078000 (Hz)."); return; }
+  const f = parseFreq(t);
+  if (f == null) { showMsg("Not a frequency: " + t.trim() + ". Type MHz (7.078), kHz (14074) or Hz (7078000)."); return; }
+  if (f < FMIN || f > FMAX) { showMsg("Out of range: rxd tunes 0.1 to 1700 MHz."); return; }
+  inp.value = ""; inp.blur();
+  tuneTo(f);
+  entryText = t.trim();
+};
+
+for (const m of MODES) {
+  const b = document.createElement("button");
+  b.type = "button"; b.className = "btn"; b.textContent = m; b.dataset.m = m;
+  b.onclick = () => {
+    if (m === localMode) return;
+    localMode = m;
+    for (const x of $("modes").children) x.setAttribute("aria-pressed", String(x.dataset.m === m));
+    setText($("modeTag"), m);
+    release("bandwidth");
+    tune({mode: m}, 0);
+  };
+  $("modes").appendChild(b);
+}
+
+// ---------------------------------------------------------------- sliders
+function fill(el) {
+  const a = +el.min, b = +el.max, v = +el.value;
+  el.style.setProperty("--p", (b > a ? (v - a) / (b - a) * 100 : 0) + "%");
+}
+function track(el, key) {
+  el.addEventListener("pointerdown", () => { active[key] = true; });
+  const up = () => { if (active[key]) { active[key] = false; hold(key, 1500); } };
+  window.addEventListener("pointerup", up); window.addEventListener("pointercancel", up);
+  el.addEventListener("focus", () => hold(key, 1500));
+}
+const bwEl = $("bw"), gainEl = $("gain"), volEl = $("vol");
+let gainSteps = [];
+function setBw(mode, bw) {
+  const r = BWR[mode] || [100, 250000, 100];
+  bwEl.min = r[0]; bwEl.max = r[1]; bwEl.step = r[2];
+  bwEl.value = Math.max(r[0], Math.min(r[1], bw)); fill(bwEl);
+  setText($("bwV"), fmtBw(Math.round(bw)));
+}
+bwEl.oninput = () => { const v = +bwEl.value; setText($("bwV"), fmtBw(v)); fill(bwEl); tune({bandwidth: v}, 200); };
+function setupGain(g) {
+  gainSteps = g.slice().sort((a, b) => a - b);
+  if (gainSteps.length) { gainEl.min = 0; gainEl.max = gainSteps.length - 1; gainEl.step = 1; }
+  else { gainEl.min = 0; gainEl.max = 50; gainEl.step = 0.1; }
+}
+function gainFromEl() { return gainSteps.length ? gainSteps[+gainEl.value] : +gainEl.value; }
+function setGain(db) {
+  if (db == null) { setText($("gainV"), "—"); return; }
+  if (gainSteps.length) {
+    let bi = 0;
+    gainSteps.forEach((g, i) => { if (Math.abs(g - db) < Math.abs(gainSteps[bi] - db)) bi = i; });
+    gainEl.value = bi;
+  } else gainEl.value = db;
+  fill(gainEl);
+  setText($("gainV"), db.toFixed(1) + " dB");
+}
+gainEl.oninput = () => { const v = gainFromEl(); setText($("gainV"), v.toFixed(1) + " dB"); fill(gainEl); tune({gain_db: v}, 200); };
+// Volume 0..4 on a squared taper so the useful low end gets most of the travel.
+function setVol(v) {
+  if (v == null) return;
+  volEl.value = Math.round(Math.sqrt(Math.max(0, v) / 4) * 1000); fill(volEl);
+  setText($("volV"), Math.round(v * 100) + " %");
+}
+volEl.oninput = () => {
+  const p = +volEl.value / 1000, v = Math.round(4 * p * p * 100) / 100;
+  setText($("volV"), Math.round(v * 100) + " %"); fill(volEl); tune({volume: v}, 200);
+};
+track(bwEl, "bandwidth"); track(gainEl, "gain_db"); track(volEl, "volume");
+
+// ---------------------------------------------------------------- keys and wheel
+document.addEventListener("keydown", e => {
+  const t = e.target;
+  if (e.altKey || e.ctrlKey || e.metaKey || $("ctl").disabled) return;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+  const i = STEPS.indexOf(step);
+  if (e.key === "ArrowRight") stepBy(1);
+  else if (e.key === "ArrowLeft") stepBy(-1);
+  else if (e.key === "ArrowUp") setStep(STEPS[Math.min(STEPS.length - 1, i + 1)]);
+  else if (e.key === "ArrowDown") setStep(STEPS[Math.max(0, i - 1)]);
+  else return;
+  e.preventDefault();
+});
+let wheelAcc = 0;
+function onWheel(e) {
+  if ($("ctl").disabled) return;
+  e.preventDefault();
+  wheelAcc += e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
+  while (Math.abs(wheelAcc) >= 100) { stepBy(wheelAcc < 0 ? 1 : -1); wheelAcc -= Math.sign(wheelAcc) * 100; }
+}
+
+// ---------------------------------------------------------------- spectrum and waterfall
+const spec = $("spec"), wf = $("wf");
+const wbuf = document.createElement("canvas");
+let col = {}, lut = null, last = null, range = null, ring = [], specMsg = "Waiting for the spectrum";
+const DAY = [[0, 0, 0, 16], [.25, 10, 26, 110], [.5, 29, 127, 214], [.7, 47, 209, 196], [.86, 245, 233, 74], [1, 255, 255, 255]];
+const NIGHT = [[0, 0, 0, 0], [.35, 60, 0, 0], [.7, 165, 8, 0], [1, 255, 40, 20]];
+function buildLut(stops) {
+  const a = new Uint8ClampedArray(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const x = i / 255; let j = 1;
+    while (j < stops.length - 1 && stops[j][0] < x) j++;
+    const s0 = stops[j - 1], s1 = stops[j], f = (x - s0[0]) / (s1[0] - s0[0]);
+    for (let c = 0; c < 3; c++) a[i * 3 + c] = s0[c + 1] + (s1[c + 1] - s0[c + 1]) * f;
+  }
+  return a;
+}
+function isNight() { return document.documentElement.dataset.theme === "night"; }
+function readColors() {
+  const cs = getComputedStyle(document.documentElement);
+  for (const k of ["plot", "grid", "trace", "pass", "mark", "dim", "fg", "bg"]) col[k] = cs.getPropertyValue("--" + k).trim();
+  lut = buildLut(isNight() ? NIGHT : DAY);
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute("content", col.bg);
+  rerenderWaterfall(); redrawSpec();
+}
+function dpr() { return window.devicePixelRatio || 1; }
+function fit(c) {
+  const r = c.getBoundingClientRect(), d = dpr();
+  const w = Math.max(1, Math.round(r.width * d)), h = Math.max(1, Math.round(r.height * d));
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; return true; }
+  return false;
+}
+function onResize() {
+  const a = fit(spec), b = fit(wf);
+  if (b) { wbuf.width = wf.width; wbuf.height = wf.height; rerenderWaterfall(); }
+  if (a || b) redrawSpec();
+}
+function niceStep(span, maxLabels) {
+  const c = [100, 200, 500, 1e3, 2e3, 2.5e3, 5e3, 1e4, 2e4, 2.5e4, 5e4, 1e5, 2e5, 2.5e5, 5e5, 1e6, 2e6, 5e6];
+  for (const s of c) if (span / s <= maxLabels) return s;
+  return 1e7;
+}
+function decimals(s) { let d = 0; while (d < 6 && Math.abs(Math.round(s / 1e6 * 10 ** d) - s / 1e6 * 10 ** d) > 1e-9) d++; return d; }
+function updateRange(bins) {
+  const s = Array.from(bins).sort((a, b) => a - b);
+  const floor = s[Math.floor(s.length * 0.2)], peak = s[s.length - 1];
+  const lo = floor - 8, hi = Math.max(peak + 6, floor + 45);
+  if (!range) range = {lo: lo, hi: hi};
+  else { range.lo += (lo - range.lo) * 0.15; range.hi += (hi - range.hi) * 0.15; }
+}
+function redrawSpec() {
+  if (last && conn === "ok") drawSpec(last); else drawSpecMsg(conn === "down" ? downMsg() : specMsg);
+}
+function drawSpecMsg(text) {
+  if (!spec.width) return;
+  const g = spec.getContext("2d"), d = dpr();
+  g.fillStyle = col.plot; g.fillRect(0, 0, spec.width, spec.height);
+  g.fillStyle = col.dim; g.font = "600 " + Math.round(17 * d) + "px system-ui,sans-serif";
+  g.textAlign = "center"; g.textBaseline = "middle";
+  g.fillText(text, spec.width / 2, spec.height / 2);
+  drawWfView();
+}
+function drawSpec(s) {
+  const g = spec.getContext("2d"), d = dpr(), W = spec.width, H = spec.height;
+  const axis = Math.round(24 * d), ph = H - axis, span = s.stop_hz - s.start_hz;
+  const X = hz => (hz - s.start_hz) / span * W;
+  const lo = range.lo, hi = range.hi, Y = v => ph - (v - lo) / (hi - lo) * ph;
+  g.fillStyle = col.plot; g.fillRect(0, 0, W, H);
+  // passband
+  if (s.passband) { const a = X(s.passband[0]), b = X(s.passband[1]); g.fillStyle = col.pass; g.fillRect(a, 0, Math.max(b - a, d), ph); }
+  // dB grid
+  g.strokeStyle = col.grid; g.lineWidth = d; g.fillStyle = col.dim;
+  g.font = Math.round(13 * d) + "px system-ui,sans-serif"; g.textBaseline = "bottom"; g.textAlign = "left";
+  const dbStep = (hi - lo) > 60 ? 20 : 10, dbs = [];
+  for (let v = Math.ceil(lo / dbStep) * dbStep; v < hi; v += dbStep) {
+    const y = Math.round(Y(v)) + .5; g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke();
+    if (y > 14 * d && v > lo + (hi - lo) * 0.2) dbs.push([v, y]);
+  }
+  // frequency grid and labels
+  const fs = niceStep(span, Math.max(2, Math.floor(W / (62 * d)))), dec = decimals(fs);
+  g.textAlign = "center"; g.textBaseline = "middle";
+  for (let f = Math.ceil(s.start_hz / fs) * fs; f <= s.stop_hz; f += fs) {
+    const x = Math.round(X(f)) + .5;
+    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, ph); g.stroke();
+    const t = (f / 1e6).toFixed(dec);
+    const tw = g.measureText(t).width / 2;
+    if (x - tw > 2 && x + tw < W - 2) g.fillText(t, x, ph + axis / 2);
+  }
+  // trace
+  const n = s.bins.length;
+  g.beginPath();
+  for (let i = 0; i < n; i++) { const x = (i + .5) / n * W, y = Math.max(0, Math.min(ph, Y(s.bins[i]))); i ? g.lineTo(x, y) : g.moveTo(x, y); }
+  g.strokeStyle = col.trace; g.lineWidth = 1.5 * d; g.stroke();
+  g.lineTo(W, ph); g.lineTo(0, ph); g.closePath();
+  g.globalAlpha = .18; g.fillStyle = col.trace; g.fill(); g.globalAlpha = 1;
+  // dB labels over the trace, with a halo
+  g.font = Math.round(13 * d) + "px system-ui,sans-serif"; g.textAlign = "left"; g.textBaseline = "bottom";
+  g.lineWidth = 3 * d; g.strokeStyle = col.plot; g.fillStyle = col.dim;
+  for (const [v, y] of dbs) { const t = (v < 0 ? "−" : "") + Math.abs(v) + " dB"; g.strokeText(t, 4 * d, y - 2 * d); g.fillText(t, 4 * d, y - 2 * d); }
+  // dial marker
+  const dx = Math.round(X(s.dial_hz)) + .5;
+  g.strokeStyle = col.mark; g.lineWidth = 2 * d; g.beginPath(); g.moveTo(dx, 0); g.lineTo(dx, ph); g.stroke();
+  g.strokeStyle = col.grid; g.lineWidth = d; g.beginPath(); g.moveTo(0, ph + .5); g.lineTo(W, ph + .5); g.stroke();
+}
+function rowH() { return Math.max(1, Math.round(2 * dpr())); }
+function paintRow(g, y, r, vs, ve, W) {
+  const h = rowH(), img = g.createImageData(W, h), px = img.data, n = r.bins.length;
+  const lo = range.lo, k = 255 / (range.hi - range.lo), rs = r.start, rspan = r.stop - r.start;
+  for (let x = 0; x < W; x++) {
+    const f0 = vs + x / W * (ve - vs), f1 = vs + (x + 1) / W * (ve - vs);
+    let b0 = Math.floor((f0 - rs) / rspan * n), b1 = Math.floor((f1 - rs) / rspan * n);
+    let ci = 0;
+    if (b1 >= 0 && b0 < n) {
+      b0 = Math.max(0, b0); b1 = Math.min(n - 1, Math.max(b0, b1));
+      let v = r.bins[b0]; for (let b = b0 + 1; b <= b1; b++) if (r.bins[b] > v) v = r.bins[b];
+      ci = Math.max(0, Math.min(255, Math.round((v - lo) * k)));
+    }
+    for (let yy = 0; yy < h; yy++) { const o = (yy * W + x) * 4; px[o] = lut[ci * 3]; px[o + 1] = lut[ci * 3 + 1]; px[o + 2] = lut[ci * 3 + 2]; px[o + 3] = 255; }
+  }
+  g.putImageData(img, 0, y);
+}
+function rerenderWaterfall() {
+  if (!wbuf.width || !lut) return;
+  const g = wbuf.getContext("2d"), W = wbuf.width, H = wbuf.height;
+  g.fillStyle = "rgb(" + lut[0] + "," + lut[1] + "," + lut[2] + ")"; g.fillRect(0, 0, W, H);
+  if (last && range) { const h = rowH(); for (let i = 0; i < ring.length && i * h < H; i++) paintRow(g, i * h, ring[i], last.start_hz, last.stop_hz, W); }
+  drawWfView();
+}
+function addRow(s) {
+  const r = {bins: s.bins, start: s.start_hz, stop: s.stop_hz};
+  const h = rowH(), cap = Math.ceil((wbuf.height || 300) / h) + 1;
+  const moved = !last || last.start_hz !== s.start_hz || last.stop_hz !== s.stop_hz;
+  ring.unshift(r); if (ring.length > cap) ring.length = cap;
+  last = s;
+  if (!wbuf.width) return;
+  if (moved) { rerenderWaterfall(); return; }
+  const g = wbuf.getContext("2d");
+  g.drawImage(wbuf, 0, 0, wbuf.width, wbuf.height - h, 0, h, wbuf.width, wbuf.height - h);
+  paintRow(g, 0, r, s.start_hz, s.stop_hz, wbuf.width);
+  drawWfView();
+}
+function drawWfView() {
+  if (!wf.width) return;
+  const g = wf.getContext("2d"), W = wf.width, H = wf.height, d = dpr();
+  g.drawImage(wbuf, 0, 0);
+  if (!last || conn !== "ok") return;
+  const span = last.stop_hz - last.start_hz, X = hz => (hz - last.start_hz) / span * W;
+  g.strokeStyle = col.mark; g.lineWidth = 2 * d; g.setLineDash([6 * d, 6 * d]);
+  const dx = Math.round(X(last.dial_hz)) + .5; g.beginPath(); g.moveTo(dx, 0); g.lineTo(dx, H); g.stroke();
+  g.setLineDash([]);
+}
+
+let specTimer = 0, specBusy = false, lastSeq = null;
+function pollSpecSoon() { clearTimeout(specTimer); specTimer = setTimeout(pollSpec, 0); }
+async function pollSpec() {
+  clearTimeout(specTimer);
+  if (document.hidden || specBusy || view !== "manual") return;
+  specBusy = true;
+  const t0 = now(); let wait = 200;
+  if (conn === "ok") {
+    try {
+      const r = await api("/api/spectrum");
+      const s = r.doc;
+      if (r.ok && s && Array.isArray(s.bins) && s.bins.length && s.stop_hz > s.start_hz) {
+        specAvail(true);
+        if (s.seq !== lastSeq) { lastSeq = s.seq; updateRange(s.bins); addRow(s); if (conn === "ok") drawSpec(s); }
+      } else {
+        wait = 5000; last = null; specAvail(false);
+        specMsg = r.status === 404 ? "This rxd has no spectrum" : "No spectrum yet"; drawSpecMsg(specMsg);
+      }
+    } catch (e) { wait = 1000; }
+  } else wait = 1000;
+  specBusy = false;
+  if (!document.hidden) specTimer = setTimeout(pollSpec, Math.max(20, wait - (now() - t0)));
+}
+function specAvail(ok) {
+  if (wf.hidden === !ok) return;
+  wf.hidden = !ok; $("tapHint").hidden = !ok;
+  spec.style.cursor = ok ? "" : "default";
+  onResize();
+}
+function canvasTune(e) {
+  if (!last || conn !== "ok") return;
+  const r = e.currentTarget.getBoundingClientRect();
+  const x = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+  const span = last.stop_hz - last.start_hz;
+  let f = last.start_hz + x * span;
+  const q = step <= span / 10 ? step : 100;
+  f = Math.round(f / q) * q;
+  tuneTo(f);
+}
+for (const c of [spec, wf]) { c.addEventListener("click", canvasTune); c.addEventListener("wheel", onWheel, {passive: false}); }
+$("freq").addEventListener("wheel", onWheel, {passive: false});
+
+// ---------------------------------------------------------------- appearance
+function setTheme(t) {
+  document.documentElement.dataset.theme = t;
+  store("theme", t);
+  for (const b of $("appear").children) b.setAttribute("aria-pressed", String(b.dataset.t === t));
+  readColors();
+}
+for (const [t, name] of THEMES) {
+  const b = document.createElement("button");
+  b.type = "button"; b.className = "btn"; b.dataset.t = t; b.textContent = name;
+  b.onclick = () => setTheme(t);
+  $("appear").appendChild(b);
+}
+for (const b of $("appear").children) b.setAttribute("aria-pressed", String(b.dataset.t === document.documentElement.dataset.theme));
+const mq = window.matchMedia("(prefers-color-scheme: dark)");
+(mq.addEventListener ? mq.addEventListener.bind(mq, "change") : mq.addListener.bind(mq))(readColors);
+
+
+// ---------------------------------------------------------------- profiles and views
+// Views follow the active profile's kind: digital profiles (a JS8 or WSPR
+// decoder) get the decodes, WFM/FM/AM get the station picker and Listen,
+// anything else gets Manual.
+// Manual is the only view that sticks, and only because the user chose it.
+const LISTEN_MODES = ["WFM", "FM", "AM"];
+const GROUPS = [["WFM", "Broadcast FM"], ["FM", "VHF · UHF"], ["AM", "AM"]];
+const VIEWS = [["digital", "Digital"], ["listen", "Listen"], ["manual", "Manual", "tuning"]];
+const DECODERS = [["js8", "JS8"], ["wspr", "WSPR"]];
+let profiles = null, profAvail = true, profLoading = false, profAskedFor = null;
+let switching = null, switchTimer = 0, flipText = "";
+let view = load("view") === "manual" ? "manual" : null, viewFor = null;
+// rxd and radio say "decoder"; older ones only the js8 flag
+function pdec(p) { return p.decoder || null; }
+function pkind(p) { return pdec(p) ? "digital" : LISTEN_MODES.indexOf(p.mode) >= 0 ? "listen" : "manual"; }
+function curDec() { if (st) return pdec(st); const p = activeProf(); return p ? pdec(p) : null; }
+function decName(d) { const x = DECODERS.find(x => x[0] === d); return x ? x[1] : "digital"; }
+function activeName() { return (st && st.profile) || (profiles && profiles.active) || null; }
+function activeProf() { const n = activeName(); return (profiles && profiles.profiles.find(p => p.name === n)) || null; }
+function curKind() {
+  const p = activeProf();
+  if (p) return pkind(p);
+  if (!st) return null;
+  return pdec(st) ? "digital" : LISTEN_MODES.indexOf(st.mode) >= 0 ? "listen" : "manual";
+}
+function curUp() { return !!(st && st.upconverter_hz > 0); }
+function hiuWord(up) { return up ? "UPCONVERT" : "BYPASS"; }
+function fmtMHz(hz) { return trim(hz / 1e6, 6) + " MHz"; }
+function pdesc(p) { return p.description || p.name; }
+function showPmsg(t) { const m = $("pmsg"); m.textContent = t ? "✕ " + t : ""; m.hidden = !t; }
+
+async function loadProfiles() {
+  if (profLoading) return;
+  profLoading = true; profAskedFor = st && st.profile;
+  try {
+    const r = await api("/api/profiles");
+    if (r.status === 404) { profAvail = false; profiles = null; }
+    else if (r.ok && r.doc && Array.isArray(r.doc.profiles)) { profAvail = true; profiles = r.doc; }
+  } catch (e) {}
+  profLoading = false;
+  pickKey = ""; autoView(); renderView();
+}
+
+function autoView() {
+  const n = activeName(), k = curKind();
+  if (!profAvail) { view = "manual"; return; }
+  if (view === "manual" && load("view") === "manual") { viewFor = n; return; }
+  if (n && k && n !== viewFor) { viewFor = n; view = k; }
+}
+function setView(v) {
+  view = v;
+  if (v === "manual") store("view", "manual"); else forget("view");
+  viewFor = activeName();
+  renderView();
+  window.scrollTo(0, 0);
+}
+for (const [v, name, sub] of VIEWS) {
+  const b = document.createElement("button");
+  b.type = "button"; b.className = "btn"; b.dataset.view = v;
+  b.onclick = () => setView(v);
+  $("views").appendChild(b);
+}
+
+function renderView() {
+  const v = view, k = curKind();
+  const mis = !!v && v !== "manual" && !!k && k !== v;
+  document.body.dataset.view = v || "";
+  $("views").hidden = !profAvail || !v;
+  for (const b of $("views").children) {
+    const on = b.dataset.view === v, d = VIEWS.find(x => x[0] === b.dataset.view);
+    b.setAttribute("aria-pressed", String(on));
+    b.innerHTML = "";
+    b.append((on ? "● " : "") + d[1]);
+    if (on || d[2]) { const sm = document.createElement("small"); sm.textContent = on ? "showing" : d[2]; b.appendChild(sm); }
+  }
+  for (const el of document.querySelectorAll("[data-v]")) {
+    if (el.parentElement.closest("[data-v]")) { el.hidden = el.dataset.v.split(" ").indexOf(v) < 0; continue; }
+    el.hidden = !v || el.dataset.v.split(" ").indexOf(v) < 0 || (el.hasAttribute("data-live") && mis);
+  }
+  // each decode list needs its decoder; Listen stays reachable on JS8 and
+  // WSPR, so the phone can hear the band too
+  const dec = curDec();
+  if (!st || pdec(st) !== "js8") $("js8").hidden = true;
+  if (!st || pdec(st) !== "wspr") $("wspr").hidden = $("wStat").hidden = true;
+  $("jCount").hidden = $("wCount").hidden = v === "digital";
+  if (v === "digital" && (A.on || (dec && !mis))) $("listenCard").hidden = false;
+  $("aPick").hidden = $("aPick").hidden || !profiles;
+  $("lPick").hidden = $("lPick").hidden || !profAvail;
+  $("jPick").hidden = $("jPick").hidden || !profAvail;
+  const nt = $("note");
+  if (mis && st && !switching) {
+    const p = activeProf();
+    nt.textContent = "Receiver is on " + st.profile + (p && p.description ? " (" + p.description + ")" : "") + ". " +
+      (v === "digital" ? "Pick a digital mode to switch." : "Pick a station to switch.");
+    nt.hidden = false;
+  } else nt.hidden = true;
+  // RF gain and the speaker slider live in whichever view shows them
+  const home = v === "listen" ? $("qual") : $("sliders");
+  if ($("gainSl").parentElement !== home) { home.appendChild($("gainSl")); home.appendChild($("volSl")); }
+  if (v === "listen") { home.appendChild($("sqSl")); home.appendChild($("auSl")); }
+  renderProfiles(); renderQual();
+  if (v === "manual") requestAnimationFrame(() => { onResize(); pollSpecSoon(); });
+}
+
+let pickKey = "";
+function profBtn(p, top, sub) {
+  const act = p.name === activeName() && !switching;
+  const el = document.createElement(act ? "div" : "button");
+  el.className = act ? "prof cur" : "btn prof";
+  const add = (cls, t) => { const s = document.createElement("span"); s.className = cls; s.textContent = t; el.appendChild(s); };
+  add("pd", top); add("pf", sub);
+  if (act) add("pa", "● Active");
+  else {
+    el.type = "button";
+    if (switching && switching.name === p.name) add("pa", "■ Switching…");
+    else if (!!p.upconvert !== curUp()) add("pw", "▲ Flip the Ham It Up to " + hiuWord(p.upconvert));
+    el.disabled = conn !== "ok" || !!switching;
+    el.onclick = () => doSwitch(p);
+  }
+  return el;
+}
+function renderProfiles() {
+  const key = JSON.stringify([profiles, activeName(), curUp(), conn === "ok", switching && switching.name, view, bandPickKey()]);
+  if (key === pickKey) return;
+  pickKey = key;
+  const all = profiles ? profiles.profiles : [];
+  const mk = (id, list, f) => {
+    const box = $(id); box.textContent = "";
+    if (!profiles) { const m = document.createElement("span"); m.className = "jmsg"; m.textContent = profAvail ? "Loading stations" : ""; box.appendChild(m); return; }
+    if (!list.length) { const m = document.createElement("span"); m.className = "jmsg"; m.textContent = "No profiles of this kind are saved."; box.appendChild(m); return; }
+    for (const p of list) box.appendChild(f(p));
+  };
+  const grouped = (id, ls, groups, f) => {
+    if (!profiles || !ls.length) { mk(id, ls, null); return; }
+    const box = $(id); box.textContent = "";
+    for (const [k, title, test] of groups) {
+      const g = ls.filter(test);
+      if (!g.length) continue;
+      const h = document.createElement("div"); h.className = "pgroup"; h.textContent = title; box.appendChild(h);
+      const l = document.createElement("div"); l.className = "plist"; box.appendChild(l);
+      for (const p of g) l.appendChild(f(p));
+    }
+  };
+  if (view === "digital") renderBandPicker(all, mk);
+  if (view === "manual") mk("aPickL", all, p => profBtn(p, pdesc(p), p.name + " · " + fmtMHz(p.freq) + " · " + p.mode + (pdec(p) ? " · " + decName(pdec(p)) : "")));
+  if (view === "listen") grouped("lPickL", all.filter(p => pkind(p) === "listen"), GROUPS.map(([m, t]) => [m, t, p => p.mode === m]),
+    p => profBtn(p, pdesc(p), fmtMHz(p.freq) + " · " + (p.mode === "FM" ? "NFM" : p.mode)));
+}
+
+// switching
+async function doSwitch(p) {
+  showPmsg(""); $("swErr").hidden = true; $("flip").hidden = true;
+  let r;
+  try { r = await api("/api/profile", {name: p.name}); }
+  catch (e) { showPmsg("Could not reach rxd. Still on " + activeName() + "."); return; }
+  if (!r.ok) { showPmsg("rxd refused: " + ((r.doc && r.doc.error) || ("HTTP " + r.status))); return; }
+  switching = {name: p.name, desc: pdesc(p), prevUp: curUp(), wantUp: !!p.upconvert};
+  setText($("swT"), "■ Switching to " + p.name + "…");
+  setText($("swS"), "rxd restarts on " + pdesc(p) + "; this takes a few seconds." +
+    (switching.wantUp !== switching.prevUp ? " Flip the Ham It Up to " + hiuWord(switching.wantUp) + "." : ""));
+  clearTimeout(switchTimer);
+  switchTimer = setTimeout(switchTimeout, 25000);
+  renderConn(); drawSpecMsg(downMsg());
+  clearTimeout(statusTimer); statusTimer = setTimeout(pollStatus, 1500);
+}
+function finishSwitch() {
+  const sw = switching;
+  clearTimeout(switchTimer); switching = null;
+  if (curUp() !== sw.prevUp) {
+    setText($("flipT"), "▲ Flip the Ham It Up to " + hiuWord(curUp()) + ". " + sw.desc + " needs it; without it you hear nothing.");
+    $("flip").hidden = false;
+  }
+  // a mute carries over to the next station
+  if (muted() && st.volume > 0) { store("spkprev", String(st.volume)); tune({volume: 0}, 0); }
+  jKey = null; wKey = null;
+  renderConn(); renderView();
+  loadProfiles();
+}
+function switchTimeout() {
+  const sw = switching; if (!sw) return;
+  switching = null;
+  setText($("swErrT"), "✕ The switch to " + sw.name + " did not finish. " +
+    (conn === "ok" && st ? "rxd is still on " + st.profile + "." : "rxd has not come back after 25 seconds."));
+  $("swErr").hidden = false;
+  renderConn(); renderView();
+  if (conn === "ok") loadProfiles();
+}
+$("swErrOk").onclick = () => { $("swErr").hidden = true; };
+$("flipOk").onclick = () => { $("flip").hidden = true; };
+
+// ---------------------------------------------------------------- Listen view: station, bandwidth, squelch
+const BWP = {WFM: [100e3, 150e3, 200e3], FM: [8e3, 12.5e3, 16e3], AM: [6e3, 10e3, 15e3]};
+const sqSl = document.createElement("div");
+sqSl.className = "sl"; sqSl.id = "sqSl"; sqSl.dataset.v = "listen";
+sqSl.innerHTML = '<div class="lbl"><span>Squelch</span><span id="sqS" class="val">—</span></div>' +
+  '<div class="row2" id="sqBtns"><button type="button" class="btn" id="sqOff">Off</button><button type="button" class="btn" id="sqOn">On</button></div>' +
+  '<div id="sqLv"><div class="lbl"><label for="sq">Opens above</label><span id="sqV" class="val">—</span></div>' +
+  '<input type="range" id="sq" min="-120" max="0" step="1"></div>';
+$("qual").appendChild(sqSl);
+for (const [i, name] of ["Narrow", "Normal", "Wide"].entries()) {
+  const b = document.createElement("button");
+  b.type = "button"; b.className = "btn"; b.dataset.i = i;
+  b.onclick = () => { const p = BWP[st && st.mode]; if (p) { tune({bandwidth: p[i]}, 0); st.bandwidth = p[i]; renderQual(); } };
+  b.dataset.name = name;
+  $("bwP").appendChild(b);
+}
+const sqEl = $("sq");
+function sqLevel() { const v = +load("squelch"); return v <= 0 && v >= -150 && load("squelch") !== null ? v : -60; }
+$("sqOff").onclick = () => { tune(sqAutoAvail() ? {squelch: null, audio_squelch: false} : {squelch: null}, 0); if (st) { st.squelch = null; if (sqAutoAvail()) st.audio.squelch = false; } renderQual(); };
+$("sqOn").onclick = () => { const v = sqLevel(); tune({squelch: v}, 0); if (st) st.squelch = v; renderQual(); };
+sqEl.oninput = () => { const v = +sqEl.value; store("squelch", String(v)); setText($("sqV"), "−" + Math.abs(v) + " dBFS"); fill(sqEl); tune({squelch: v}, 200); };
+track(sqEl, "squelch");
+function renderQual() {
+  if (!st || view !== "listen") return;
+  const p = activeProf();
+  setText($("nName"), p ? pdesc(p) : st.profile || "—");
+  setText($("nFreq"), fmtMHz(st.freq));
+  setText($("nMode"), st.mode === "FM" ? "NFM" : st.mode);
+  const pre = BWP[st.mode] || [];
+  for (const b of $("bwP").children) {
+    const hz = pre[+b.dataset.i];
+    b.hidden = !hz;
+    if (!hz) continue;
+    b.innerHTML = ""; b.append(b.dataset.name);
+    const sm = document.createElement("small"); sm.textContent = fmtBw(hz); b.appendChild(sm);
+    b.setAttribute("aria-pressed", String(Math.abs(st.bandwidth - hz) < 1));
+  }
+  const named = pre.findIndex(hz => Math.abs(st.bandwidth - hz) < 1);
+  setText($("bwPV"), named >= 0 ? fmtBw(Math.round(st.bandwidth)) : "Custom, " + fmtBw(Math.round(st.bandwidth)));
+  // squelch: NFM voice only, and only if this rxd reports it
+  const hasSq = st.mode === "FM" && "squelch" in st;
+  $("sqSl").hidden = !hasSq;
+  if (hasSq) {
+    const on = st.squelch !== null && st.squelch !== undefined;
+    $("sqOff").setAttribute("aria-pressed", String(!on)); $("sqOn").setAttribute("aria-pressed", String(on));
+    $("sqLv").hidden = !on;
+    if (on && !held("squelch")) { sqEl.value = st.squelch; fill(sqEl); setText($("sqV"), (st.squelch < 0 ? "−" : "") + Math.abs(st.squelch) + " dBFS"); }
+    sqRenderAuto(on);
+    if (on) {} else if (sqAuto()) setText($("sqS"), st.squelch_open ? "● Auto: open (signal)" : "■ Auto: closed (quiet)", st.squelch_open ? "val ok" : "val dimc");
+    else if (!on) setText($("sqS"), "Off, always open", "val");
+    else if (st.squelch_open) setText($("sqS"), "● Open (signal)", "val ok");
+    else setText($("sqS"), "■ Closed (quiet)", "val dimc");
+  }
+}
+
+// ---------------------------------------------------------------- uConsole speaker mute
+function muted() { return load("spkprev") !== null; }
+function syncMute() {
+  if (muted() && st && st.volume > 0 && !held("volume")) forget("spkprev");
+  renderMute();
+}
+function renderMute() {
+  const b = $("mute"), m = muted();
+  b.disabled = conn !== "ok" || !!switching || !st || (!m && st.volume === 0);
+  b.setAttribute("aria-pressed", String(m));
+  if (m) setText(b, "Unmute uConsole speaker (back to " + Math.round(+load("spkprev") * 100) + " %)");
+  else if (st && st.volume === 0) setText(b, "uConsole speaker is at 0 %");
+  else setText(b, "Mute uConsole speaker");
+}
+$("mute").onclick = () => {
+  if (!st) return;
+  if (muted()) { const v = +load("spkprev") || 0.5; forget("spkprev"); setVol(v); tune({volume: v}, 0); st.volume = v; }
+  else { store("spkprev", String(st.volume)); setVol(0); tune({volume: 0}, 0); st.volume = 0; }
+  renderMute();
+};
+
+// ---------------------------------------------------------------- audio on this device
+// rxd streams s16le mono PCM; chunks are queued and scheduled back to back on
+// one AudioContext clock, with ~0.4 s banked first and again after an underrun.
+const A = {ctx: null, gain: null, on: false, gen: 0, want: 0, rate: 0, up: 1, bufRate: 0, ctl: null,
+  q: [], qLen: 0, head: 0, playing: false, rest: -1, prev: 0, srcs: new Set(), scheduled: 0, underruns: 0,
+  dropped: 0, bytes: 0, lastData: 0, retry: 0, err: "", rt: 0, tick: 0};
+window.rxdAudio = A;  // read-only inspection from the console
+function rateFor(m) { return m === "WFM" ? 24000 : 12000; }
+function insecure() { return window.isSecureContext === false ? " This page is plain http, not a secure context, and some browsers limit audio there." : ""; }
+const pvol = $("pvol");
+pvol.value = load("phonevol") !== null ? +load("phonevol") : 100;
+function phoneGain() { const v = +pvol.value / 100; return v * v; }
+function renderPvol() { setText($("pvolV"), pvol.value + " %"); fill(pvol); if (A.gain) A.gain.gain.value = phoneGain(); }
+pvol.oninput = () => { store("phonevol", pvol.value); renderPvol(); };
+renderPvol();
+
+$("listen").onclick = () => {
+  if (A.on && A.ctx && A.ctx.state !== "running") { A.ctx.resume().then(renderAudio, renderAudio); return; }
+  if (A.on) stopListen(); else startListen();
+};
+function startListen() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  A.err = "";
+  if (!AC || !window.fetch || !window.ReadableStream) { A.err = "this browser cannot play a live stream." + insecure(); renderAudio(); return; }
+  try {
+    if (!A.ctx) {
+      A.ctx = new AC();
+      A.gain = A.ctx.createGain(); A.gain.connect(A.ctx.destination);
+      A.ctx.onstatechange = renderAudio;
+    }
+    A.gain.gain.value = phoneGain();
+    A.ctx.resume().catch(() => {});
+    // iOS unlocks output for a context that starts a source inside the tap
+    const s = A.ctx.createBufferSource(); s.buffer = A.ctx.createBuffer(1, 1, A.ctx.sampleRate); s.connect(A.ctx.destination); s.start(0);
+  } catch (e) { A.err = "the browser refused to start audio." + insecure(); renderAudio(); return; }
+  A.on = true; A.retry = 0; A.underruns = 0;
+  clearInterval(A.tick); A.tick = setInterval(audioTick, 250);
+  connectAudio();
+  renderView();
+}
+function stopListen() {
+  A.on = false; A.gen++;
+  if (A.ctl) A.ctl.abort();
+  A.ctl = null; clearTimeout(A.rt); clearInterval(A.tick);
+  dropAudio();
+  if (A.ctx) A.ctx.suspend().catch(() => {});
+  renderAudio(); renderView();
+}
+function dropAudio() {
+  for (const s of A.srcs) { try { s.stop(); } catch (e) {} }
+  A.srcs.clear(); A.q = []; A.qLen = 0; A.playing = false; A.rest = -1;
+}
+function setRate(rate) {
+  A.rate = rate; A.up = 1;
+  try { A.ctx.createBuffer(1, 1, rate); } catch (e) { A.up = Math.ceil(22050 / rate); }
+  A.bufRate = rate * A.up;
+}
+async function connectAudio() {
+  const gen = ++A.gen;
+  if (A.ctl) A.ctl.abort();
+  clearTimeout(A.rt);
+  dropAudio();
+  const want = rateFor(st ? st.mode : "USB");
+  A.want = want;
+  const ctl = new AbortController(); A.ctl = ctl;
+  renderAudio();
+  let why = "";
+  try {
+    const r = await fetch("/api/audio?rate=" + want, {cache: "no-store", signal: ctl.signal});
+    if (gen !== A.gen) return;
+    if (!r.ok) {
+      let d = null; try { d = await r.json(); } catch (e) {}
+      why = r.status === 404 ? "this rxd has no audio stream." : "rxd refused: " + ((d && d.error) || "HTTP " + r.status) + ".";
+      throw new Error(why);
+    }
+    if (!r.body || !r.body.getReader) { why = "this browser cannot read a stream." + insecure(); throw new Error(why); }
+    setRate(+r.headers.get("X-Audio-Rate") || want);
+    A.lastData = now();
+    const rd = r.body.getReader();
+    for (;;) {
+      const x = await rd.read();
+      if (gen !== A.gen) { rd.cancel().catch(() => {}); return; }
+      if (x.done) break;
+      A.bytes += x.value.length; A.lastData = now(); A.retry = 0; A.err = "";
+      push(x.value);
+    }
+  } catch (e) { if (gen !== A.gen) return; }
+  if (gen !== A.gen || !A.on) return;
+  A.retry++; A.err = why;
+  renderAudio();
+  A.rt = setTimeout(() => { if (A.on && gen === A.gen) connectAudio(); }, why ? 5000 : Math.min(500 * A.retry, 3000));
+}
+function push(u8) {
+  let b = u8;
+  if (A.rest >= 0) { b = new Uint8Array(u8.length + 1); b[0] = A.rest; b.set(u8, 1); A.rest = -1; }
+  const n = b.length >> 1;
+  if (b.length & 1) A.rest = b[b.length - 1];
+  if (!n) return;
+  const dv = new DataView(b.buffer, b.byteOffset, n * 2), up = A.up, f = new Float32Array(n * up);
+  if (up === 1) for (let i = 0; i < n; i++) f[i] = dv.getInt16(2 * i, true) / 32768;
+  else {
+    let p = A.prev;
+    for (let i = 0; i < n; i++) { const x = dv.getInt16(2 * i, true) / 32768; for (let k = 1; k <= up; k++) f[i * up + k - 1] = p + (x - p) * k / up; p = x; }
+    A.prev = p;
+  }
+  A.q.push(f); A.qLen += f.length;
+  pump();
+}
+function pump() {
+  const ctx = A.ctx, t = ctx.currentTime, R = A.bufRate;
+  if (A.playing && A.head < t + 0.01) { A.playing = false; A.underruns++; }
+  if (!A.playing) {
+    if (A.qLen < R * 0.4) return;
+    A.head = t + 0.05; A.playing = true;
+  } else if (A.qLen < R * 0.05) return;
+  if (A.head - t > 0.9) { A.dropped += A.qLen; A.q = []; A.qLen = 0; return; }  // clocks drift: stay near 0.4 s
+  const buf = ctx.createBuffer(1, A.qLen, R), ch = buf.getChannelData(0);
+  let o = 0; for (const c of A.q) { ch.set(c, o); o += c.length; }
+  A.q = []; A.qLen = 0;
+  const s = ctx.createBufferSource(); s.buffer = buf; s.connect(A.gain); s.start(A.head);
+  A.head += buf.duration; A.scheduled++;
+  A.srcs.add(s); s.onended = () => A.srcs.delete(s);
+}
+function audioTick() {
+  // a stream that stalls without closing (rxd went away mid-restart) is dropped and retried
+  if (A.on && A.ctl && A.lastData && now() - A.lastData > 3000 && !A.err) { A.lastData = 0; A.ctl.abort(); connectAudio(); }
+  renderAudio();
+}
+function renderAudio() {
+  const b = $("listen"), el = $("aState");
+  let t, cls, depth = "";
+  if (!A.on) {
+    setText(b, "▶ Listen on this device"); b.setAttribute("aria-pressed", "false");
+    if (A.err) { t = "✕ Audio unavailable: " + A.err; cls = "astate bad"; } else { t = "■ Not listening"; cls = "astate dimc"; }
+  } else if (A.ctx.state !== "running") {
+    setText(b, "▶ Resume listening"); b.setAttribute("aria-pressed", "true");
+    t = "■ Paused by the browser. Tap Resume listening."; cls = "astate warn";
+  } else {
+    setText(b, "■ Stop listening"); b.setAttribute("aria-pressed", "true");
+    const d = A.head - A.ctx.currentTime;
+    if (A.err) { t = "✕ Audio unavailable: " + A.err + " Retrying."; cls = "astate bad"; }
+    else if (A.playing && d > 0) { t = "● Listening, " + trim(A.rate / 1000, 1) + " kHz"; cls = "astate ok"; depth = "Buffer " + Math.round(d * 1000) + " ms"; }
+    else if (A.retry || (switching && !A.playing)) { t = "▲ Reconnecting to rxd"; cls = "astate warn"; }
+    else { t = "▲ Buffering"; cls = "astate warn"; }
+  }
+  setText(el, t, cls); setText($("aDepth"), depth);
+}
+renderAudio();
+
+// ---------------------------------------------------------------- JS8 decodes
+const JMAX = 500;
+let jOn = false, jKey = null, jSeq = 0, jTimer = 0, jHeard = new Map(), jFilt = "";
+function js8Sync() {
+  const want = !!(st && pdec(st) === "js8");
+  if (want && st.profile !== jKey) {
+    jKey = st.profile; jOn = true; jSeq = 0; jHeard = new Map();
+    $("jList").textContent = ""; setText($("jMsg"), "Loading decodes");
+    pollJs8();
+  } else if (!want && jOn) { jOn = false; jKey = null; clearTimeout(jTimer); }
+}
+async function pollJs8() {
+  clearTimeout(jTimer);
+  if (!jOn) return;
+  if (document.hidden) { jTimer = setTimeout(pollJs8, 5000); return; }
+  const key = jKey;
+  try {
+    const r = await api("/api/js8?after=" + jSeq);
+    if (key !== jKey) return;
+    if (r.ok && r.doc && Array.isArray(r.doc.lines)) {
+      addJs8(r.doc.lines.filter(l => l.seq > jSeq).sort((a, b) => a.seq - b.seq));
+      if (typeof r.doc.seq === "number") jSeq = Math.max(jSeq, r.doc.seq);
+      jStatus("");
+    } else jStatus(r.status === 404 ? "✕ This rxd has no JS8 feed." : "✕ No decodes: " + ((r.doc && r.doc.error) || "HTTP " + r.status));
+  } catch (e) {}
+  if (jOn && key === jKey) jTimer = setTimeout(pollJs8, 2500);
+}
+function mineLine(l) {
+  if (l.mycall === true) return true;
+  const c = (st && st.station && st.station.call || "").toUpperCase();
+  if (!c) return false;
+  return (l.to || "").toUpperCase() === c || String(l.text || "").toUpperCase().split(/[^A-Z0-9\/]+/).indexOf(c) >= 0;
+}
+function jMatch(li) { return !jFilt || li.dataset.k.indexOf(jFilt) >= 0; }
+function addJs8(lines) {
+  if (!lines.length) return jStatus("");
+  const list = $("jList"), frag = document.createDocumentFragment(), call = (st && st.station && st.station.call) || "";
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i], li = document.createElement("li"), mine = mineLine(l), fr = String(l.from || "?");
+    li.className = "jl" + (mine ? " me" : "");
+    li.dataset.k = [fr, l.to || "", l.text || ""].join(" ").toUpperCase();
+    li.dataset.f = fr;
+    const add = (tag, cls, t) => { const e = document.createElement(tag); e.className = cls; e.textContent = t; li.appendChild(e); };
+    add("span", "jt", lineTime(l.time, true));
+    add("span", "js", typeof l.snr === "number" ? "SNR " + signed(l.snr) : "SNR —");
+    add("b", "jfr", fr);
+    if (mine) add("span", "jme", "◆ " + (call || "You"));
+    let text = String(l.text || "");
+    if (text.toUpperCase().indexOf(fr.toUpperCase() + ":") === 0) text = text.slice(fr.length + 1).trim();
+    add("span", "jx", text);
+    li.hidden = !jMatch(li);
+    jHeard.set(fr, (jHeard.get(fr) || 0) + 1);
+    frag.appendChild(li);
+  }
+  list.insertBefore(frag, list.firstChild);
+  while (list.children.length > JMAX) {
+    const f = list.lastChild.dataset.f, n = jHeard.get(f) - 1;
+    if (n > 0) jHeard.set(f, n); else jHeard.delete(f);
+    list.removeChild(list.lastChild);
+  }
+  jStatus("");
+}
+function jStatus(err) {
+  const list = $("jList"), n = jHeard.size;
+  const heard = n + (n === 1 ? " station heard" : " stations heard");
+  let shown = 0; if (jFilt) for (const li of list.children) if (!li.hidden) shown++;
+  setText($("jCount"), heard); setText($("jHeard"), n + (n === 1 ? " station" : " stations"), "v");
+  if (err) setText($("jMsg"), err);
+  else if (!list.children.length) setText($("jMsg"), "No decodes yet. They appear here as rxd decodes each slot.");
+  else if (jFilt) setText($("jMsg"), shown ? "Showing " + shown + " of " + list.children.length + " lines with " + jFilt : "No lines with " + jFilt + ".");
+  else setText($("jMsg"), "");
+}
+$("jFilter").oninput = () => {
+  jFilt = $("jFilter").value.trim().toUpperCase();
+  $("jClear").hidden = !jFilt;
+  for (const li of $("jList").children) li.hidden = !jMatch(li);
+  jStatus("");
+};
+$("jClear").onclick = () => { $("jFilter").value = ""; $("jFilter").oninput(); $("jFilter").focus(); };
+function renderJs8Stat(s, rxText, rxCls) {
+  if (view !== "digital") return;
+  setText($("jHiu"), s.upconverter_hz > 0 ? "⇅ UPCONVERT" : "→ BYPASS", "v");
+  setText($("jRx"), rxText, rxCls);
+  const lv = s.level_dbfs;
+  setText($("jLvl"), typeof lv === "number" ? (lv < 0 ? "−" : "") + Math.abs(lv).toFixed(1) + " dBFS" : "— dBFS", "v");
+  // JS8's 15 s slots and WSPR's 2 min ones fail silently past about 2 s of
+  // clock error, so a clock that isn't synced is the first thing to say.
+  const c = s.clock || {};
+  if (c.synced === true) setText($("jClock"), "● Synced" + (c.source ? " (" + c.source + ")" : ""), "v ok");
+  else if (c.synced === false) setText($("jClock"), "✕ Not synced", "v bad");
+  else setText($("jClock"), "? Unknown", "v");
+  const bad = $("jClockBad");
+  bad.hidden = c.synced !== false;
+  if (c.synced === false) {
+    const off = typeof c.offset_s === "number" ? " It is " + Math.abs(c.offset_s).toFixed(1) + " s " + (c.offset_s > 0 ? "fast" : "slow") + "." : "";
+    setText(bad, "✕ Clock not synced: " + decName(pdec(s)) + " won't decode until it is." + off + " No GPS fix and no network? Check chronyc sources.");
+  }
+}
+
+// ---------------------------------------------------------------- gain: auto RF gain and audio clean-up
+// Auto gain sits in the RF gain block, which moves between Listen and Manual;
+// moving the slider sets the gain by hand, which turns auto off in rxd.
+// Listen gets one Auto audio switch; Manual a switch per stage.
+const AU = [["auto", "Auto audio"], ["nr", "Noise reduction"], ["filter", "Hum filter"],
+  ["norm", "Even loudness"], ["limit", "Limiter"], ["squelch", "NFM squelch"]];
+const auSl = document.createElement("div");
+auSl.className = "sl"; auSl.id = "auSl"; auSl.dataset.v = "listen"; auSl.hidden = true;
+auSl.innerHTML = '<div class="lbl"><span>Auto audio</span><span id="auS" class="val">—</span></div>' +
+  '<div class="row2" role="group" aria-label="Auto audio"><button type="button" class="btn" id="auOff">Off</button><button type="button" class="btn" id="auOn">On</button></div>' +
+  '<p id="auNote" class="note"></p>';
+$("qual").appendChild(auSl);
+for (const [k, name] of AU) {
+  const b = document.createElement("button");
+  b.type = "button"; b.className = "btn"; b.dataset.k = k; b.dataset.name = name;
+  b.onclick = () => auToggle(k);
+  $("auGrid").appendChild(b);
+}
+function gAuto(s) { return held("gain_auto") && "gain_auto" in pend ? pend.gain_auto : s.gain_auto; }
+function setGainAuto(on) { if (!st) return; tune({gain_auto: on}, 0); st.gain_auto = on; renderGainAudio(st); }
+$("gAutoOn").onclick = () => setGainAuto(true);
+$("gAutoOff").onclick = () => { if (st) { tune({gain_db: st.gain_db}, 0); st.gain_auto = false; renderGainAudio(st); } };
+$("auOn").onclick = () => auSet("auto", true);
+$("auOff").onclick = () => auSet("auto", false);
+function auSet(k, v) {
+  if (!st || !st.audio) return;
+  const f = {}; f["audio_" + k] = v; tune(f, 0);
+  st.audio[k] = v;
+  if (k === "nr") { st.audio.nr_setting = v; st.audio.nr = v === null ? st.mode !== "WFM" : v; }
+  renderGainAudio(st);
+}
+function auToggle(k) {
+  if (!st || !st.audio) return;
+  if (k !== "nr") return auSet(k, !st.audio[k]);
+  // noise reduction is on by mode (off for WFM); back to "by mode" when that's what's asked
+  const want = !st.audio.nr, byMode = st.mode !== "WFM";
+  auSet("nr", want === byMode ? null : want);
+}
+const AU_WORDS = {nr: "noise reduction", filter: "hum filter", norm: "even loudness", limit: "limiter", squelch: "squelch"};
+function gainWhy(s) {
+  const g = s.gain_loop || {};
+  if (!s.gain_auto) return "Set by hand. Auto picks the gain with the best signal-to-noise without overload.";
+  if (g.state === "unavailable") return "✕ " + (g.reason || "No gain control on this source.");
+  const state = {settling: "■ Settling", holding: "● Holding", stepped: "● Stepped", "waiting for the gap between slots": "■ Stepping in the next gap between slots"}[g.state] || g.state;
+  const m = typeof g.margin_db === "number" ? "; band noise " + Math.round(g.margin_db) + " dB over the ADC's" : "";
+  return state + (g.reason ? ": " + g.reason : "") + m + ".";
+}
+// NFM's squelch row in Listen: Off, Auto (rxd's noise squelch) or a level
+const sqAutoB = document.createElement("button");
+sqAutoB.type = "button"; sqAutoB.className = "btn"; sqAutoB.id = "sqAuto"; sqAutoB.textContent = "Auto";
+$("sqBtns").insertBefore(sqAutoB, $("sqOn"));
+sqAutoB.onclick = () => { tune({squelch: null, audio_squelch: true, audio_auto: true}, 0); if (st) { st.squelch = null; Object.assign(st.audio, {squelch: true, auto: true}); } renderQual(); renderGainAudio(st); };
+function sqAutoAvail() { return !!(st && st.audio && typeof st.audio.squelch === "boolean"); }
+function sqAuto() { return sqAutoAvail() && st.audio.auto && st.audio.squelch && (st.squelch === null || st.squelch === undefined); }
+function sqRenderAuto(level) {
+  const av = sqAutoAvail(), au = sqAuto() && !level;
+  sqAutoB.hidden = !av;
+  $("sqBtns").className = av ? "row3" : "row2";
+  sqAutoB.setAttribute("aria-pressed", String(au));
+  $("sqOff").setAttribute("aria-pressed", String(!level && !au));
+  $("sqOn").textContent = av ? "Level" : "On";
+}
+function renderGainAudio(s) {
+  const has = typeof s.gain_auto === "boolean";
+  $("gAuto").hidden = !has;
+  if (has) {
+    const on = gAuto(s);
+    $("gAutoOn").setAttribute("aria-pressed", String(on)); $("gAutoOff").setAttribute("aria-pressed", String(!on));
+    $("gAutoOn").textContent = (on ? "● " : "") + "Auto"; $("gAutoOff").textContent = (on ? "" : "● ") + "By hand";
+    if (!held("gain_db") && typeof s.gain_db === "number") setText($("gainV"), (on ? "Auto, " : "") + s.gain_db.toFixed(1) + " dB");
+    setText($("gWhy"), gainWhy(s)); $("gWhy").hidden = false;
+  }
+  const jc = $("jGainC");
+  jc.hidden = !has;
+  if (has && view === "digital") setText($("jGain"), (s.gain_auto ? "Auto " : "Set ") + (typeof s.gain_db === "number" ? s.gain_db.toFixed(1) : "—") + " dB", "v");
+  const a = s.audio;
+  const hasA = !!a && typeof a.auto === "boolean";
+  $("auSl").hidden = !hasA || view !== "listen";
+  $("audioCard").hidden = $("audioCard").hidden || !hasA;
+  if (!hasA) return;
+  const act = Array.isArray(a.active) ? a.active : [];
+  const sum = !a.auto ? "Off, untouched" : act.length ? "On: " + act.map(k => AU_WORDS[k]).filter(Boolean).join(", ") : "On, nothing for this mode";
+  $("auOn").setAttribute("aria-pressed", String(a.auto)); $("auOff").setAttribute("aria-pressed", String(!a.auto));
+  $("auOn").textContent = (a.auto ? "● " : "") + "On"; $("auOff").textContent = (a.auto ? "" : "● ") + "Off";
+  setText($("auS"), a.auto ? "On" : "Off", "val");
+  setText($("auNote"), sum);
+  setText($("auState"), a.auto ? (a.squelch_open === false ? "■ Squelch closed (quiet)" : a.squelch_open ? "● Squelch open (signal)" : "● On") : "Off", "val");
+  for (const b of $("auGrid").children) {
+    const k = b.dataset.k;
+    b.hidden = k === "squelch" && s.mode !== "FM";
+    const on = k === "nr" ? a.nr : a[k];
+    b.disabled = k !== "auto" && !a.auto;
+    b.setAttribute("aria-pressed", String(!!on));
+    b.textContent = "";
+    b.append((on ? "● " : "○ ") + (k === "filter" && s.mode === "FM" ? "Voice filter" : b.dataset.name));
+    const sm = document.createElement("small");
+    sm.textContent = (on ? "On" : "Off") + (k === "nr" && a.nr_setting === null ? " (by mode)" : "") +
+      (k === "squelch" && on && s.squelch !== null && s.squelch !== undefined ? ", the level squelch is on instead" : "");
+    b.appendChild(sm);
+  }
+}
+
+// ---------------------------------------------------------------- WSPR spots
+let wOn = false, wKey = null, wSeq = 0, wTimer = 0, wHeard = new Map(), wFilt = "", wBusy = false;
+function wsprSync() {
+  const want = !!(st && pdec(st) === "wspr");
+  if (want && st.profile !== wKey) {
+    wKey = st.profile; wOn = true; wSeq = 0; wHeard = new Map();
+    $("wList").textContent = ""; setText($("wsMsg"), "Loading spots");
+    pollWspr();
+  } else if (!want && wOn) { wOn = false; wKey = null; clearTimeout(wTimer); }
+}
+async function pollWspr() {
+  clearTimeout(wTimer);
+  if (!wOn) return;
+  if (document.hidden) { wTimer = setTimeout(pollWspr, 5000); return; }
+  const key = wKey;
+  try {
+    const r = await api("/api/wspr?after=" + wSeq);
+    if (key !== wKey) return;
+    if (r.ok && r.doc && Array.isArray(r.doc.lines)) {
+      addWspr(r.doc.lines.filter(l => l.seq > wSeq).sort((a, b) => a.seq - b.seq));
+      if (typeof r.doc.seq === "number") wSeq = Math.max(wSeq, r.doc.seq);
+      wStatus("");
+    } else wStatus(r.status === 404 ? "✕ This rxd has no WSPR feed." : "✕ No spots: " + ((r.doc && r.doc.error) || "HTTP " + r.status));
+  } catch (e) {}
+  if (wOn && key === wKey) wTimer = setTimeout(pollWspr, 5000);
+}
+function fmtPower(dbm) {
+  const w = Math.pow(10, (dbm - 30) / 10);
+  const mw = w * 1000;
+  return dbm + " dBm (" + (w >= 1 ? trim(w, 1) + " W" : (mw < 10 ? trim(mw, 1) : String(Math.round(mw))) + " mW") + ")";
+}
+function wMatch(li) { return !wFilt || li.dataset.k.indexOf(wFilt) >= 0; }
+function addWspr(lines) {
+  if (!lines.length) return wStatus("");
+  const list = $("wList"), frag = document.createDocumentFragment(), dial = st ? st.freq : null;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i], li = document.createElement("li"), call = String(l.call || "?");
+    li.className = "jl wl";
+    li.dataset.k = [call, l.grid || ""].join(" ").toUpperCase();
+    li.dataset.f = call;
+    const add = (tag, cls, t) => { const e = document.createElement(tag); e.className = cls; e.textContent = t; li.appendChild(e); };
+    add("span", "jt", lineTime(l.time));
+    add("b", "wc", call);
+    if (l.grid) add("span", "wg", l.grid);
+    if (typeof l.km === "number") add("span", "wd", Math.round(l.km * 0.621371).toLocaleString() + " mi");
+    const x = [typeof l.snr === "number" ? "SNR " + signed(l.snr) + " dB" : "SNR —"];
+    if (typeof l.dbm === "number") x.push(fmtPower(l.dbm));
+    if (typeof l.freq === "number" && typeof dial === "number") x.push("Audio " + Math.round(l.freq - dial) + " Hz");
+    add("span", "wx", x.map(t => t.replace(/ /g, "\u00a0")).join(" · "));
+    li.hidden = !wMatch(li);
+    wHeard.set(call, (wHeard.get(call) || 0) + 1);
+    frag.appendChild(li);
+  }
+  list.insertBefore(frag, list.firstChild);
+  while (list.children.length > JMAX) {
+    const f = list.lastChild.dataset.f, n = wHeard.get(f) - 1;
+    if (n > 0) wHeard.set(f, n); else wHeard.delete(f);
+    list.removeChild(list.lastChild);
+  }
+  wStatus("");
+}
+function wStatus(err) {
+  const list = $("wList"), n = wHeard.size;
+  let shown = 0; if (wFilt) for (const li of list.children) if (!li.hidden) shown++;
+  setText($("wCount"), n + (n === 1 ? " station heard" : " stations heard"));
+  if (st && pdec(st) === "wspr") setText($("jHeard"), n + (n === 1 ? " station" : " stations"), "v");
+  if (err) setText($("wsMsg"), err);
+  else if (!list.children.length) setText($("wsMsg"), "No spots yet. They appear here after each two-minute slot is decoded.");
+  else if (wFilt) setText($("wsMsg"), shown ? "Showing " + shown + " of " + list.children.length + " spots with " + wFilt : "No spots with " + wFilt + ".");
+  else setText($("wsMsg"), "");
+}
+$("wFilter").oninput = () => {
+  wFilt = $("wFilter").value.trim().toUpperCase();
+  $("wClear").hidden = !wFilt;
+  for (const li of $("wList").children) li.hidden = !wMatch(li);
+  wStatus("");
+};
+$("wClear").onclick = () => { $("wFilter").value = ""; $("wFilter").oninput(); $("wFilter").focus(); };
+function renderWsprStat(s) {
+  const w = s.wspr;
+  if (!w || view !== "digital") return;
+  const slot = slotTime(w.decoding || w.slot);
+  if (w.state === "recording") setText($("wCycle"), "● Recording the " + slot + " slot", "v ok");
+  else if (w.state === "decoding") setText($("wCycle"), "◆ Decoding the " + slot + " slot", "v");
+  else setText($("wCycle"), "■ Next slot " + slot, "v");
+  const L = w.last;
+  if (!L) setText($("wLast"), "No slot decoded yet", "v dimc");
+  else setText($("wLast"), (L.spots ? L.spots + (L.spots === 1 ? " spot" : " spots") : "No spots") + " in the " + slotTime(L.slot) + " slot", "v");
+  const e = $("wErr");
+  e.hidden = !w.error;
+  if (w.error) setText(e, "✕ WSPR decoder: " + w.error);
+  const p = w.report || {}, id = [p.call, p.grid].filter(Boolean).join(" ");
+  if (!p.enabled) setText($("wRep"), "■ Not reporting" + (p.reason ? ": " + p.reason : ""), "v dimc");
+  else if (p.online === false) setText($("wRep"), "▲ Offline: " + (p.pending || 0) + (p.pending === 1 ? " spot" : " spots") + " waiting", "v warn");
+  else if (p.error) setText($("wRep"), "✕ " + p.error, "v bad");
+  else setText($("wRep"), "● Reporting to WSPRnet" + (id ? " as " + id : "") + " · " + (p.sent || 0) + " sent" +
+    (p.pending ? " · " + p.pending + " waiting" : ""), "v ok");
+  // the switch only where reporting can be on: a callsign and grid are set
+  $("wRepSl").hidden = !!p.reason;
+  const on = !!p.enabled, dis = wBusy || conn !== "ok" || !!switching;
+  setText($("wRepS"), on ? "On" : "Off", "val");
+  for (const [id2, v] of [["wRepOff", false], ["wRepOn", true]]) {
+    const b = $(id2);
+    b.setAttribute("aria-pressed", String(on === v));
+    setText(b, (on === v ? "● " : "") + (v ? "On" : "Off"));
+    b.disabled = dis;
+  }
+}
+async function setReport(on) {
+  if (!st || !st.wspr || wBusy) return;
+  wBusy = true; $("wMsg").hidden = true; renderWsprStat(st);
+  let msg = "";
+  try {
+    const r = await api("/api/tune", {wspr_report: on});
+    if (r.ok && r.doc && typeof r.doc.freq === "number") { wBusy = false; applyStatus(r.doc); return; }
+    msg = "rxd refused: " + ((r.doc && r.doc.error) || "HTTP " + r.status);
+  } catch (e) { msg = "Could not reach rxd. Reporting is unchanged."; }
+  wBusy = false;
+  setText($("wMsg"), "✕ " + msg); $("wMsg").hidden = false;
+  if (st) renderWsprStat(st);
+}
+$("wRepOff").onclick = () => setReport(false);
+$("wRepOn").onclick = () => setReport(true);
+
+// ---------------------------------------------------------------- band plan and the band picker
+// rxd's band plan (status band_plan, GET/POST /api/bands): Auto picks the JS8
+// or WSPR band by conditions, time of day and what rxd has heard; Manual
+// stays put. The picker is a mode toggle plus a grid of bands.
+const BAND_ORDER = ["2190m", "630m", "160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m", "2m"];
+const DWELLS = [2, 4, 6, 8, 10, 15, 20, 30];
+const EVERY = [15, 30, 60, 120];
+let pickMode = null, bandsDoc = null, bandsAt = -1e9, bandsBusy = false, bpOpen = false;
+function bandWord(b) { return b ? b.replace(/m$/, " m") : "—"; }
+function bp() { return st && st.band_plan ? st.band_plan : null; }
+function bestBand(mode) {
+  if (!bandsDoc || !Array.isArray(bandsDoc.profiles)) return null;
+  let best = null;
+  for (const r of bandsDoc.profiles) if (r.mode === mode && r.eligible && (!best || r.score > best.score)) best = r;
+  return best && best.name;
+}
+function bandPickKey() { const b = bp(); return [pickMode, b && b.plan, b && b.mode, bestBand("js8"), bestBand("wspr")].join(); }
+function pickModeNow() { return pickMode || curDec() || (bp() && bp().mode) || "wspr"; }
+
+function bandBtn(p, best) {
+  const act = p.name === activeName() && !switching;
+  const el = document.createElement(act ? "div" : "button");
+  el.className = act ? "bbtn cur" : "btn bbtn";
+  const add = (cls, t) => { const s = document.createElement("span"); s.className = cls; s.textContent = t; el.appendChild(s); };
+  add("bb", bandWord(p.band));
+  add("bf", trim(p.freq / 1e6, 4));
+  if (act) add("ba", "● On");
+  else {
+    el.type = "button";
+    if (switching && switching.name === p.name) add("ba", "■ Switching");
+    else if (!!p.upconvert !== curUp()) add("bw", "▲ " + hiuWord(p.upconvert));
+    else if (best) add("ba", "★ Best now");
+    el.setAttribute("aria-label", decName(pdec(p)) + " " + bandWord(p.band) + ", " + fmtMHz(p.freq) + (best ? ", best now" : ""));
+    el.disabled = conn !== "ok" || !!switching;
+    el.onclick = () => doSwitch(p);
+  }
+  return el;
+}
+function renderBandPicker(all, mk) {
+  const box = $("jPickL");
+  const dig = all.filter(p => pdec(p));
+  if (!profiles || !dig.length) { mk("jPickL", dig, null); return; }
+  box.textContent = "";
+  const mode = pickModeNow();
+  const seg = document.createElement("div"); seg.className = "row2"; seg.setAttribute("role", "group"); seg.setAttribute("aria-label", "Mode");
+  for (const [d, t] of DECODERS) {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "btn"; b.setAttribute("aria-pressed", String(d === mode));
+    b.textContent = (d === mode ? "● " : "") + t + (d === curDec() ? " (on now)" : "");
+    b.onclick = () => { pickMode = d; pickKey = ""; renderProfiles(); };
+    seg.appendChild(b);
+  }
+  box.appendChild(seg);
+  const best = bp() && bp().plan === "auto" && bp().mode === mode ? bestBand(mode) : null;
+  const grid = document.createElement("div"); grid.className = "bgrid";
+  const plan = dig.filter(p => pdec(p) === mode && p.plan && p.band)
+    .sort((a, b) => BAND_ORDER.indexOf(a.band) - BAND_ORDER.indexOf(b.band));
+  for (const p of plan) grid.appendChild(bandBtn(p, p.name === best));
+  box.appendChild(grid);
+  const extra = dig.filter(p => pdec(p) === mode && !(p.plan && p.band));
+  if (extra.length) {
+    const h = document.createElement("div"); h.className = "pgroup"; h.textContent = "Other " + decName(mode) + " profiles"; box.appendChild(h);
+    const l = document.createElement("div"); l.className = "plist"; box.appendChild(l);
+    for (const p of extra) l.appendChild(profBtn(p, p.name, (p.description ? p.description + " · " : "") + fmtMHz(p.freq)));
+  }
+  if (bp() && bp().plan === "auto") {
+    const n = document.createElement("p"); n.className = "note";
+    n.textContent = "Auto is choosing the band. Picking one here sets the band plan to Manual.";
+    box.appendChild(n);
+  }
+}
+
+function bpMsg(t) { const m = $("bpMsg"); m.textContent = t ? "✕ " + t : ""; m.hidden = !t; }
+async function postBands(body) {
+  if (bandsBusy) return;
+  bandsBusy = true; bpMsg(""); renderBandPlan(st);
+  let r = null;
+  try { r = await api("/api/bands", body); } catch (e) {}
+  bandsBusy = false;
+  if (!r) bpMsg("Could not reach rxd. Nothing was changed.");
+  else if (!r.ok) bpMsg("rxd refused: " + ((r.doc && r.doc.error) || ("HTTP " + r.status)));
+  else if (r.doc) { bandsDoc = r.doc; bandsAt = now(); if (st) st.band_plan = r.doc.status; }
+  pickKey = ""; renderBandPlan(st); renderProfiles();
+}
+async function loadBands() {
+  bandsAt = now();
+  try {
+    const r = await api("/api/bands");
+    if (r.ok && r.doc) { bandsDoc = r.doc; pickKey = ""; renderProfiles(); }
+  } catch (e) {}
+}
+function localHM(epoch) { return epoch ? hhmm(new Date(epoch * 1000)) : "—"; }
+function pressed(id, on, text) {
+  const b = $(id); b.setAttribute("aria-pressed", String(!!on));
+  setText(b, (on ? "● " : "") + text);
+  b.disabled = conn !== "ok" || bandsBusy;
+}
+function renderBandPlan(s) {
+  const b = s && s.band_plan, card = $("bPlan");
+  if (!b) { card.hidden = true; return; }
+  if (view === "digital" && !card.hidden && now() - bandsAt > 60000) loadBands();
+  const auto = b.plan === "auto";
+  const sym = !auto ? "■ " : b.phase === "scan" ? "◔ " : b.phase === "idle" ? "▲ " : "● ";
+  setText($("bpState"), auto ? (b.phase === "scan" ? "Auto, scanning" : "Auto") : "Manual");
+  setText($("bpWhy"), sym + (b.reason || "—"), "bpwhy" + (b.phase === "idle" ? " warn" : ""));
+  const sun = b.sun || {};
+  const parts = [];
+  if (auto && b.phase === "hold" && b.next_at) parts.push("Next look " + localHM(b.next_at));
+  if (auto && b.switching_to && b.switching_to !== b.profile) parts.push("Switching to " + b.switching_to);
+  parts.push((sun.words ? sun.words[0].toUpperCase() + sun.words.slice(1) : "—") +
+    (sun.sunrise ? " · sunrise " + localHM(sun.sunrise) : "") + (sun.sunset ? " · sunset " + localHM(sun.sunset) : "") +
+    (sun.located === false ? " (no grid set: by this clock)" : ""));
+  setText($("bpSub"), parts.join(" · "));
+  pressed("bpAuto", auto, "Auto"); pressed("bpMan", !auto, "Manual");
+  $("bpAutoBox").hidden = !auto;
+  pressed("bpWspr", b.mode === "wspr", "WSPR"); pressed("bpJs8", b.mode === "js8", "JS8");
+  const c = b.conditions;
+  if (c) {
+    setText($("bpCond"), "Conditions: SFI " + c.sfi + " · A " + (c.a == null ? "—" : c.a) + " · K " + (c.k == null ? "—" : c.k) +
+      (c.fetched ? " · as of " + localHM(c.fetched) : ""));
+    const cr = $("bpCred");
+    if (c.source === "hamqsl") {
+      if (!cr.firstChild || cr.dataset.src !== "hamqsl") {
+        cr.textContent = "Band conditions courtesy of N0NBH, ";
+        const a = document.createElement("a"); a.href = "https://www.hamqsl.com/solar.html"; a.rel = "noopener"; a.target = "_blank";
+        a.textContent = "www.hamqsl.com"; cr.appendChild(a); cr.dataset.src = "hamqsl";
+      }
+    } else { cr.textContent = c.credit || ""; cr.dataset.src = c.source || ""; }
+    cr.hidden = false;
+  } else {
+    setText($("bpCond"), "▲ No band conditions" + (b.conditions_error ? ": can't reach hamqsl.com or NOAA" : "") +
+      ". Auto goes by time of day and what rxd has heard, scanning to learn.");
+    $("bpCred").hidden = true;
+  }
+  $("bpMore").setAttribute("aria-expanded", String(bpOpen));
+  setText($("bpMore"), bpOpen ? "Bands and timing ▴" : "Bands and timing ▾");
+  $("bpSet").hidden = !bpOpen;
+  if (!bpOpen) return;
+  // bands
+  const box = $("bpBands"), en = b.bands || [];
+  const key = JSON.stringify([en, b.side, b.cross_side, conn, bandsBusy]);
+  if (box.dataset.key !== key) {
+    box.dataset.key = key; box.textContent = "";
+    for (const band of BAND_ORDER) {
+      const on = en.indexOf(band) >= 0, up = !(band === "6m" || band === "2m");
+      const btn = document.createElement("button");
+      btn.type = "button"; btn.className = "btn bbtn"; btn.setAttribute("aria-pressed", String(on));
+      const t = document.createElement("span"); t.className = "bb"; t.textContent = bandWord(band); btn.appendChild(t);
+      const sub = document.createElement("span"); sub.className = "bf"; sub.textContent = on ? "✓ On" : "Off"; btn.appendChild(sub);
+      if ((up ? "UPCONVERT" : "BYPASS") !== b.side) {
+        const w = document.createElement("span"); w.className = "bw"; w.textContent = "▲ " + (up ? "UPCONVERT" : "BYPASS"); btn.appendChild(w);
+      }
+      btn.setAttribute("aria-label", bandWord(band) + (on ? ", on" : ", off") + ((up ? "UPCONVERT" : "BYPASS") !== b.side ? ", needs the Ham It Up on " + (up ? "UPCONVERT" : "BYPASS") : ""));
+      btn.disabled = conn !== "ok" || bandsBusy;
+      btn.onclick = () => postBands({bands: on ? en.filter(x => x !== band) : en.concat([band])});
+      box.appendChild(btn);
+    }
+  }
+  $("bpDef").hidden = !!b.default_bands;
+  $("bpDef").disabled = conn !== "ok" || bandsBusy;
+  pressed("bpSideOff", !b.cross_side, "Stay on this side"); pressed("bpSideOn", b.cross_side, "Allow, I'll flip it");
+  setText($("bpDw"), b.dwell_min + " min" + (b.mode === "wspr" ? ", 2 slots at least" : ""));
+  const di = DWELLS.indexOf(b.dwell_min);
+  $("bpDwDn").disabled = conn !== "ok" || bandsBusy || di === 0;
+  $("bpDwUp").disabled = conn !== "ok" || bandsBusy || di === DWELLS.length - 1;
+  const ev = $("bpEvery");
+  if (!ev.children.length) for (const m of EVERY) {
+    const x = document.createElement("button"); x.type = "button"; x.className = "btn"; x.dataset.m = m;
+    x.onclick = () => postBands({every_min: m}); ev.appendChild(x);
+  }
+  for (const x of ev.children) pressed(x.id || (x.id = "bpEv" + x.dataset.m), +x.dataset.m === b.every_min, x.dataset.m + " min");
+  $("bpScan").disabled = conn !== "ok" || bandsBusy;
+}
+$("bpAuto").onclick = () => postBands({plan: "auto"});
+$("bpMan").onclick = () => postBands({plan: "manual"});
+$("bpWspr").onclick = () => postBands({mode: "wspr"});
+$("bpJs8").onclick = () => postBands({mode: "js8"});
+$("bpMore").onclick = () => { bpOpen = !bpOpen; renderBandPlan(st); };
+$("bpDef").onclick = () => postBands({bands: null});
+$("bpSideOff").onclick = () => postBands({cross_side: false});
+$("bpSideOn").onclick = () => postBands({cross_side: true});
+function stepDwell(d) {
+  const b = bp(); if (!b) return;
+  let i = DWELLS.indexOf(b.dwell_min); if (i < 0) i = DWELLS.findIndex(x => x >= b.dwell_min);
+  const n = DWELLS[Math.max(0, Math.min(DWELLS.length - 1, (i < 0 ? 2 : i) + d))];
+  if (n !== b.dwell_min) postBands({dwell_min: n});
+}
+$("bpDwDn").onclick = () => stepDwell(-1);
+$("bpDwUp").onclick = () => stepDwell(1);
+$("bpScan").onclick = () => postBands({scan: true});
+
+// ---------------------------------------------------------------- station map (map helper)
+// A small pan/zoom map of the stations heard, in the Digital view. Stations
+// sit at the centre of their Maidenhead grid square (from /api/stations),
+// never anywhere more precise. Tiles are rxd's own offline tiles
+// (/tiles/Z/X/Y.png); with none, or past their zoom, Maidenhead grid lines
+// still draw. Tiles load only while the map is open.
+// map:projection begin
+const MTILE = 256;
+// Web Mercator, in pixels of a world 256 * 2^z wide.
+function mercX(lon, z) { return (lon + 180) / 360 * MTILE * Math.pow(2, z); }
+function mercY(lat, z) {
+  const s = Math.sin(Math.max(-85.05112878, Math.min(85.05112878, lat)) * Math.PI / 180);
+  return (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * MTILE * Math.pow(2, z);
+}
+function unmercY(y, z) {
+  const n = Math.PI - 2 * Math.PI * y / (MTILE * Math.pow(2, z));
+  return Math.atan(Math.sinh(n)) * 180 / Math.PI;
+}
+// n+1 points along the great circle from a to b, [[lat, lon], ...]
+function greatCircle(lat1, lon1, lat2, lon2, n) {
+  const r = Math.PI / 180, p1 = lat1 * r, l1 = lon1 * r, p2 = lat2 * r, l2 = lon2 * r;
+  const d = 2 * Math.asin(Math.sqrt(Math.pow(Math.sin((p2 - p1) / 2), 2) +
+    Math.cos(p1) * Math.cos(p2) * Math.pow(Math.sin((l2 - l1) / 2), 2)));
+  const out = [];
+  for (let i = 0; i <= n; i++) {
+    const f = i / n;
+    if (d < 1e-9) { out.push([lat1, lon1]); continue; }
+    const A = Math.sin((1 - f) * d) / Math.sin(d), B = Math.sin(f * d) / Math.sin(d);
+    const x = A * Math.cos(p1) * Math.cos(l1) + B * Math.cos(p2) * Math.cos(l2);
+    const y = A * Math.cos(p1) * Math.sin(l1) + B * Math.cos(p2) * Math.sin(l2);
+    const zz = A * Math.sin(p1) + B * Math.sin(p2);
+    out.push([Math.atan2(zz, Math.sqrt(x * x + y * y)) / r, Math.atan2(y, x) / r]);
+  }
+  return out;
+}
+// map:projection end
+
+const M = {
+  open: load("map") === "1", paths: load("mapPaths") === "1",
+  doc: null, tiles: null, z: 4, cx: 0.5, cy: 0.5, fitted: false,
+  imgs: new Map(), sel: null, timer: 0, raf: 0, col: {}, busy: false
+};
+const mapV = $("mapV"), mCan = $("mCan"), mTiles = $("mTiles");
+const MZMIN = 0, MZMAX = 10;
+const MODE = {js8: ["JS8", "●", "js8"], wspr: ["WSPR", "▲", "wspr"]};
+
+function mapShown() { return M.open && !$("mapCard").hidden && !document.hidden; }
+function mapColors() {
+  const cs = getComputedStyle(document.documentElement);
+  for (const k of ["accent", "mark", "fg", "bg", "panel", "dim", "line", "grid", "plot"]) M.col[k] = cs.getPropertyValue("--" + k).trim();
+}
+function worldW(z) { return MTILE * Math.pow(2, z); }
+// a point to screen pixels (CSS px), the copy of it nearest the centre
+function toScreen(lat, lon, w, h) {
+  const W = worldW(M.z);
+  let dx = mercX(lon, M.z) / W - M.cx;
+  dx -= Math.round(dx);
+  return [w / 2 + dx * W, h / 2 + (mercY(lat, M.z) / W - M.cy) * W];
+}
+function clampView() {
+  M.z = Math.max(MZMIN, Math.min(MZMAX, M.z));
+  M.cx -= Math.floor(M.cx);
+  const h = mapV.clientHeight / worldW(M.z) / 2;
+  M.cy = h >= 0.5 ? 0.5 : Math.max(h, Math.min(1 - h, M.cy));
+}
+function zoomAt(f, sx, sy) {
+  const w = mapV.clientWidth, h = mapV.clientHeight, W0 = worldW(M.z);
+  const wx = M.cx + (sx - w / 2) / W0, wy = M.cy + (sy - h / 2) / W0;
+  M.z = Math.max(MZMIN, Math.min(MZMAX, M.z + Math.log2(f)));
+  const W1 = worldW(M.z);
+  M.cx = wx - (sx - w / 2) / W1; M.cy = wy - (sy - h / 2) / W1;
+  clampView(); mapDraw();
+}
+function mapFit() {
+  const pts = [];
+  const d = M.doc;
+  if (d && d.me) pts.push([d.me.lat, d.me.lon]);
+  if (d) for (const s of d.stations) if (s.src !== "country") pts.push([s.lat, s.lon]);
+  const w = mapV.clientWidth || 360, h = mapV.clientHeight || 400;
+  if (pts.length < 2) {
+    M.z = pts.length ? 4 : MZMIN;
+    M.cx = pts.length ? mercX(pts[0][1], 0) / MTILE : 0.5;
+    M.cy = pts.length ? mercY(pts[0][0], 0) / MTILE : 0.5;
+  } else {
+    // longitudes around the station, so a path across the date line fits
+    const ref = pts[0][1];
+    const xs = pts.map(p => mercX(ref + ((p[1] - ref + 540) % 360 - 180), 0) / MTILE), ys = pts.map(p => mercY(p[0], 0) / MTILE);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    const pad = 56;
+    const zx = Math.log2((w - 2 * pad) / MTILE / Math.max(x1 - x0, 1e-6));
+    const zy = Math.log2((h - 2 * pad) / MTILE / Math.max(y1 - y0, 1e-6));
+    M.z = Math.min(zx, zy, 7);
+    M.cx = (x0 + x1) / 2; M.cy = (y0 + y1) / 2;
+  }
+  clampView(); mapDraw();
+}
+
+function mapDraw() {
+  if (M.raf) return;
+  M.raf = requestAnimationFrame(() => { M.raf = 0; drawTiles(); drawOverlay(); });
+}
+function drawTiles() {
+  const t = M.tiles, want = new Set();
+  const w = mapV.clientWidth, h = mapV.clientHeight;
+  if (t && t.available && w && h) {
+    const tz = Math.max(t.min, Math.min(t.max, Math.round(M.z)));
+    const n = Math.pow(2, tz), ts = MTILE * Math.pow(2, M.z - tz), W = worldW(M.z);
+    const ox = w / 2 - M.cx * W, oy = h / 2 - M.cy * W;  // screen position of the world's corner
+    const i0 = Math.floor(-ox / ts), i1 = Math.floor((w - ox) / ts);
+    const j0 = Math.max(0, Math.floor(-oy / ts)), j1 = Math.min(n - 1, Math.floor((h - oy) / ts));
+    for (let i = i0; i <= i1; i++) {
+      for (let j = j0; j <= j1; j++) {
+        const x = ((i % n) + n) % n, key = tz + "/" + i + "/" + j;
+        want.add(key);
+        let img = M.imgs.get(key);
+        if (!img) {
+          img = new Image();
+          img.alt = ""; img.decoding = "async";
+          img.onerror = () => { img.style.visibility = "hidden"; };
+          img.src = "/tiles/" + tz + "/" + x + "/" + j + ".png";
+          M.imgs.set(key, img); mTiles.appendChild(img);
+        }
+        const l = Math.floor(ox + i * ts), tp = Math.floor(oy + j * ts);
+        img.style.left = l + "px"; img.style.top = tp + "px";
+        img.style.width = (Math.ceil(ox + (i + 1) * ts) - l) + "px";
+        img.style.height = (Math.ceil(oy + (j + 1) * ts) - tp) + "px";
+      }
+    }
+  }
+  for (const [k, img] of M.imgs) if (!want.has(k)) { img.remove(); M.imgs.delete(k); }
+  const a = $("mAttr");
+  a.hidden = !(t && t.available && t.attribution);
+  if (!a.hidden) setText(a, t.attribution);
+}
+function fieldName(lon, lat) {
+  return String.fromCharCode(65 + Math.floor((lon + 180) / 20)) + String.fromCharCode(65 + Math.floor((lat + 90) / 10));
+}
+function drawGrid(g, w, h) {
+  const tiles = M.tiles && M.tiles.available;
+  const W = worldW(M.z);
+  const latTop = unmercY((M.cy - h / 2 / W) * W, M.z), latBot = unmercY((M.cy + h / 2 / W) * W, M.z);
+  const lonL = (M.cx - w / 2 / W) * 360 - 180, lonR = (M.cx + w / 2 / W) * 360 - 180;
+  const squares = M.z >= 5.5;
+  g.lineWidth = 1;
+  g.strokeStyle = tiles ? M.col.dim : M.col.line;
+  g.globalAlpha = tiles ? 0.35 : 1;
+  g.beginPath();
+  const dLon = squares ? 2 : 20, dLat = squares ? 1 : 10;
+  for (let lon = Math.floor(lonL / dLon) * dLon; lon <= lonR; lon += dLon) {
+    const x = Math.round(w / 2 + ((lon + 180) / 360 - M.cx) * W) + 0.5;
+    g.moveTo(x, 0); g.lineTo(x, h);
+  }
+  for (let lat = Math.max(-80, Math.floor(latBot / dLat) * dLat); lat <= Math.min(80, latTop); lat += dLat) {
+    const y = Math.round(h / 2 + (mercY(lat, M.z) / W - M.cy) * W) + 0.5;
+    g.moveTo(0, y); g.lineTo(w, y);
+  }
+  g.stroke();
+  if (squares) {  // field lines heavier over the squares
+    g.lineWidth = 2; g.beginPath();
+    for (let lon = Math.floor(lonL / 20) * 20; lon <= lonR; lon += 20) {
+      const x = Math.round(w / 2 + ((lon + 180) / 360 - M.cx) * W);
+      g.moveTo(x, 0); g.lineTo(x, h);
+    }
+    for (let lat = Math.max(-80, Math.floor(latBot / 10) * 10); lat <= Math.min(80, latTop); lat += 10) {
+      const y = Math.round(h / 2 + (mercY(lat, M.z) / W - M.cy) * W);
+      g.moveTo(0, y); g.lineTo(w, y);
+    }
+    g.stroke();
+  }
+  // labels: fields, or squares when zoomed in far enough to read them
+  g.globalAlpha = tiles ? 0.75 : 1;
+  g.fillStyle = M.col.dim;
+  g.font = "600 15px system-ui,sans-serif";
+  g.textBaseline = "top";
+  // only where a cell is wide enough for its name
+  if (dLon / 360 * W >= (squares ? 48 : 34)) {
+    for (let lon = Math.floor(lonL / dLon) * dLon; lon <= lonR; lon += dLon) {
+      for (let lat = Math.max(-90, Math.floor(latBot / dLat) * dLat); lat < Math.min(90, latTop); lat += dLat) {
+        const lo = ((lon + 180) % 360 + 360) % 360 - 180;
+        const x = w / 2 + ((lon + 180) / 360 - M.cx) * W + 4;
+        const y = h / 2 + (mercY(lat + dLat, M.z) / W - M.cy) * W + 3;
+        const name = fieldName(lo, lat) + (squares ? Math.floor(((lo + 180) % 20) / 2) + "" + Math.floor((lat + 90) % 10) : "");
+        g.fillText(name, x, Math.max(y, 3));
+      }
+    }
+  }
+  g.globalAlpha = 1;
+}
+// where a position came from: the station's own grid, or the callsign database
+const SRC = {addr: "Approx. location: licence address, to the grid square", zip: "Approx. location: licence ZIP code",
+  country: "Country only, from the callsign prefix"};
+function marker(g, mode, x, y, r, src) {
+  g.beginPath();
+  if (mode === "wspr") { g.moveTo(x, y - r * 1.25); g.lineTo(x + r * 1.15, y + r * 0.8); g.lineTo(x - r * 1.15, y + r * 0.8); g.closePath(); }
+  else if (mode === "me") g.rect(x - r, y - r, 2 * r, 2 * r);
+  else g.arc(x, y, r, 0, 2 * Math.PI);
+  const c = mode === "wspr" ? M.col.mark : mode === "me" ? M.col.fg : M.col.accent;
+  if (src && src !== "heard") {  // hollow: not the station's own grid
+    g.fillStyle = M.col.panel; g.fill();
+    g.lineWidth = 3; g.strokeStyle = c;
+    if (src === "country") g.setLineDash([3, 3]);
+    g.stroke(); g.setLineDash([]);
+    return;
+  }
+  g.fillStyle = c;
+  g.fill();
+  g.lineWidth = 2.5; g.strokeStyle = M.col.panel; g.stroke();
+}
+function drawOverlay() {
+  fit(mCan);
+  const g = mCan.getContext("2d"), d = dpr(), w = mCan.width / d, h = mCan.height / d;
+  g.setTransform(d, 0, 0, d, 0, 0);
+  g.clearRect(0, 0, w, h);
+  drawGrid(g, w, h);
+  const doc = M.doc;
+  if (!doc) return;
+  const me = doc.me, pts = [];
+  if (M.paths && me) {
+    g.lineWidth = 2; g.globalAlpha = 0.7;
+    for (const s of doc.stations) {
+      if (s.src === "country") continue;  // a country's centre isn't a path
+      g.strokeStyle = s.mode === "wspr" ? M.col.mark : M.col.accent;
+      g.setLineDash(s.mode === "wspr" ? [6, 4] : []);
+      g.beginPath();
+      let prev = null;
+      const gc = greatCircle(me.lat, me.lon, s.lat, s.lon, 48);
+      const [mx] = toScreen(me.lat, me.lon, w, h), W = worldW(M.z);
+      let base = mx - mercX(me.lon, M.z), lonPrev = me.lon;
+      for (const [la, lo] of gc) {
+        // keep the line continuous across the date line
+        let dl = lo - lonPrev; if (dl > 180) base -= W; else if (dl < -180) base += W;
+        lonPrev = lo;
+        const x = base + mercX(lo, M.z), y = h / 2 + (mercY(la, M.z) / W - M.cy) * W;
+        if (prev) g.lineTo(x, y); else g.moveTo(x, y);
+        prev = [x, y];
+      }
+      g.stroke();
+    }
+    g.setLineDash([]); g.globalAlpha = 1;
+  }
+  // oldest first, so the newest draw on top
+  const list = doc.stations.slice().reverse();
+  for (const s of list) {
+    const [x, y] = toScreen(s.lat, s.lon, w, h);
+    if (x < -20 || y < -20 || x > w + 20 || y > h + 20) continue;
+    marker(g, s.mode, x, y, 8, s.src);
+    pts.push([x, y, s]);
+  }
+  if (me) {
+    const [x, y] = toScreen(me.lat, me.lon, w, h);
+    marker(g, "me", x, y, 8);
+    pts.push([x, y, null]);
+  }
+  // call labels, newest first, skipping any that would overlap
+  g.font = "700 15px system-ui,sans-serif"; g.textBaseline = "middle";
+  const boxes = [];
+  for (const [x, y, s] of pts.slice().reverse()) {
+    const t = s ? s.call : (me.call || "You") + " (you)", tw = g.measureText(t).width;
+    const b = [x + 12, y - 9, x + 16 + tw, y + 9];
+    if (boxes.some(o => b[0] < o[2] && b[2] > o[0] && b[1] < o[3] && b[3] > o[1])) continue;
+    boxes.push(b);
+    g.lineWidth = 4; g.strokeStyle = M.col.panel; g.lineJoin = "round"; g.strokeText(t, x + 13, y);
+    g.fillStyle = M.col.fg; g.fillText(t, x + 13, y);
+  }
+  if (M.sel) {
+    g.lineWidth = 3; g.strokeStyle = M.col.fg;
+    const shown = M.sel.slice(0, 6);  // the ones the details list
+    for (const [x, y, s] of pts) if (shown.indexOf(s) >= 0) { g.beginPath(); g.arc(x, y, 15, 0, 2 * Math.PI); g.stroke(); }
+  }
+  M.pts = pts;
+}
+
+function fmtDist(km) { return typeof km === "number" ? Math.round(km * 0.621371).toLocaleString() + " mi · " + km.toLocaleString() + " km" : null; }
+function renderInfo() {
+  const box = $("mInfo");
+  box.textContent = "";
+  if (!M.sel || !M.sel.length) { box.textContent = M.doc && M.doc.stations.length ? "Tap a station for its details." : ""; return; }
+  for (const s of M.sel.slice(0, 6)) {
+    const div = document.createElement("div"); div.className = "mi";
+    const add = (cls, t, parent) => { const e = document.createElement("span"); e.className = cls; e.textContent = t; (parent || div).appendChild(e); return e; };
+    if (s === null) {
+      const me = M.doc.me;
+      add("mc", me.call || "This station");
+      add("mm mk-me", "■ You");
+      add("md", "Grid " + me.grid);
+    } else {
+      const m = MODE[s.mode] || [s.mode, "●", ""];
+      add("mc", s.call);
+      add("mm mk-" + m[2], m[1] + " " + m[0]);
+      const dist = fmtDist(s.km), approx = s.src && s.src !== "heard";
+      if (s.src === "country") add("md", (s.region || "Country") + " · " + SRC.country);
+      else add("md", "Grid " + s.grid + (dist ? " · " + (approx ? "about " : "") + dist : ""));
+      if (s.src === "addr" || s.src === "zip") add("md", SRC[s.src] + (s.region ? " (" + s.region + ")" : ""));
+      add("md", "Last heard " + lineTime(s.last) + (typeof s.last_snr === "number" ? " at " + signed(s.last_snr) + " dB" : ""));
+      const extra = [];
+      if (typeof s.snr === "number") extra.push("Best SNR " + signed(s.snr) + " dB");
+      if (typeof s.dbm === "number") extra.push(fmtPower(s.dbm));
+      if (extra.length) add("md", extra.join(" · "));
+    }
+    box.appendChild(div);
+  }
+  if (M.sel.length > 6) { const p = document.createElement("div"); p.className = "md"; p.textContent = "and " + (M.sel.length - 6) + " more here: zoom in."; box.appendChild(p); }
+}
+function mapTap(sx, sy) {
+  const hits = (M.pts || []).filter(([x, y]) => Math.hypot(x - sx, y - sy) <= 28);
+  M.sel = hits.length ? hits.sort((a, b) => Math.hypot(a[0] - sx, a[1] - sy) - Math.hypot(b[0] - sx, b[1] - sy)).map(p => p[2]) : null;
+  renderInfo(); mapDraw();
+}
+function renderLegend() {
+  const doc = M.doc, leg = $("mLeg");
+  leg.textContent = "";
+  const add = (cls, sym, text) => {
+    const e = document.createElement("span");
+    const s = document.createElement("span"); s.className = "s " + cls; s.textContent = sym;
+    e.append(s, text); leg.appendChild(e);
+  };
+  if (doc && doc.me) add("mk-me", "■", (doc.me.call || "You") + " · " + doc.me.grid);
+  const dec = doc ? doc.decoder : null;
+  for (const k of ["js8", "wspr"]) {
+    const n = doc ? doc.stations.filter(s => s.mode === k).length : 0;
+    if (n || k === dec) add("mk-" + k, MODE[k][1], MODE[k][0] + " · " + n + (n === 1 ? " station" : " stations"));
+  }
+  const nLook = doc ? doc.stations.filter(s => s.src === "addr" || s.src === "zip").length : 0;
+  const nCty = doc ? doc.stations.filter(s => s.src === "country").length : 0;
+  if (nLook) add("mk-hollow", "○", "Approx., from licence · " + nLook);
+  if (nCty) add("mk-hollow big", "◌", "Country only · " + nCty);
+  const msgs = [];
+  if (doc) {
+    for (const k of ["js8", "wspr"]) {
+      const n = doc.no_grid && doc.no_grid[k];
+      if (n) msgs.push(n + " " + MODE[k][0] + (n === 1 ? " station" : " stations") + " heard without a grid, not on the map.");
+    }
+    msgs.unshift("Stations heard in the last " + doc.hours + " hours, at the centre of their grid square." +
+      (nLook || nCty ? " Hollow markers are stations that never sent a grid, placed from the offline callsign database; country-only ones aren't counted by Fit all." : ""));
+  }
+  const t = M.tiles;
+  if (t) msgs.push(t.available ? "Map tiles: offline, zoom " + t.min + "–" + t.max + "." : "No map tiles on this rxd: grid lines only.");
+  setText($("mMsg"), msgs.join(" "));
+}
+async function mapPoll() {
+  clearTimeout(M.timer);
+  if (!M.open) return;
+  if (mapShown() && !M.busy) {
+    M.busy = true;
+    try {
+      if (!M.tiles) { const r = await api("/tiles/info.json"); if (r.ok && r.doc) M.tiles = r.doc; else if (r.status === 404) M.tiles = {available: false}; }
+      const r = await api("/api/stations");
+      if (r.ok && r.doc && Array.isArray(r.doc.stations)) {
+        M.doc = r.doc;
+        if (M.sel) {  // keep the selection on the same stations
+          const keys = new Set(M.sel.map(s => s ? s.mode + s.call : "me"));
+          M.sel = (M.doc.me && keys.has("me") ? [null] : []).concat(M.doc.stations.filter(s => keys.has(s.mode + s.call)));
+          if (!M.sel.length) M.sel = null;
+        }
+        if (!M.fitted) { M.fitted = true; mapFit(); }
+        renderLegend(); renderInfo(); mapDraw();
+      }
+    } catch (e) {}
+    M.busy = false;
+  }
+  M.timer = setTimeout(mapPoll, 15000);
+}
+function renderMapOpen() {
+  const b = $("mapTog");
+  b.setAttribute("aria-expanded", String(M.open));
+  b.textContent = M.open ? "▾ Hide map" : "▸ Show map of stations";
+  $("mapBody").hidden = !M.open;
+  $("mPath").setAttribute("aria-pressed", String(M.paths));
+  $("mPath").textContent = M.paths ? "✓ Paths" : "Paths";
+  if (!M.open) { clearTimeout(M.timer); for (const img of M.imgs.values()) img.remove(); M.imgs.clear(); }
+}
+$("mapTog").onclick = () => {
+  M.open = !M.open; store("map", M.open ? "1" : "0");
+  renderMapOpen();
+  if (M.open) { mapColors(); mapDraw(); mapPoll(); }
+};
+$("mIn").onclick = () => zoomAt(2, mapV.clientWidth / 2, mapV.clientHeight / 2);
+$("mOut").onclick = () => zoomAt(0.5, mapV.clientWidth / 2, mapV.clientHeight / 2);
+$("mFit").onclick = mapFit;
+$("mPath").onclick = () => { M.paths = !M.paths; store("mapPaths", M.paths ? "1" : "0"); renderMapOpen(); mapDraw(); };
+
+// drag to pan, pinch to zoom, tap to pick; the wheel zooms on a desktop
+const mp = new Map();
+let mTapAt = null, mPinch = null;
+function mRel(e) { const r = mapV.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }
+mapV.addEventListener("pointerdown", e => {
+  try { mapV.setPointerCapture(e.pointerId); } catch (err) {}
+  mp.set(e.pointerId, mRel(e));
+  mTapAt = mp.size === 1 ? mRel(e) : null;
+  mPinch = null;
+});
+mapV.addEventListener("pointermove", e => {
+  if (!mp.has(e.pointerId)) return;
+  const prev = mp.get(e.pointerId), cur = mRel(e);
+  if (mTapAt && Math.hypot(cur[0] - mTapAt[0], cur[1] - mTapAt[1]) > 8) mTapAt = null;
+  if (mp.size === 1) {
+    const W = worldW(M.z);
+    M.cx -= (cur[0] - prev[0]) / W; M.cy -= (cur[1] - prev[1]) / W;
+    mp.set(e.pointerId, cur); clampView(); mapDraw();
+  } else if (mp.size === 2) {
+    mp.set(e.pointerId, cur);
+    const [a, b] = [...mp.values()];
+    const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], dist = Math.max(1, Math.hypot(a[0] - b[0], a[1] - b[1]));
+    if (mPinch) {
+      const W = worldW(M.z);
+      M.cx -= (mid[0] - mPinch.mid[0]) / W; M.cy -= (mid[1] - mPinch.mid[1]) / W;
+      zoomAt(dist / mPinch.dist, mid[0], mid[1]);
+    }
+    mPinch = {mid, dist};
+  }
+});
+function mUp(e) {
+  if (!mp.has(e.pointerId)) return;
+  mp.delete(e.pointerId);
+  if (mTapAt && e.type === "pointerup") mapTap(mTapAt[0], mTapAt[1]);
+  mTapAt = null; mPinch = null;
+}
+mapV.addEventListener("pointerup", mUp);
+mapV.addEventListener("pointercancel", mUp);
+mapV.addEventListener("wheel", e => {
+  e.preventDefault();
+  const [x, y] = mRel(e);
+  zoomAt(Math.pow(2, -e.deltaY / (e.deltaMode ? 3 : 300)), x, y);
+}, {passive: false});
+mapV.addEventListener("dblclick", e => { const [x, y] = mRel(e); zoomAt(2, x, y); });
+
+// redraw for a new size (the card shown again, a rotation) or appearance
+if (window.ResizeObserver) new ResizeObserver(() => { if (M.open && mapV.clientWidth) { clampView(); mapDraw(); mapPoll(); } }).observe(mapV);
+new MutationObserver(() => { mapColors(); if (M.open) mapDraw(); }).observe(document.documentElement, {attributes: true, attributeFilter: ["data-theme"]});
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => { mapColors(); if (M.open) mapDraw(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && M.open) mapPoll(); });
+mapColors(); renderMapOpen(); renderInfo();
+if (M.open) mapPoll();
+
+// ---------------------------------------------------------------- start
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    pollStatus(); pollSpecSoon(); if (jOn) pollJs8(); if (wOn) pollWspr();
+    if (A.on && A.ctx && A.ctx.state !== "running") A.ctx.resume().catch(() => {});
+    renderAudio();
+  }
+});
+if (window.ResizeObserver) new ResizeObserver(onResize).observe($("ctl"));
+window.addEventListener("resize", onResize);
+renderView();
+onResize(); readColors();
+pollStatus();
+})();
+</script>
+</body>
+</html>

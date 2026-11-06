@@ -22,17 +22,16 @@ only `Alt+h/j/k/l`, `Alt+1..9`, `Alt+r` and `Alt+Return` — costing readline
 ## Applications at login
 
 i3 runs `radio resume` at login, which starts the active profile's receiver,
-rxd, as a headless systemd user unit (`rxd@NAME`) with no window. Two apps
-have placement rules:
+rxd, as a headless systemd user unit (`rxd@NAME`) with no window; JS8 and
+WSPR are decoded inside it and shown in its browser UI and `rxd-tui`. One app
+has a placement rule:
 
 | Workspace | Application | At boot |
 |---|---|---|
-| 2 | JS8Call | started by `radio resume` for a JS8 profile |
 | 3 | `meshtastic-ui` | placement only |
 
-JS8Call and the dashboard land on 2 and 3 whenever started — `Alt+2` and
-`Alt+3` reach those workspaces at any time, whether or not anything is on
-them.
+The dashboard lands on 3 whenever started — `Alt+3` reaches that workspace
+at any time, whether or not anything is on it.
 
 No mesh daemon runs at boot either. **`radio mesh`** starts the active one
 and opens its client — the dashboard on workspace 3 for Meshtastic — from a
