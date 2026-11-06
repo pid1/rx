@@ -3445,6 +3445,8 @@ def spot_from(date, hhmm, snr, dt, mhz, msg, drift, mygrid=None):
     if not parsed:
         return None
     call, grid, dbm = parsed
+    if grid:  # DM33vq, as WSPRnet and everyone else writes it
+        grid = grid[:4].upper() + grid[4:].lower()
     iso = "20%s-%s-%sT%s:%s:00Z" % (date[:2], date[2:4], date[4:6], hhmm[:2], hhmm[2:])
     return {"time": iso, "snr": int(snr), "dt": float(dt), "freq": round(float(mhz) * 1e6),
             "drift": int(drift), "call": call, "grid": grid, "dbm": dbm,
@@ -4564,6 +4566,9 @@ def no_player_hint(platform=sys.platform):
         return "No audio player found. Install one: brew install ffmpeg (or sox), or use --player"
     return "No audio player found. Install pipewire-bin, alsa-utils, ffmpeg or sox"
 
+
+
+WAITING = "Waiting for rxd; 3 opens Manual meanwhile"
 
 class Player:
     """How to start the local player: a name for the status and an argv per rate."""
@@ -5734,7 +5739,7 @@ class App:
         elif self.view == "manual":
             self.manual_key(ch, s)
         elif s["reachable"] is not True:
-            self.say("Waiting for rxd; 3 opens Manual meanwhile")
+            self.say(WAITING)
         return True
 
     def pick_view(self, v, s):
@@ -6087,7 +6092,8 @@ class App:
                     break
             scr.put(y, 0, prompt, "value")
             scr.put(y, len(prompt), self.entry + "_", "key")
-        elif self.message:
+        elif self.message and not (self.message == WAITING and s["reachable"] is True):
+            # "Waiting for rxd" is over once it answers; don't leave it up.
             scr.put(y, 1, clip(g.text(self.message), w - 2, g), self.message_role)
         elif self.switching:
             sw = self.switching
@@ -6711,7 +6717,17 @@ def main(argv=None):
                          "{rate} becomes the sample rate (default: the first of %s on PATH)"
                          % ", ".join(PLAYERS))
     a = ap.parse_args(argv)
-    locale.setlocale(locale.LC_ALL, "")
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        # A locale the machine doesn't have, usually forwarded over SSH
+        # (macOS sends LC_CTYPE=UTF-8). curses still needs UTF-8 to draw.
+        for name in ("C.UTF-8", "C.utf8"):
+            try:
+                locale.setlocale(locale.LC_ALL, name)
+                break
+            except locale.Error:
+                pass
     os.environ.setdefault("ESCDELAY", "25")  # Esc cancels typing without a pause
     url = a.url if "//" in a.url else "http://" + a.url
     poller = Poller(Link(url))
