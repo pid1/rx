@@ -103,10 +103,13 @@ yourself, from a picker or with `radio NAME`, sets it to Manual.
   per profile and UTC hour, is kept in `~/.local/share/rxd/bands.json` and
   counts for half as much every 14 days. Spot counts outweigh the
   conditions after a single good look.
+- **Bands:** every band is enabled by default, 2190 m and 630 m included
+  (Win's call, 2026-11-06: no assumptions about antennas); turn off the ones
+  without an antenna under *Bands and timing*.
 - **Ham It Up:** Auto only uses bands on the side the switch is on now (the
-  side the running profile needs), unless *Allow, I'll flip it* is set.
-  The default bands are 160 m to 10 m on UPCONVERT, or 6 m and 2 m on
-  BYPASS.
+  side the running profile needs), unless *Allow, I'll flip it* is set: on
+  UPCONVERT that is 2190 m to 10 m, on BYPASS 6 m and 2 m.
+- **First start:** Auto goes straight to the best-scoring band.
 - **Switching** goes through `radio NAME`, so a JS8 band starts JS8Call and
   a WSPR band closes it. A switch waits for a WSPR slot's decode to finish,
   and stays put unless another band scores 15 % better. The re-check
