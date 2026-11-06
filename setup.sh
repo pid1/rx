@@ -2261,12 +2261,12 @@ BLACKLIST
     #
     # A new rxd release is a PR here changing RXD_VERSION and RXD_SHA256.
     # The release build is reproducible, so this is also what
-    # scripts/release.py makes from the v0.4.1 tag.
+    # scripts/release.py makes from the v0.5.0 tag.
     # RX_RXD_TARBALL=/path/rxd-X.Y.Z.tar.gz installs that file instead of
     # downloading, for trying a build before it is published; it must still
     # match RXD_SHA256.
-    local RXD_VERSION=0.4.1
-    local RXD_SHA256=c3a07e05d3601636199d99855c74deff1b1f03f9770a772189a24ceefbbc83e4
+    local RXD_VERSION=0.5.0
+    local RXD_SHA256=bac20c0dbea7979355d3c0c80d6681e41d824e23bbfed034dd2a0c64e1da3583
     local rxd_tar="rxd-${RXD_VERSION}.tar.gz"
     local rxd_url="https://github.com/pid1/rxd/releases/download/v${RXD_VERSION}/${rxd_tar}"
     local rxd_cache="/var/cache/rx/${rxd_tar}"
@@ -2331,6 +2331,8 @@ BLACKLIST
     "dcara":    {"description": "DCARA", "frequency": 146920000, "demod": "FM",
                  "demod_settings": {"bandwidth": 12500}, "rtl": {"gain": 20}},
     "fm-93.3":  {"description": "93.3 FM", "frequency": 93300000, "demod": "WFM",
+                 "demod_settings": {"bandwidth": 150000}, "rtl": {"gain": 10}},
+    "fm-94.5":  {"description": "94.5 FM (HD)", "frequency": 94500000, "demod": "WFM",
                  "demod_settings": {"bandwidth": 150000}, "rtl": {"gain": 10}},
     "fm-105.3": {"description": "105.3 FM", "frequency": 105300000, "demod": "WFM",
                  "demod_settings": {"bandwidth": 150000}, "rtl": {"gain": 10}},
@@ -2704,7 +2706,7 @@ RADIOMESH
     run ln -sfn radio-mesh /usr/local/bin/radio-meshcore
     log "installed radio's mesh commands"
 
-    note "radio: 'radio' lists profiles, 'radio NAME' (Tab completes) closes whatever runs and brings NAME up; 'radio off' closes everything. Each profile resumes where it was left. Local profiles (dcara fm-93.3 fm-105.3 am-820) are in /etc/rxd/station.json. It says when the Ham It Up needs flipping between upconvert (HF, AM) and bypass (VHF/UHF, FM)."
+    note "radio: 'radio' lists profiles, 'radio NAME' (Tab completes) closes whatever runs and brings NAME up; 'radio off' closes everything. Each profile resumes where it was left. Local profiles (dcara fm-93.3 fm-94.5 fm-105.3 am-820) are in /etc/rxd/station.json. Switching across the Ham It Up's sides (upconvert for HF and AM, bypass for VHF/UHF and FM) asks you to flip it and confirm. FM profiles play HD Radio when the station has it (fm-94.5 does)."
 
     note "SDR needs the antenna on the 'SDR' IPEX pad (the GPS pad is a separate path). All four AIO rails (SDR, USB, GPS, LoRa) come up at boot — see docs/hardware.md for switching them."
     note "rxd: 'systemctl --user status rxd@NAME' and 'journalctl --user -u rxd@NAME' show the receiver for profile NAME; 'curl -s 127.0.0.1:8073/api/v1/status' shows its frequency, mode, gain and dropped blocks. Test against a strong FM broadcast (88-108 MHz) before anything weak. rxd's own docs: https://github.com/pid1/rxd"
@@ -2730,6 +2732,32 @@ Pin: origin deb.debian.org
 Pin-Priority: 990
 WSJTXPIN
     apt_install_opt --no-install-recommends wsjtx
+
+    # nrsc5, for rxd's HD Radio on FM profiles (rxd plays analog without it).
+    # Built here from a pinned upstream commit rather than shipped, since it
+    # is GPL-3 and not in Debian; rxd runs it as a separate program. Skipped
+    # when the installed one is already this commit. The build fetches FAAD2
+    # from GitHub, so it needs the network the first time.
+    local NRSC5_COMMIT=a5c09723b135327aeef157770caae9aebf597547  # v3.2.0
+    if nrsc5 -v 2>/dev/null | grep -q "revision ${NRSC5_COMMIT:0:7}"; then
+      log "nrsc5 ${NRSC5_COMMIT:0:7} already installed"
+    elif $DRY_RUN; then
+      log "[dry-run] build nrsc5 ${NRSC5_COMMIT:0:7}"
+    else
+      apt_install_opt git build-essential cmake autoconf libtool pkgconf \
+        libao-dev libfftw3-dev librtlsdr-dev
+      local nrsc5_src; nrsc5_src=$(mktemp -d)
+      if git clone -q https://github.com/theori-io/nrsc5 "$nrsc5_src" \
+          && git -C "$nrsc5_src" checkout -q "$NRSC5_COMMIT" \
+          && cmake -S "$nrsc5_src" -B "$nrsc5_src/build" -DUSE_NEON=ON -DCMAKE_BUILD_TYPE=Release >/dev/null \
+          && make -C "$nrsc5_src/build" -j4 >/dev/null \
+          && make -C "$nrsc5_src/build" install >/dev/null && ldconfig; then
+        log "built and installed nrsc5 ${NRSC5_COMMIT:0:7} (HD Radio)"
+      else
+        warn "nrsc5 didn't build; rxd plays FM without HD Radio"
+      fi
+      rm -rf "$nrsc5_src"
+    fi
 
     # CHIRP, for programming handhelds. Debian's package rather than
     # upstream's newer build: chirpmyradio.com's archive returns 403 to
