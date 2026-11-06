@@ -109,7 +109,7 @@ The account is assumed to be `jroemer`; pass another with
 | `vhf` | 2 m calling, 146.520 MHz FM | bypass |
 | `dcara` | DCARA, 146.920 MHz FM | bypass |
 | `uhf` | 70 cm calling, 446.000 MHz FM | bypass |
-| `noaa` | NOAA weather, 162.400 MHz FM | bypass |
+| `noaa` | NOAA weather, 162.550 MHz FM | bypass |
 | `fm-93.3`, `fm-105.3` | broadcast FM | bypass |
 | `am-820` | 820 kHz AM | upconvert |
 

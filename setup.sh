@@ -3307,7 +3307,7 @@ PROFILES = {
     "vhf":      vhf("2 m calling", 146520000.0),
     "dcara":    vhf("DCARA", 146920000.0),
     "uhf":      vhf("70 cm calling", 446000000.0),
-    "noaa":     vhf("NOAA weather", 162400000.0),
+    "noaa":     vhf("NOAA weather", 162550000.0),  # strongest of the seven at EM13
     "fm-93.3":  vhf("93.3 FM", 93300000.0, "WFM", WFM, gain=10),
     "fm-105.3": vhf("105.3 FM", 105300000.0, "WFM", WFM, gain=10),
     # Below the R820T's range, so through the Ham It Up like HF: "auto"

@@ -35,7 +35,7 @@ starting points. `vfo_offset`, left in older profiles, is no longer used.
 | `vhf` | 146.520 MHz FM (2 m calling) | bypass |
 | `dcara` | 146.920 MHz FM (DCARA) | bypass |
 | `uhf` | 446.000 MHz FM (70 cm calling) | bypass |
-| `noaa` | 162.400 MHz FM (NOAA weather) | bypass |
+| `noaa` | 162.550 MHz FM (NOAA weather) | bypass |
 | `fm-93.3`, `fm-105.3` | broadcast WFM, mono, 75 µs de-emphasis | bypass |
 | `am-820` | 820 kHz AM | upconvert |
 
