@@ -19,6 +19,7 @@ EMBEDS=(
   "rxd/rxd.py"         "    write_file /usr/local/bin/rxd 0755 <<'RXD'"                       RXD
   "rxd/rxd_tui.py"     "    write_file /usr/local/bin/rxd-tui 0755 <<'RXDTUI'"                RXDTUI
   "rxd/web/index.html" "    write_file /usr/local/share/rxd/index.html 0644 <<'RXDWEB'"       RXDWEB
+  "rxd/js8.py"         "    write_file /usr/local/lib/rxd/js8.py 0644 <<'RXDJS8'"             RXDJS8
 )
 
 check=false
@@ -97,7 +98,7 @@ done
 if $check; then
   (( ${#stale[@]} == 0 )) \
     || fail "the copy in $dst differs from ${stale[*]}; run rxd/embed.sh"
-  echo "setup.sh carries the current ${EMBEDS[0]} ${EMBEDS[3]} ${EMBEDS[6]}"
+  echo "setup.sh carries the current ${EMBEDS[0]} ${EMBEDS[3]} ${EMBEDS[6]} ${EMBEDS[9]}"
 elif cmp -s "$tmp" "$dst"; then
   echo "setup.sh already carries the current rxd and its clients"
 else
