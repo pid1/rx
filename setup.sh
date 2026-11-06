@@ -13609,26 +13609,6 @@ RXDUNIT
         || warn "could not reload ${DESKTOP_USER}'s systemd; log out and back in to pick up rxd@.service"
     fi
 
-    # rxd replaces SDR++ outright. Purge it from machines provisioned before
-    # the switch. Its user config is left in place.
-    local pkg; local -a sdrpp_pkgs=()
-    for pkg in sdrpp-brown sdrpp; do
-      if pkg_installed "$pkg"; then sdrpp_pkgs+=("$pkg"); fi
-    done
-    if (( ${#sdrpp_pkgs[@]} )); then
-      run apt-get purge -y "${sdrpp_pkgs[@]}"
-      log "purged ${sdrpp_pkgs[*]} (replaced by rxd)"
-    fi
-    if compgen -G "$USER_HOME/.config/sdrpp*" >/dev/null; then
-      note "SDR++ is gone, replaced by rxd. Its old settings are still in ~/.config/sdrpp* and can be deleted."
-    fi
-    # The gqrx-to-SDR++ bookmark converter earlier revisions installed. Only
-    # ours; the gqrx config and its backup tarball are left alone.
-    if grep -qs 'Managed by rx/setup.sh' /usr/local/sbin/gqrx-bookmarks-to-sdrpp; then
-      run rm -f /usr/local/sbin/gqrx-bookmarks-to-sdrpp
-      log "removed the old gqrx-bookmarks-to-sdrpp converter"
-    fi
-
     # Switchable, resumable receiver profiles, played by rxd through its
     # systemd user unit. See the docstring for how a profile is kept.
     write_file /usr/local/bin/radio 0755 <<'RADIO'
