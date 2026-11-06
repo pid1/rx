@@ -2260,15 +2260,13 @@ BLACKLIST
     # /etc/rxd/station.json and /etc/rxd/rxd.env, below.
     #
     # A new rxd release is a PR here changing RXD_VERSION and RXD_SHA256.
-    # TODO(coordinator, before merging): this SHA-256 is of rxd-0.3.0.tar.gz
-    # as scripts/release.py builds it locally from pid1/rxd at bbca82d. The
-    # build is reproducible, so the published release must match it: check
-    # the release's .sha256 against it, and pin the published one if not.
+    # The release build is reproducible, so this is also what
+    # scripts/release.py makes from the v0.3.0 tag.
     # RX_RXD_TARBALL=/path/rxd-X.Y.Z.tar.gz installs that file instead of
     # downloading, for trying a build before it is published; it must still
     # match RXD_SHA256.
     local RXD_VERSION=0.3.0
-    local RXD_SHA256=f1bdd59571410a1de939d265aea98c2c7b8c63f70ef60c0cbc86877ba57550a9
+    local RXD_SHA256=7f421b45b1ecccf5dc353b2b3cd90d6a1ee993c91e3ef7c0fb5027a745c48087
     local rxd_tar="rxd-${RXD_VERSION}.tar.gz"
     local rxd_url="https://github.com/pid1/rxd/releases/download/v${RXD_VERSION}/${rxd_tar}"
     local rxd_cache="/var/cache/rx/${rxd_tar}"
