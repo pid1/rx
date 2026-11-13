@@ -1331,10 +1331,48 @@ UNIT
   if [[ -f $BOOT_DIR/config.txt ]]; then
     section "Boot configuration ($BOOT_DIR/config.txt)"
 
+    # The uConsole CM4 overlay enables SPI4 on GPIO 4 (CS), 6 (MOSI) and 7
+    # (clock) and has no parameter to turn it off. The bus is dead with the
+    # AIO fitted anyway -- GPIO 7 is the SDR rail -- but its driver still
+    # claims GPIO 6 first, and pps-gpio then fails to probe ("pin gpio6
+    # already requested by fe204800.spi"), so there is no PPS at all. This
+    # overlay switches SPI4 back off; it has to load after the uConsole one
+    # and before pps-gpio, which its place in the block below gives it.
+    local spi4_off=uconsole-aio-spi4-off spi4_line=""
+    if [[ -d $BOOT_DIR/overlays ]]; then
+      apt_install device-tree-compiler
+      write_file "/usr/local/share/uconsole/${spi4_off}.dts" 0644 <<'DTS'
+// Managed by rx/setup.sh — disable SPI4 so pps-gpio can claim GPIO 6.
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2711";
+
+    fragment@0 {
+        target-path = "/soc/spi@7e204800";
+        __overlay__ {
+            status = "disabled";
+        };
+    };
+};
+DTS
+      if $DRY_RUN; then
+        log "[dry-run] compile ${spi4_off}.dtbo into $BOOT_DIR/overlays"
+        spi4_line="dtoverlay=${spi4_off}"
+      elif dtc -I dts -O dtb -o "$BOOT_DIR/overlays/${spi4_off}.dtbo" \
+               "/usr/local/share/uconsole/${spi4_off}.dts"; then
+        spi4_line="dtoverlay=${spi4_off}"
+      else
+        warn "could not build ${spi4_off}.dtbo — SPI4 keeps GPIO 6 and PPS will not bind"
+      fi
+    fi
+
     local -a want_overlays=(
       "dtparam=i2c_arm=on"                 # RTC bus
       "dtoverlay=i2c-rtc,pcf85063a"        # RTC
       "enable_uart=1"                      # GPS on the PL011
+      ${spi4_line:+"$spi4_line"}           # frees GPIO 6 for the PPS line
       "dtoverlay=pps-gpio,gpiopin=6"       # GPS PPS for chrony
       "dtparam=spi=on"
       "dtoverlay=spi1-1cs"                 # LoRa: creates /dev/spidev1.0
