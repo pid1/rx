@@ -85,8 +85,22 @@ power, including across a reboot: `uconsole-rtc` then reports "RTC holds no
 valid time" and the clock starts from `fake-hwclock`'s last hourly save, up to
 an hour behind, until GPS or NTP corrects it.
 
+The uConsole CM4 overlay enables SPI4 on GPIO 6 and 7, which collides with
+the PPS line on GPIO 6 (and the bus is unusable with the AIO fitted, since
+GPIO 7 is the SDR rail). `setup.sh` builds a small overlay,
+`uconsole-aio-spi4-off`, that disables SPI4 so `pps-gpio` can claim the pin.
+
+chronyd will not start with a refclock it cannot open, so the PPS line is
+not in the static config. `uconsole-pps` runs before each chrony start and
+writes it to `/run/uconsole-pps/pps.conf` only when the kernel has a GPIO PPS
+source. If `pps-gpio` did not bind (`dmesg | grep -i pps`), chrony still
+runs and keeps time from NMEA and, with a network, the NTP pool. A udev rule
+re-runs the check when a PPS source appears later and restarts chrony to add
+it.
+
 ```bash
 chronyc sources               # NMEA and PPS reachable, PPS '*' once locked
+journalctl -u chrony | grep uconsole-pps   # which PPS device, or why none
 systemctl status uconsole-rtc # chip bound, and which way time went
 cgps -s                       # GPS fix; needs a sky view
 ```
