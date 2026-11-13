@@ -1486,6 +1486,70 @@ GPSD
     # Only one thing may discipline the clock.
     run systemctl disable --now systemd-timesyncd 2>/dev/null || true
 
+    # chronyd treats a refclock it cannot open as fatal, so a missing
+    # /dev/pps0 (pps-gpio failing to claim its pin, say) used to leave the
+    # box with no time daemon at all -- not even NTP. The PPS refclock is
+    # therefore generated at each chrony start, and only when the kernel has
+    # a real PPS source; without one chrony still runs on NMEA and the pool.
+    #
+    # It also picks the device rather than assuming pps0: gpsd registers its
+    # own line-discipline source on the UART, which takes pps0 whenever
+    # pps-gpio is absent and carries no pulses on this board.
+    write_file /usr/local/sbin/uconsole-pps 0755 <<'PPS'
+#!/bin/sh
+# Managed by rx/setup.sh — writes chrony's PPS refclock only if a kernel GPIO
+# PPS source exists. Runs before each chronyd start (chrony.service drop-in).
+# udev runs it with 'hotplug' when a PPS source appears after that; chronyd
+# cannot add a refclock while running, so it is restarted if the answer changed.
+set -u
+
+dir=/run/uconsole-pps
+conf=$dir/pps.conf
+
+want= name=
+for src in /sys/class/pps/pps*; do
+    [ -r "$src/name" ] || continue
+    # Line-discipline sources (gpsd on the UART) name their tty in 'path';
+    # the pps-gpio source leaves it empty.
+    [ -n "$(cat "$src/path" 2>/dev/null)" ] && continue
+    dev=/dev/${src##*/}
+    [ -c "$dev" ] || continue
+    want="refclock PPS $dev refid PPS lock NMEA"
+    name=$(cat "$src/name")
+    break
+done
+
+if [ "${1:-}" = hotplug ]; then
+    [ "$want" = "$(cat "$conf" 2>/dev/null)" ] && exit 0
+    # The restart re-runs this script without 'hotplug', which writes the file.
+    exec systemctl --no-block try-restart chrony.service
+fi
+
+mkdir -p "$dir"
+if [ -n "$want" ]; then
+    printf '%s\n' "$want" > "$conf"
+    echo "uconsole-pps: PPS refclock on $dev ($name)"
+else
+    rm -f "$conf"
+    echo "uconsole-pps: no kernel PPS source (see 'dmesg | grep -i pps'); chrony runs on NMEA and NTP only" >&2
+fi
+exit 0
+PPS
+    write_file /etc/systemd/system/chrony.service.d/10-uconsole-pps.conf 0644 <<'DROPIN'
+# Managed by rx/setup.sh — decide at each start whether there is a PPS
+# device for chronyd to open. '+' runs it unsandboxed, as root.
+[Service]
+ExecStartPre=+/usr/local/sbin/uconsole-pps
+DROPIN
+    # A PPS source that registers after chrony is up (a late module load, a
+    # runtime overlay) is picked up without waiting for a reboot.
+    write_file /etc/udev/rules.d/90-uconsole-pps.rules 0644 <<'PPSRULE'
+# Managed by rx/setup.sh — tell chrony when a kernel PPS source appears.
+ACTION=="add", SUBSYSTEM=="pps", RUN+="/usr/local/sbin/uconsole-pps hotplug"
+PPSRULE
+    run systemctl daemon-reload
+    run udevadm control --reload
+
     local chrony_conf=/etc/chrony/chrony.conf
     local chrony_drop=/etc/chrony/conf.d/10-uconsole-gps.conf
     local chrony_target="$chrony_conf"
@@ -1506,15 +1570,22 @@ GPSD
 # it supplies coarse time while the kernel PPS device from the pps-gpio
 # overlay (GPIO 6) does the actual disciplining. 'lock NMEA' ties the PPS
 # pulses to NMEA's seconds so chrony knows which second each pulse belongs to.
+#
+# The PPS refclock line is not here: chronyd refuses to start when it cannot
+# open the device. /usr/local/sbin/uconsole-pps writes it into the directory
+# below before each start, only when a kernel PPS source exists. Without one
+# chrony falls back to NMEA and the NTP pool.
 refclock SHM 0 refid NMEA offset 0.2 delay 0.2 poll 3
-refclock PPS /dev/pps0 refid PPS lock NMEA${rtcsync_line}
+include /run/uconsole-pps/*.conf${rtcsync_line}
 CHRONYGPS
     else
       printf '%s\n' \
         '# GPS-disciplined time: NMEA over gpsd shared memory for coarse time,' \
-        '# kernel PPS (pps-gpio on GPIO 6) for the actual disciplining.' \
+        '# kernel PPS (pps-gpio on GPIO 6) for the actual disciplining. The PPS' \
+        '# refclock is written by uconsole-pps before each start, only when the' \
+        '# device exists; without it chrony runs on NMEA and the NTP pool.' \
         'refclock SHM 0 refid NMEA offset 0.2 delay 0.2 poll 3' \
-        'refclock PPS /dev/pps0 refid PPS lock NMEA'"${rtcsync_line}" \
+        'include /run/uconsole-pps/*.conf'"${rtcsync_line}" \
         | apply_block "$chrony_conf"
     fi
 
@@ -1523,7 +1594,7 @@ CHRONYGPS
       systemctl restart chrony 2>/dev/null || warn "chrony would not restart"
     fi
     log "chrony configured for GPS + PPS (wrote ${chrony_target})"
-    note "GPS time: after reboot check 'chronyc sources' — NMEA and PPS should both appear, PPS with a '*' once locked. 'ppstest /dev/pps0' proves the pulse itself."
+    note "GPS time: after reboot check 'chronyc sources' — NMEA and PPS should both appear, PPS with a '*' once locked. 'ppstest /dev/pps0' proves the pulse itself. If PPS is missing, 'journalctl -u chrony | grep uconsole-pps' says why; chrony then keeps time from NMEA and the NTP pool."
     note "GPS: needs the antenna on the 'GPS' IPEX pad and a clear sky view. The rail comes up at boot; check with 'cgps -s' or 'gpsmon'."
   fi
 
