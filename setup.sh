@@ -2370,12 +2370,12 @@ BLACKLIST
     #
     # A new rxd release is a PR here changing RXD_VERSION and RXD_SHA256.
     # The release build is reproducible, so this is also what
-    # scripts/release.py makes from the v0.5.2 tag.
+    # scripts/release.py makes from the v0.6.0 tag.
     # RX_RXD_TARBALL=/path/rxd-X.Y.Z.tar.gz installs that file instead of
     # downloading, for trying a build before it is published; it must still
     # match RXD_SHA256.
-    local RXD_VERSION=0.5.2
-    local RXD_SHA256=82e5dc0137541faf6bd936103f280990a94de47ff01a5a22a1747ba604e78e51
+    local RXD_VERSION=0.6.0
+    local RXD_SHA256=614d37a1193cb7c3159d2566d48f2d3fa0afd17be6efdfe5c20559822db0f4c5
     local rxd_tar="rxd-${RXD_VERSION}.tar.gz"
     local rxd_url="https://github.com/pid1/rxd/releases/download/v${RXD_VERSION}/${rxd_tar}"
     local rxd_cache="/var/cache/rx/${rxd_tar}"
